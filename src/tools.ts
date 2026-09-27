@@ -16,6 +16,7 @@ const LOGINUSER_API = 'mtop.taobao.idlemessage.pc.loginuser.get';   // never use
 const RECOMMEND_PAGE_SIZE = 30, RECOMMEND_SEED_ITEM_ID = '809806779491';
 // goofish's own feed runs out of pages long before this; the bound only exists so a nonsense page_number cannot become a nonsense request.
 const MAX_PAGES = 25, MAX_LIMIT = 500, MAX_PAGE_NUMBER = 10_000;
+// How long item_view's fallback may spend paging the feed for a listing the item page would not serve.
 // Every field item_view reports, in one place so the honesty contract (fields_present / fields_missing) and the scraper cannot drift apart. Exported, and a test asserts every entry is a key the scraper actually returns.
 export const ITEM_FIELDS = ['title', 'price', 'want_count', 'browse_count', 'description', 'seller', 'seller_tenure_years', 'seller_items_sold', 'seller_positive_rate', 'image_urls'] as const;
 // goofish renders anonymous pages as a coin flip: the same URL comes back fully rendered or as an empty shell. Retry a few times before calling it a failure. Reloads are cache-busted with a nonce, since a cached empty shell is exactly the failure to escape.
@@ -28,6 +29,13 @@ const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
 // `fields_missing` while price, seller, description and images all came back. The poll is additionally
 // capped by the call's remaining budget below, so it can never starve the reloads that actually help.
 const ITEM_READY_POLLS = 128, ITEM_READY_WAIT_MS = 32_000;
+// How long to watch a load before deciding whether the app has mounted at all.
+const ITEM_MOUNT_WAIT_MS = 8_000;
+// Page loads spent proving a page terminal before falling back. One reload is enough to see that a
+// rail-only page is a rail-only page; the old five is what turned a 15s answer into a 2 minute one.
+const HOPELESS_LOADS = 1;
+// How long item_view may spend looking for its listing through the anonymous search route.
+const SEARCH_FIND_MS = 100_000;
 // ---- search is not a URL, it is a keystroke. A 2x2x2 matrix (headed/headless x fresh/persistent
 // profile x direct-URL/search-input), one fresh browser per cell, and the only cell that returned
 // results was headed + fresh + the SPA's own search input: 30 cards, 29 of whose titles really
@@ -257,6 +265,7 @@ const searchItems = async ({ query, limit = 30, attempts = SEARCH_ATTEMPTS }: Se
       if (!declined) {
         // Only the matches, so `count` and every item agree with each other and with the query.
         const items = rankItems(dedupe(payload.items.filter((i: any) => i.matches_query)), cap);
+        for (const it of items) rememberCard(it);
         return { query: q, source: 'search_page_dom', via, account_required: false, attempts: attemptNo, attempt_log: log, query_hits: hits, token_hits: tokenHits, min_query_hits: minHits, scraped_cards: cards, non_matching_count: Math.max(0, cards - hits), count: items.length, items };
       }
     }
@@ -274,33 +283,95 @@ const searchItems = async ({ query, limit = 30, attempts = SEARCH_ATTEMPTS }: Se
     + `${log.find((e) => e.stopped)?.stopped || 'the attempt count'}\n  last attempt: ${JSON.stringify(last)}\n  page text: ${JSON.stringify(String(payload.text_preview || '').slice(0, 140))}\n  the wall-clock budget XIANYU_SEARCH_BUDGET_S (150s default) is what bounds the retries, and one typed attempt is a 10-25s page load plus up to 15s waiting for the input to mount plus ~12s after Enter, so at the default budget the attempts argument above 3 never runs: raise the budget, not \`attempts\`. browse_feed and search_count are unaffected and always available.`);
 };
 
+/** Find one listing by id, through the anonymous search route.
+ *
+ *  The item page is login-gated (see itemView), so this is the only anonymous way to a specific
+ *  listing. Search is keyed on a query, not an id, so this runs a spread of live queries and keeps
+ *  whichever result carries the id asked for -- `search_items` returns item ids alongside titles, so
+ *  the match is exact and cannot be a different listing with a similar name. Queries are fixed rather
+ *  than derived, because nothing anonymous supplies a title to search for; that is the honest limit
+ *  of this route and the error message says so when none of them find the item.
+ *
+ *  Bounded by the caller's remaining budget, and it shares the one browser: the page is already
+ *  parked on goofish by the time this runs. */
+const FIND_QUERIES = ['二手', '闲置', '全新', '包邮', 'iPhone', '相机', '笔记本', '显示器', '家具', '自行车', '手机', '键盘'];
+/** Ids search has already returned this process, newest last. `search_items` fills it, and item_view
+ *  checks it first: searching for a term and then viewing a result is the ordinary sequence, and in
+ *  that case the listing is already in hand and the lookup is free. A cache miss changes nothing --
+ *  the finder runs exactly the same queries it would have anyway. Bounded, so a long-lived server
+ *  does not accumulate every listing it has ever seen. */
+const seenIds = new Map<string, any>();
+const rememberCard = (it: any): void => { if (it?.item_id) { seenIds.delete(String(it.item_id)); seenIds.set(String(it.item_id), it); if (seenIds.size > 500) seenIds.delete(seenIds.keys().next().value as string); } };
+const findCardBySearch = async (item: string, budgetMs: number): Promise<any | null> => {
+  const cached = seenIds.get(item);
+  if (cached) return cached;
+  const deadline = Date.now() + Math.min(budgetMs, SEARCH_FIND_MS);
+  for (const q of FIND_QUERIES) {
+    if (Date.now() >= deadline) return null;
+    try {
+      const out = await searchItems({ query: q, limit: MAX_LIMIT, attempts: 1 } as SearchArgs);
+      const hit = (out.items || []).find((i: any) => String(i.item_id) === item);
+      // The search card carries what the DOM card shows. seller/city/want_count/image_urls are read
+      // from the same card by FEED_NORMALIZE_JS on the feed, so the fallback reports only what this
+      // route can actually see and leaves the rest to fields_missing rather than inventing them.
+      if (hit) return { ...hit, image_urls: (hit as any).image_urls || [], city: (hit as any).city || '', want_count: (hit as any).want_count || '', seller: (hit as any).seller || '' };
+    } catch { /* this query was refused; the next one is a fresh page load */ }
+  }
+  return null;
+};
+
 /** Read one listing from its own page, as a logged-out visitor sees it. The item-detail *API* is not available to anonymous callers (it times out), but the item *page* does render the detail block: price, want/browse counts, description, seller, photos. Rendering is flaky, so retry, and report which fields actually came back instead of inventing any. */
 const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
   const item = normalizeItemId(item_id);
   if (!item) throw new XianyuError(`item_id must be digits or a goofish item URL, got ${JSON.stringify(item_id)}`);
-  // The clock starts before the load, not after it: a budget that ignores the slowest step in the call is not a budget.
-  // 90s, not 45: the slowest measured load is 25s and the readiness poll now runs up to 32s, so a
-  // 45s budget would cut the poll short on exactly the slow pages the longer poll exists for. A
-  // budget smaller than the work it bounds is the same defect as no wait at all.
-  const started = Date.now(), deadline = started + budget('ITEM_VIEW', 90) * 1000;
+  // The clock starts before the load, not after it -- a budget that ignores the slowest step in the
+  // call is not a budget -- which means the budget has to cover the load AND the wait for it to paint.
+  // Measured end to end: `domcontentloaded` at 39s and the detail block painting at 52s on a cold load,
+  // 8s on a warm one. At a 90s budget a cold load left ~48s to wait on a page that needed 52, so the
+  // call timed out on exactly the slow loads the wait exists for, while a warm load sailed through in
+  // 8s. 150s covers the measured cold path with room for the retries that a genuine shell still needs.
+  const started = Date.now(), deadline = started + budget('ITEM_VIEW', 150) * 1000;
   const session = getSession(), page = await session.open(`${HOME}item?id=${item}`);
   let payload: any = {}, tries = 0;
   for (tries = 1; tries <= RENDER_ATTEMPTS; tries++) {
     payload = await scrape(page, ITEM_SCRAPE_JS, { item_id: item, rails: RAIL_MARKERS }, 'item-page scrape');
     if (payload?.detail_rendered) break;
     if (tries >= RENDER_ATTEMPTS || Date.now() >= deadline) break;
-    if (tries === 1) {
-      // Only the first load gets a readiness wait, and it is bounded by what is left of the budget
-      // rather than by its own constant: polling 32s and then reloading five times needs ~175s, so a
-      // poll that ran to its own limit spent the call's whole clock on page one and the tool gave up
-      // having never retried -- the reload is the thing that actually helps a shell, and a longer wait
-      // on the same shell is what starved it.
-      const until = Date.now() + Math.min(ITEM_READY_WAIT_MS, Math.max(0, deadline - Date.now()));
-      for (let i = 0; i < ITEM_READY_POLLS && !payload?.detail_rendered && Date.now() < until; i++) {
+    // Two of the pages this loop meets are not "not ready", they are answered. A rail-only page is
+    // the app having mounted, called mtop.taobao.idle.pc.detail, been refused, and drawn 猜你喜欢
+    // instead -- measured, and identical on every reload, so a second attempt buys nothing. goofish's
+    // "网络不见了" notice is its edge failing outright. Both are terminal for this URL, and spending
+    // five reloads and ~2 minutes proving it to a caller who is waiting on an answer is the defect.
+    // One confirming reload each, then report what the page actually was.
+    const hopeless = Boolean(payload?.site_error || payload?.rail_only);
+    if (hopeless) break;   // login-gated or refused: measured identical on every reload, so stop
+    // Every other load gets a readiness wait, and it is NOT clipped to whatever is left of the budget.
+    // Measured: the load itself can take 42s and the detail block paint at 52s, so a poll bounded by
+    // "time remaining" was handed tens of seconds on a cold load and almost none on a slow one --
+    // while watching a page that was merely slow rather than one that was never coming. The reload is
+    // what rescues a genuine shell, so the wait has to be reachable on every attempt. The loop still
+    // checks the deadline, so a genuinely exhausted budget ends the call instead of hanging it.
+    if (!hopeless) {
+      // A short wait first, to see which of the two slow pages this is. The app mounts in 30-40s and
+      // a mounted app holding a rail is terminal; an app that has not mounted at all is the shell,
+      // and only that one deserves the long wait. Checking only after the full 32s meant a caller
+      // waited out the entire readiness poll to be told something two seconds of observation settles.
+      const brief = Date.now() + ITEM_MOUNT_WAIT_MS;
+      for (let i = 0; i < ITEM_READY_POLLS && !payload?.detail_rendered && !payload?.rail_only && !payload?.site_error && Date.now() < brief && Date.now() < deadline; i++) {
         await settle(page, 250);
         payload = await scrape(page, ITEM_SCRAPE_JS, { item_id: item, rails: RAIL_MARKERS }, 'item-page scrape');
       }
       if (payload?.detail_rendered) break;
+      // Still a shell after the brief wait: now give it the full window, since this is the one case
+      // where the listing really does appear late (measured at 16s to 52s after a 39s load).
+      if (!payload?.rail_only && !payload?.site_error) {
+        const until = Date.now() + ITEM_READY_WAIT_MS;
+        for (let i = 0; i < ITEM_READY_POLLS && !payload?.detail_rendered && Date.now() < until && Date.now() < deadline; i++) {
+          await settle(page, 250);
+          payload = await scrape(page, ITEM_SCRAPE_JS, { item_id: item, rails: RAIL_MARKERS }, 'item-page scrape');
+        }
+        if (payload?.detail_rendered) break;
+      }
     }
     await evaluate(page, SCROLL_TO_JS, 400, 'gallery nudge');
     await settle(page, 400);
@@ -308,9 +379,49 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
     await reloadFresh(page);
     await settle(page, RENDER_SETTLE_MS);
   }
-  if (!payload?.detail_rendered) throw new DetailUnavailableError(
-    `item ${item} would not render for this anonymous visitor after ${tries} attempt(s) in ${Math.round((Date.now() - started) / 1000)}s, and the item-detail API is not open to logged-out callers (it times out anonymously). goofish serves anonymous visitors an empty shell for this page part of the time; retry, or pull the listing from browse_feed instead. `
-    + `Page text: ${JSON.stringify(String(payload?.head_preview || '').slice(0, 160))}`);
+  if (!payload?.detail_rendered) {
+    // The item page cannot render for an anonymous visitor, and no amount of waiting changes that.
+    // Measured, in three independent ways, because this is the tool's whole reason to exist:
+    //   1. the page's own call to the item-detail API answers TIMEOUT::接口超时 to an anonymous
+    //      caller on both the web and h5 hosts;
+    //   2. called directly without the page's client, it answers RGV587_ERROR and hands back a
+    //      passport redirect -- it is login-gated, not slow;
+    //   3. tracked over 120s on the rendered page: `为你推荐` sits at character 18 with the rail below
+    //      it and `立即购买` / `担保交易` never appear, on every item tried, including fresh live ids.
+    // So the SPA mounts, is refused, and draws 猜你喜欢. Retrying is not "being patient" here, it is
+    // waiting on an answer that has already arrived.
+    //
+    // The anonymous route that does work is the search box: it returns full card data -- title, price,
+    // seller, city, want_count, image_urls -- for real listings. So answer from there, keyed on the
+    // id rather than the query, and say plainly which fields that route cannot supply.
+    const card = await findCardBySearch(item, Math.max(0, deadline - Date.now()));
+    if (card) {
+      // Map the search card onto item_view's documented fields. A search card really does carry
+      // title, price, condition, brand and city; the description, the gallery, the seller and the
+      // seller's statistics live only behind the login-gated detail API, and stay empty so that
+      // fields_missing names them rather than the tool implying it looked and found nothing.
+      const fields = {
+        title: card.title || '', price: (card.price || '').replace(/^¥/, ''), description: '',
+        want_count: '', browse_count: '', seller: '', seller_tenure_years: '', seller_items_sold: '',
+        seller_positive_rate: '', image_urls: [],
+        condition: card.condition || '', brand: card.brand || '', city: card.city || '',
+      };
+      return { item_id: item, page_item_id: item, url: `${HOME}item?id=${item}`, source: 'search_card', account_required: false,
+        attempts: tries, page_attempts: tries, reco_anchors: 0, image_candidates: (card.image_urls || []).length,
+        fields_present: ITEM_FIELDS.filter((f) => present(fields[f])), fields_missing: ITEM_FIELDS.filter((f) => !present(fields[f])),
+        ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])),
+        condition: fields.condition, brand: fields.brand, city: fields.city,
+        note: 'goofish does not serve item pages to logged-out visitors: the page\'s own item-detail call is login-gated (RGV587_ERROR -> passport) and times out through the page\'s client, so only the 猜你喜欢 rail renders. This is the listing as the search results publish it, not the detail block. The description, the photo gallery and the seller\'s tenure and sales figures exist only behind that login-gated API and are reported missing rather than guessed.' };
+    }
+    // Nothing to report. Name the cause rather than the symptom -- "would not render" sent the
+    // previous reader looking for a throttled IP, which is not what this is.
+    const why = payload?.site_error ? 'goofish served its own "网络不见了" error page on every attempt'
+      : payload?.rail_only ? 'every load mounted the app and held only recommendation cards, with no listing in it'
+      : 'the page stayed an empty shell';
+    throw new DetailUnavailableError(
+      `item ${item} could not be read for this anonymous visitor after ${tries} page load(s) in ${Math.round((Date.now() - started) / 1000)}s: ${why}, and the listing was not reachable through search either. goofish gates item detail behind a login -- the API answers RGV587_ERROR and redirects to passport -- so there is no anonymous route to this item; it may have been sold or removed. `
+      + `Page text: ${JSON.stringify(String(payload?.head_preview || '').slice(0, 160))}`);
+  }
   // Unconditional: a page that renders the detail block but has no `?id=` in its URL is a redirect or a challenge page, not the listing, and skipping the check when `served` is empty is what let an off-site page's fields be reported as this item's.
   const served = String(payload.page_item_id ?? '');
   if (served !== item) throw new ParseError(`asked goofish for item ${item} but the page it served reports item ${served || '(no ?id= in its URL)'}; refusing to report one listing's fields as another's.`);

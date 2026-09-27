@@ -78,11 +78,23 @@ export async function reloadFresh(page: Page): Promise<void> {
   ensureGoofishUrl(page.url());
 }
 
+/** One bounded mtop-readiness probe that cannot throw. `true` ready, `false` not yet. A probe that
+ *  errors (timed out, context swapped mid-navigation) is reported as "not ready" rather than raised,
+ *  so a page that is still booting is a reason to keep waiting, not to fail the call. */
+async function probeMtop(page: Page): Promise<boolean> {
+  try { return (await evaluate(page, MTOP_READY_JS, undefined, 'mtop readiness check', PROBE_TIMEOUT_S)) === 'ready'; }
+  catch { return false; }
+}
+
 /** Wait for the page's own mtop client to appear. False means it never did. Bounded by the clock, not by an iteration count, and each probe carries its own short timeout -- an unbounded evaluate inside a bounded loop is a 75-minute wait wearing a 15-second label. */
 export async function waitForMtop(page: Page, timeoutMs = 15_000): Promise<boolean> {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    if ((await evaluate(page, MTOP_READY_JS, undefined, 'mtop readiness check', PROBE_TIMEOUT_S)) === 'ready') return true;
+    // A probe that times out is not a verdict: the page is simply not answering yet. That is the
+    // normal state of a slow load, and it used to throw out of `open()` and take the whole tool call
+    // with it -- a page that was still booting is exactly the page a caller wants to come back to.
+    // Only an explicit `false` or an exhausted clock ends the wait.
+    if (await probeMtop(page)) return true;
     await settle(page, 300);
   }
   return false;

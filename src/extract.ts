@@ -152,6 +152,12 @@ export const ITEM_SCRAPE_JS = (spec: { item_id: string; rails: string[] }): any 
     // The page's own id, so the caller can check it got the listing it asked for instead of a redirect, a challenge page, or a different item.
     page_item_id: (location?.search?.match(/[?&]id=([0-9]+)/) || location?.pathname?.match(/\/item\/([0-9]+)/) || [])[1] || '',
     detail_rendered: /人想要|浏览|立即购买/.test(headCompact),
+    // Two pages look like "not ready yet" and are not. goofish serves a "网络不见了" notice when its
+    // own edge fails, and a cached shell can hold nothing but rail cards under a `为你推荐` heading in
+    // the first few characters -- which cut the head to 3 chars and made a real listing look empty.
+    // Both are instant and retryable, so both are named rather than polled for another 32s.
+    site_error: /网络不见了|服务异常|页面不存在|网络异常/.test(full),
+    rail_only: cut >= 0 && cut < 120,
     title: firstInDetail(['[class*="main-title"]', '[class*="item-title"]', '[class*="detail-title"]', 'h1']),
     price: priceMatch ? priceMatch[1].replace(/,/g, '') : '',
     want_count: money(/([\d.]+)\s*(万)?\s*人想要/),

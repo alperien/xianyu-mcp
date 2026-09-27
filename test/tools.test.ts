@@ -410,7 +410,9 @@ test('item_view refuses to report a different listing\'s fields -- or no listing
   use(makeSession({ item: [UNRENDERED, UNRENDERED, UNRENDERED] }));
   await assert.rejects(run('item_view')({ item_id: '42' }), (e: any) => {
     assert.ok(e instanceof DetailUnavailableError);
-    assert.match(e.message, /attempt\(s\) in \d+s/);
+    // The wording changed when the cause was pinned down -- the page is login-gated, not slow -- so
+    // the count and the clock are asserted separately rather than as one interpolated phrase.
+    assert.match(e.message, /\b\d+ page load\(s\) in \d+s/);
     assert.match(e.message, /阿里巴巴/, 'the page text it actually saw must be quoted');
     return true;
   });
