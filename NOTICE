@@ -1,0 +1,21 @@
+xianyu-mcp
+Copyright 2026 alperien
+
+This product includes software derived from goofish-cli
+(https://github.com/fancyboi999/goofish-cli), Copyright 2026 fancy,
+licensed under the Apache License, Version 2.0. The in-page JavaScript
+extractors for search results and item detail were adapted from that
+project's `commands/search/search.py` and `commands/item/view.py`.
+
+This TypeScript port carries that attribution forward from the Python
+implementation of the same server, which made the same adaptation.
+
+This tool is provided for lawful, read-only automation of publicly
+visible Xianyu (闲鱼 / Goofish) listings. The authors explicitly disallow:
+  - Any use for fraud, scalping, or fake transactions
+  - Reselling this tool as a service targeting the Goofish platform
+  - Any use that violates Goofish/Alibaba Terms of Service
+
+No Goofish account, credential or cookie is used, requested, stored or
+required. Users are solely responsible for compliance with applicable
+laws and platform policies.

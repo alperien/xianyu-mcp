@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/** MCP stdio entry point. Register it with an MCP client exactly as README.md shows it -- `node /path/to/xianyu-mcp-ts/src/index.ts` as `command` + `args`; this file used to carry an inline config snippet of its own and it was not valid MCP config. No Xianyu account, no cookies, no stored credentials, no write tools: the server launches its own Chromium and reads goofish the way an anonymous visitor's browser does. */
+/** MCP stdio entry point. Register it with an MCP client exactly as README.md shows it -- `node /path/to/xianyu-mcp/dist/index.js` as `command` + `args`; this file used to carry an inline config snippet of its own and it was not valid MCP config. No Xianyu account, no cookies, no stored credentials, no write tools: the server launches its own Chromium and reads goofish the way an anonymous visitor's browser does. */
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { exclusive, getSession } from './browser.ts';

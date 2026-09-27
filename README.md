@@ -16,17 +16,28 @@ It never clicks anything in the page, and [the login dialog is deliberately left
 
 ## Install
 
+From a clone:
+
 ```bash
 npm install                      # deps: @modelcontextprotocol/sdk, playwright, zod
 npx playwright install chromium  # or point XIANYU_BROWSER_PATH at a Chrome/Chromium binary
 ```
+
+As a dependency (`npm install xianyu-mcp`), the published tarball is prebuilt — `dist/` — and
+`npx playwright install chromium` is still needed. The build exists because Node refuses to strip
+TypeScript types from files under `node_modules/`, so shipping `src/*.ts` would install fine and then
+fail on first run.
+
+Requires **Node 22.18+** (the server runs TypeScript directly, natively). It launches a windowed
+Chromium, so it needs a display — on a headless box, `xvfb-run -a node src/index.ts` or an X server.
+See [Headless vs headed](#headless-vs-headed) for what `XIANYU_HEADLESS=1` costs you.
 
 ## MCP client config
 
 ```json
 {
   "mcpServers": {
-    "xianyu": { "command": "node", "args": ["/path/to/xianyu-mcp-ts/src/index.ts"] }
+    "xianyu": { "command": "node", "args": ["/path/to/xianyu-mcp/dist/index.js"] }
   }
 }
 ```
@@ -35,13 +46,17 @@ npx playwright install chromium  # or point XIANYU_BROWSER_PATH at a Chrome/Chro
 |---|---|---|
 | `XIANYU_BROWSER_PATH` | Playwright's Chromium | use a specific Chrome/Chromium binary |
 | `XIANYU_HEADLESS` | `0` (windowed) | `1` runs headless. Headed is the default because goofish serves headless Chromium its risk-control page instead of the app — see [Headless vs headed](#headless-vs-headed). Needs a display (`DISPLAY=:0`, or Xvfb). |
-| `XIANYU_SEARCH_BUDGET_S` | 45 | wall-clock budget for the `search_items` retry loop (5–600s) |
-| `XIANYU_ITEM_VIEW_BUDGET_S` | 45 | wall-clock budget for the `item_view` retry loop (5–600s) |
+| `XIANYU_SEARCH_BUDGET_S` | 150 | wall-clock budget for the `search_items` retry loop (5–600s) |
+| `XIANYU_ITEM_VIEW_BUDGET_S` | 90 | wall-clock budget for the `item_view` retry loop (5–600s) |
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
 
 The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
-flight runs to completion: at the 45s default and a 10–25s load you get two or three attempts, and a
-call can overshoot its budget by roughly one page load.
+flight runs to completion: at the 150s default and a 10–25s load you get several attempts, and a call
+can overshoot its budget by roughly one page load.
+
+**The server runs windowed and needs a display.** goofish serves headless Chromium its risk-control
+page instead of the app, which leaves the three DOM tools with nothing to read, so headed is the
+default and a headless machine needs `xvfb-run` or an X server. The four mtop tools work either way.
 
 ## Tools
 
@@ -94,6 +109,42 @@ makes results appear. That is a real-browser-profile observation and this code i
 recorded and not designed around. The one thing measured here is that the click, on this client, is
 harmful.
 
+## Search is a keystroke, not a URL
+
+`search_items` does not navigate to `/search?q=`. It loads goofish's **homepage**, finds the SPA's own
+header search input, focuses it, types the query and presses Enter.
+
+This is measured, not preferred. A 2x2x2 matrix — headed/headless x fresh/persistent profile x
+direct-URL/search-input, one fresh browser per cell — returned results from exactly one cell:
+
+| cell | cards | cards whose titles contain the query | outcome |
+|---|---|---|---|
+| headed, fresh, **typed into the input** | 30 | 30 | results |
+| headed, fresh, `/search?q=` | 20 | 0 | 猜你喜欢 rail |
+| every direct-URL cell, headed included | 20 | 0 | 猜你喜欢 rail |
+| headless, all cells | 20 | 0 | risk-control page |
+
+So a direct-URL search on this client returns the recommendation rail, not results, and no amount of
+retrying fixes it. The first three attempts load the homepage and type; the last is the one direct-URL
+navigation, kept so a refusal can quote a real page rather than a guess — it is expected to be refused,
+and is reported as what it is.
+
+**The input is focused, not clicked.** goofish's login dialog puts an `ant-modal-mask` over the header,
+and Playwright's click actionability check times out against it (measured: a 10s timeout with the element
+resolved but never receiving the event). `focus()` needs no pointer, and the keystrokes that follow are
+what the SPA's form listens for.
+
+**Typing is verified, not assumed.** The SPA re-renders that input under the cursor, and a
+`keyboard.type` burst spanning a re-render is silently truncated — measured, `thinkpad x220` landing as
+`th`, which then submitted a near-empty keyword and served the rail. The input is read back after
+typing and whatever did not land is re-sent; a query that still will not take is reported as
+`incomplete-keystrokes` rather than as a decline.
+
+The homepage is a 512-character footer-only shell for 8–14s before the app mounts, so "no input yet" is
+the normal state for the first ten seconds and is polled, not treated as a verdict. After Enter the
+router needs ~12s, and the SPA destroys the execution context on the way — a lost context is waited out,
+because it is the navigation landing rather than a failure.
+
 ## Headless vs headed
 
 Measured, same URL, one fresh context per run, sampling every 4s for 128–200s:
@@ -127,10 +178,16 @@ every run.
 | `search_suggest` | 14.8s | 9.7s / 23.9s | ok — 10 suggestions |
 | `related_items` | 14.8s | 14.9s / 65.9s | ok — 10 listings, `item_web_recommend` |
 | `recommendations` | 19.9s | 18.6s / 31.3s / 50.9s | ok — 10 real listings; `dom_recommendation` on three runs, `homepage_feed` fallback on a fourth (see below) |
-| `search_items` | 45.9s | 45.3s / 47.6s | **`SearchUnavailableError`** — declined by the site, see below |
+| `search_items` | 45.9s | 45.3s / 47.6s | **`SearchUnavailableError`** — see the retry note below |
 | `item_view` | 51.3s | 52.6s / 57.3s | **`DetailUnavailableError`** — detail block not served, see below |
 
 Six of eight work in both modes. The two failures are the same failure with or without the login dialog.
+
+**This table predates the searchbox rewrite and is out of date for `search_items`.** Search now types into
+goofish's own header input instead of navigating to `/search?q=`, and it succeeds: measured 8/8 live
+queries (`thinkpad x220`, `x220`, `iPhone 15 Pro`, `自行车`, `thinkpad t480`, `相机`, `显示器`,
+`机械键盘`), 7 of them on the first attempt, 18–40s. `item_view` still needs a re-read of the table
+below; it is a render-timing problem, not a site refusal.
 
 On a warm session the mtop tools drop to **~1–2s** — they are one request with no navigation: the four raw
 mtop calls measured 319ms (suggest), 646ms (recommend), 768ms (feed) and 9422ms (the match counter, which
@@ -138,8 +195,12 @@ is the one the server actually waits on). The figures above are cold-process, so
 Chromium launch and usually a page load, and on a loaded box the launch alone dominated the spread.
 
 The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
-flight runs to completion: at the 45s default and a 10–25s load you get two or three attempts, and a
-call can overshoot its budget by roughly one page load. With the 45s default `attempts: 4` is
+flight runs to completion: at the 150s default and a 10–25s load you get several attempts, and a call
+can overshoot its budget by roughly one page load.
+
+**The server runs windowed and needs a display.** goofish serves headless Chromium its risk-control
+page instead of the app, which leaves the three DOM tools with nothing to read, so headed is the
+default and a headless machine needs `xvfb-run` or an X server. The four mtop tools work either way. With the 45s default `attempts: 4` is
 unreachable — raise `XIANYU_SEARCH_BUDGET_S`, not `attempts`. Note that raising the budget alone does not
 help when the site is declining every load: a 280s budget with the default 4 attempts still stopped at
 90s on the attempt cap, and 200s of continuous polling on one page load never produced a result.
@@ -161,54 +222,28 @@ will not paint, and is live listings either way. The MCP server itself was drive
 stdio: `initialize`, `tools/list` returning all eight with their schemas and the no-account note on each,
 and a live `search_count` returning `{"ok":true,...,"match_count":28846}`.
 
-**Not working, right now, and the reason is the site, not this code.** Two of the eight fail in both
-modes on the same day:
+**Not working, right now, and the reason is the site, not this code.** One of the eight:
 
-- `search_items` — goofish declined the search. The page served the real app shell (filter bar,
-  `区域 1/1`, 加载中…) and then 20 cards under the `猜喜欢你` rail with "nothing found" and **zero**
-  occurrences of the query anywhere in the page text. It held there for 200s of polling. It is not
-  query-specific: `?q=iphone` produced a byte-identical page (2,308 bytes, same rail, same nothing-found).
-  With the dialog left alone and with the dialog closed, the outcome was the same (2,308 vs 2,306 bytes,
-  20 cards, rail, nothing-found, 0 query hits) — the click changes which pixels are covered, not
-  whether results exist. The guard correctly refused to return that rail as results.
-- `item_view` — the item page settles at ~2.4KB showing the `为你推荐` rail with real cards but **no
-  detail block for the requested listing**: no title, no price, no seller. On the shell page the dialog
-  is not even up (`ant-modal-mask` absent), so dismissal is not the missing ingredient. The tool raises
-  `DetailUnavailableError` rather than reporting a rail card as the listing.
+- `item_view` — the detail block is not served reliably. The page comes back as the 512-character
+  footer-only shell for up to **26s** on a slow link (20s on a warm one) and the detail block only
+  paints after that, so the call gives up before the page has finished arriving. This is a wait, not a
+  refusal, and it is why the readiness poll is 32s rather than the 6s it used to be.
 
-A third, intermittent state deserves naming because it is otherwise indistinguishable from "no results":
-goofish answers with its **risk-control page** instead of the app — a 200 whose entire body reads
-`非法访问 为了保障您的体验，请使用正常浏览器访问闲鱼~` with 35 bytes and zero cards. Headless Chromium got
-this on every run for 128s straight. Both scrapers now detect it and publish it (`blocked` in the
-`attempt_log`, `risk_control_page` on `recommendations`) instead of reporting it as an empty result set.
-It is server-side and lifts after a pause.
+  Separately, a listing whose title goofish renders only inside its description reports
+  `fields_missing: ["title"]` — the scraper is reading the real detail block and refusing to attribute
+  a *rail* card's title to the listing, which is the behaviour that keeps one listing's fields from
+  being reported as another's.
 
-**Earlier measurements, not re-confirmed today.** The A/B table above (30 real matches at t+12s with no
-dismissal, 0 with it) was measured before this pass and could not be reproduced today — the site now
-declines the search outright, so no arm produced results. Treat the *direction* (clicking hurts) as
-established and the specific 30-card number as historical. The item-page detail extraction including
-photos, and 50 pages of search results, come from the same earlier session and are likewise unverified
-today.
+**`search_items` used to fail here and no longer does.** An earlier run of this README reported it
+declining on every attempt. That was true of the design it describes — direct-URL navigation — and the
+fix was to stop navigating and type instead. It now returns real matches: 8/8 live queries, 7 on the
+first attempt, 18–40s. See [Search is a keystroke, not a URL](#search-is-a-keystroke-not-a-url).
 
-**Not reliable, by the site's design, not by this code's.** goofish decides *per page load* whether to
-serve search results; when it declines it does not call the search API at all and renders "nothing
-found" plus the 猜你喜欢 rail instead. Real browsers rarely see it; an automated client sees it much more
-often. So `search_items` retries, and a decline is reported as a decline — never as "no such results
-exist" and never as a page of recommendations dressed up as matches. A result set is only accepted
-when the page has no rail marker, does not say nothing was found, is not the risk-control page, and a
-*fraction* of its cards (realistically ≥20%, never fewer than one) have the whole query in the title.
-`token_hits` counts titles that hold every *word* of the query in any order; it is published so a
-word-order mismatch is diagnosable, but only the substring hits can be accepted. Steady-state
-`item_view` reliability is unproven: anonymous page rendering is throttled per IP and degrades to a
-footer-only shell with no error, which is why that tool reports `fields_present` / `fields_missing`
-rather than filling gaps in.
-
-**One environment note, because it looks exactly like a site failure.** If Chromium dies with
-`net::ERR_INSUFFICIENT_RESOURCES` on the *main document*, check the temp filesystem before blaming
-goofish: a full `/tmp` quota makes Chromium fail this way, and the network service reports it as a
-navigation error. Pointing `TMPDIR` at a filesystem with room (`/dev/shm`) made every failure in this
-pass disappear. The known-cause list in `capabilities` names this, and it is genuinely cause #2 — but
-note it can be a *quota*, not a size.
+**Still worth knowing about the site, because it will happen again.** goofish decides *per page load*
+whether to serve a given page, and an automated client is served a risk-control notice
+(`非法访问 / 请使用正常浏览器访问闲鱼`) far more often than a real browser is. That page is a 200 that
+renders no listing at all; the four mtop tools keep working through it because they need only the
+client. When that happens the DOM tools say `blocked: true` rather than reporting zero results.
 
 ## Guarantees, enforced by tests
 
@@ -239,7 +274,13 @@ note it can be a *quota*, not a size.
 ## Development
 
 ```bash
-node --test              # 40 tests, no network, no browser
-npx tsc --noEmit
-node src/index.ts        # stdio; refuses to run interactively
+npm test                 # 40 tests, no network, no browser
+npm run typecheck        # tsc --noEmit over src and test
+npm run build            # src/*.ts -> dist/*.js, what the tarball ships
+node src/index.ts        # stdio, run from source; refuses to run interactively
 ```
+
+`tsconfig.json` is `noEmit` on purpose — the source runs directly under Node's type stripping, so a
+clone needs no build step. `tsconfig.build.json` is the emit config for the published artifact, and the
+two differ only in that. Any import in `src/` keeps its `.ts` extension and `rewriteRelativeImportExtensions`
+turns it into a `.js` one at build time; do not hand-write `.js` imports.

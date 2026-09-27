@@ -1,16 +1,42 @@
 {
   "name": "xianyu-mcp",
   "version": "0.1.0",
-  "private": true,
   "description": "Read-only Xianyu (Goofish) MCP server that needs no Xianyu account. No cookies, no login, no stored credentials, no write tools.",
+  "license": "Apache-2.0",
+  "private": false,
   "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "xianyu-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
   "engines": {
     "node": ">=22.18"
   },
+  "keywords": [
+    "mcp",
+    "xianyu",
+    "goofish",
+    "model-context-protocol",
+    "scraping",
+    "read-only"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alperien/xianyu-mcp"
+  },
   "scripts": {
-    "start": "node src/index.ts",
+    "start": "node dist/index.js",
     "test": "node --test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build && npm run typecheck && npm test",
+    "build": "tsc -p tsconfig.build.json",
+    "dev": "node src/index.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",
