@@ -21,15 +21,13 @@ export const ITEM_FIELDS = ['title', 'price', 'want_count', 'browse_count', 'des
 // goofish renders anonymous pages as a coin flip: the same URL comes back fully rendered or as an empty shell. Retry a few times before calling it a failure. Reloads are cache-busted with a nonce, since a cached empty shell is exactly the failure to escape.
 const RENDER_ATTEMPTS = 5, RENDER_SETTLE_MS = 3500;
 const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
-// Readiness polling for the item page, spent once per item_view call rather than once per attempt.
-// Measured: the item page is a 512-character footer-only shell for as long as 26s on a slow link
-// (20s of that on a warm page, 3.4s of it indistinguishable from the shell), and `detail_rendered`
-// only flips once the detail block paints. The old 24 polls at 250ms were 6s -- comfortably inside
-// the shell window, so item_view gave up on every load and reported a *partial* success with
-// `fields_missing: "title|want_count"` while price, seller, description and images all came back.
-// 32s covers the measured worst case with room for a slower link; the poll is bounded by the call's
-// own budget either way, so a generous constant costs nothing on a page that renders early.
-const ITEM_READY_POLLS = 128;
+// The readiness poll for the item page, spent once per item_view call rather than once per attempt.
+// Measured: the item page is a 512-character footer-only shell for as long as 26s on a slow link, and
+// `detail_rendered` only flips once the detail block paints. The old 24 polls at 250ms were 6s -- well
+// inside the shell window, so item_view gave up on every load and reported a *partial* success with
+// `fields_missing` while price, seller, description and images all came back. The poll is additionally
+// capped by the call's remaining budget below, so it can never starve the reloads that actually help.
+const ITEM_READY_POLLS = 128, ITEM_READY_WAIT_MS = 32_000;
 // ---- search is not a URL, it is a keystroke. A 2x2x2 matrix (headed/headless x fresh/persistent
 // profile x direct-URL/search-input), one fresh browser per cell, and the only cell that returned
 // results was headed + fresh + the SPA's own search input: 30 cards, 29 of whose titles really
@@ -292,8 +290,13 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
     if (payload?.detail_rendered) break;
     if (tries >= RENDER_ATTEMPTS || Date.now() >= deadline) break;
     if (tries === 1) {
-      // Only the first load gets a readiness wait. If the listing has not painted within it, the page is a shell and reloading is the only thing that helps -- polling again on every retry just multiplies the wait by the attempt count, which is how this ended up taking a minute.
-      for (let i = 0; i < ITEM_READY_POLLS && !payload?.detail_rendered; i++) {
+      // Only the first load gets a readiness wait, and it is bounded by what is left of the budget
+      // rather than by its own constant: polling 32s and then reloading five times needs ~175s, so a
+      // poll that ran to its own limit spent the call's whole clock on page one and the tool gave up
+      // having never retried -- the reload is the thing that actually helps a shell, and a longer wait
+      // on the same shell is what starved it.
+      const until = Date.now() + Math.min(ITEM_READY_WAIT_MS, Math.max(0, deadline - Date.now()));
+      for (let i = 0; i < ITEM_READY_POLLS && !payload?.detail_rendered && Date.now() < until; i++) {
         await settle(page, 250);
         payload = await scrape(page, ITEM_SCRAPE_JS, { item_id: item, rails: RAIL_MARKERS }, 'item-page scrape');
       }
