@@ -217,7 +217,16 @@ const typeSearch = async (page: Page, query: string, deadline: number): Promise<
  *  guard as before, a *fraction* of the page's card titles having to really contain the query, so the
  *  rail can never be presented as results and `items` holds only the matches. The last attempt is
  *  the one direct-URL navigation, kept so that a refusal can quote a real page rather than a guess;
- *  it is expected to be refused, and that is reported as what it is. Nothing clicks anything. */
+ *  it is expected to be refused, and that is reported as what it is.
+ *
+ *  Nothing clicks anything, and that is a measured result rather than a style choice. goofish's
+ *  anonymous login dialog puts an ant-modal-mask over the header; the listings render *underneath* it,
+ *  so a read works through the mask and needs no dismissal. Measured headed, same URL, one fresh
+ *  context per arm: with nothing dismissed the cards were in the DOM by t+12s under the mask, while
+ *  dismissing at t+6s or t+12s clicked four close controls and the result list then never rendered at
+ *  any later sample, serving the 猜你喜欢 rail instead. The searchbox flow also has to `focus()`
+ *  rather than click, because Playwright's click actionability check times out against that mask
+ *  (measured: element resolved, never received the event) while `focus()` needs no pointer. */
 const searchItems = async ({ query, limit = 30, attempts = SEARCH_ATTEMPTS }: SearchArgs): Promise<Data> => {
   const q = requireQuery(query), maxAttempts = clamp(attempts, 1, MAX_SEARCH_ATTEMPTS), cap = clamp(limit, 1, MAX_LIMIT);
   const session = getSession(), log: any[] = [];
@@ -255,8 +264,14 @@ const searchItems = async ({ query, limit = 30, attempts = SEARCH_ATTEMPTS }: Se
     }
     if (Date.now() >= deadline) { log.push({ attempt: attemptNo, stopped: 'time budget reached' }); break; }
   }
-  const typed = log.filter((e) => e.via === 'searchbox'), last = log.filter((e) => e.scraped_cards !== undefined || e.error || e.retryable).pop() || {};
-  throw new SearchUnavailableError(`goofish never served a usable result set for ${JSON.stringify(q)} in ${Math.round((Date.now() - started) / 1000)}s, over ${log.filter((e) => e.attempt).length} attempt(s) of which ${typed.length} typed the query into the search box. `
+  // Count distinct attempts, not log entries. A searchbox attempt logs twice -- the typing step and
+  // then the scrape -- so counting entries reported "6 attempt(s)" for a call that made 3, and counted
+  // the typed attempts the same way. An operator reading a refusal to decide whether to raise
+  // `attempts` or the budget needs the real number.
+  const attemptsMade = new Set(log.filter((e) => e.attempt).map((e) => e.attempt)).size;
+  const typed = new Set(log.filter((e) => e.via === 'searchbox' && e.attempt).map((e) => e.attempt)).size;
+  const last = log.filter((e) => e.scraped_cards !== undefined || e.error || e.retryable).pop() || {};
+  throw new SearchUnavailableError(`goofish never served a usable result set for ${JSON.stringify(q)} in ${Math.round((Date.now() - started) / 1000)}s, over ${attemptsMade} attempt(s) of which ${typed} typed the query into the search box. `
     + 'Search here is a keystroke, not a URL: navigating to /search?q= is measured to serve the 猜你喜欢 rail instead of results (20 cards, zero query hits), so the query is typed into the header input and submitted. Typed attempts fail in four ways, all retried, and the counts say which: `no-search-input-on-homepage` means the homepage came back as a footer-only shell with no input at all, `incomplete-keystrokes` means the SPA re-rendered the input mid-typing and swallowed part of the query (`typed` is what actually landed, `wanted` the full query; the input is refocused and the tail re-sent before this is reported), `enter-did-not-submit` means the keys landed (`typed`) but the router never moved off `/`, and a `blocked: true` attempt is goofish serving its "非法访问 / 请使用正常浏览器" page instead of the app, which is server-side and lifts after a pause. A `token_hits` above `query_hits` means the page held matches that contain every word of the query but not the query as one substring.\n  stopped on: '
     + `${log.find((e) => e.stopped)?.stopped || 'the attempt count'}\n  last attempt: ${JSON.stringify(last)}\n  page text: ${JSON.stringify(String(payload.text_preview || '').slice(0, 140))}\n  the wall-clock budget XIANYU_SEARCH_BUDGET_S (150s default) is what bounds the retries, and one typed attempt is a 10-25s page load plus up to 15s waiting for the input to mount plus ~12s after Enter, so at the default budget the attempts argument above 3 never runs: raise the budget, not \`attempts\`. browse_feed and search_count are unaffected and always available.`);
 };

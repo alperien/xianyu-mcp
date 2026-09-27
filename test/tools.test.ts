@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BOOT_URL, exclusive, HOME, reloadFresh, Session, setSession } from '../src/browser.ts';
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
-import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, SCRAPE_CARDS_JS } from '../src/extract.ts';
+import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
 import { budget, TOOLS } from '../src/tools.ts';
 
 const run = (name: string) => {
@@ -27,27 +27,42 @@ const run = (name: string) => {
  *  resolves -- after `open`'s own allowlist check, before the caller's first read, the window the
  *  reviewer read a lookalike host off-site in. At `'read'`, on the first wait *after* a read, which is
  *  item_view's 6s readiness poll and the second read site. */
-const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[] } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
+const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
   const queues: Record<any, any[]> = { [FEED_NORMALIZE_JS as any]: [...(payloads.cards ?? [])], [ITEM_SCRAPE_JS as any]: [...(payloads.item ?? [])], [SCRAPE_CARDS_JS as any]: [...(payloads.scrape ?? [])] };
+  // The searchbox, as a real page holds it: mounted or not, with the keys that have landed so far.
+  const search = { mounted: 'search' in payloads ? payloads.search !== null : true, value: '' };
   let at = HOME, reads = 0;
   const page: any = {
     url: () => { reads++; return at; },
     waitForTimeout: async (ms: number) => { if (hijack && hijackAfter === 'read' && reads > 0) at = hijack; if (sleepMs) await new Promise((r) => setTimeout(r, sleepMs)); },
-    goto: async (u: string) => { at = u; },
+    goto: async (u: string) => { at = u; search.value = ''; },
+    // Only what typeSearch needs: the two in-page reads and the two key actions. `keyboard.type`
+    // truncates at `swallow` characters to reproduce the SPA eating a burst across a re-render.
+    keyboard: {
+      type: async (text: string) => { search.value = payloads.swallow ? text.slice(0, payloads.swallow) : text; },
+      press: async (key: string) => { if (key === 'Enter' && search.value) at = `${HOME}search?q=${encodeURIComponent(search.value)}`; },
+    },
     evaluate: async (fn: any) => {
       if (fn === MTOP_READY_JS) return 'ready';
+      if (fn === SEARCH_INPUT_JS) return search.mounted
+        ? { found: true, focused: true, value: search.value, inputs: 1, chars: 1200, path: '/' }
+        : { found: false, inputs: 0, chars: 512, path: '/', value: '' };
+      if (fn === SEARCH_STATE_JS) {
+        const onSearch = at.includes('/search');
+        return { typed: search.value, path: onSearch ? '/search' : '/', on_search: onSearch, cards: onSearch ? 30 : 0 };
+      }
       const q = queues[fn];
       if (!q) return null;   // the gallery nudge, and anything not a scraper
       return q.length > 1 ? q.shift() : q[0];
     },
   };
   const s: any = {
-    launches: 0, opened: [] as string[], specs: [] as any[][], raw,
+    launches: 0, opened: [] as string[], specs: [] as any[][], raw, search,
     ensureReady: async () => page,
     // NOT the real guard: this stand-in records what a tool asked for and loads it, nothing more.
     // The real `Session.open`, and the `ensureGoofishUrl` it runs before and after every goto, is
     // exercised for real in the two navigation tests below, against a fake Page.
-    open: async (u: string) => { s.opened.push(u); at = u; if (hijack && hijackAfter === 'open') queueMicrotask(() => { at = hijack; }); return page; },
+    open: async (u: string) => { s.opened.push(u); at = u; search.value = ''; if (hijack && hijackAfter === 'open') queueMicrotask(() => { at = hijack; }); return page; },
     call: async (spec: any) => { s.specs.push(spec); return s.raw; },
   };
   return s;
@@ -89,14 +104,37 @@ const domSession = (titles: string[], at = HOME, dialog = false) => {
   const overlay: Record<string, any[]> = dialog
     ? { '#baxia-dialog-close': [close('close')], '[class*="closeIcon"]': [close('icon')], '[class*="closeIconBg"]': [close('iconBg')], '[class*="dialog-close"]': [close('dclose')], '[class*="modal-close"]': [close('mclose')], '.ant-modal-mask': [{ getBoundingClientRect: () => ({ width: 1440, height: 900 }) }], 'iframe': [{ src: 'https://passport.goofish.com/iframe' }] }
     : {};
-  g.document = { body: { innerText: dialog ? '区域 1/50  登录后可查看更多\n联想 X220' : '' }, querySelector: (s: string) => overlay[s]?.[0] ?? null, querySelectorAll: (sel: string) => overlay[sel] ?? (sel === 'a[href*="/item?id="]' ? titles.map((t, i) => ({
+  // A real <input>, so SEARCH_INPUT_JS -- the one in-page function that finds, marks and focuses it --
+  // runs for real here rather than being mocked past. The geometry it selects on is >=100px wide in
+  // the top 400px, so the fixture has to be the right size or the test measures a search tool aimed at
+  // a document with no search box.
+  const input: any = { value: '', attrs: {} as Record<string, string>, getBoundingClientRect: () => ({ width: 320, height: 40, top: 60 }), setAttribute(this: any, k: string, v: string) { this.attrs[k] = v; }, focus: () => {}, getAttribute(this: any, k: string) { return this.attrs[k] ?? null; } };
+  const cardEls: any[] = titles.map((t, i) => ({
     href: `https://www.goofish.com/item?id=${100 + i}`, innerText: `${t} ¥9`, getAttribute: () => null,
     // the price and seller cells are one level deeper than the title cell, as they are in a real card
     querySelector: (sel: string) => (sel.includes('price') || sel.includes('seller') ? { querySelector: () => ({ textContent: '' }) } : { textContent: t }),
     querySelectorAll: () => [],
-  })) : []) };
-  const page: any = { url: () => at, waitForTimeout: async () => {}, evaluate: async (fn: any, arg: any) => fn(arg) };
-  const s: any = { launches: 0, opened: [] as string[], specs: [] as any[][], raw: {}, ensureReady: async () => page, open: async (u: string) => { s.opened.push(u); return page; }, call: async () => ({}), clicks };
+  }));
+  g.document = {
+    body: { innerText: dialog ? '区域 1/50  登录后可查看更多\n联想 X220' : '' },
+    activeElement: input,
+    querySelector: (s: string): any => (s === 'input' ? input : overlay[s]?.[0] ?? (input.attrs['data-xianyu-search'] ? input : null)),
+    querySelectorAll: (sel: string) => (sel === 'input' ? [input] : overlay[sel] ?? (sel === 'a[href*="/item?id="]' ? cardEls : [])),
+  };
+  // The in-page scripts read `location` and `window` off globalThis and throw without them; a missing
+  // global is a TypeError that reads like a product bug, which is how a real one hides.
+  g.window = { innerHeight: 900, innerWidth: 1440 };
+  let here = at;
+  g.location = { get pathname() { return new URL(here).pathname; }, get search() { return new URL(here).search; }, href: here };
+  // The typed query really navigates, so SEARCH_STATE_JS answers on_search: true -- otherwise the tool
+  // would report a refusal and the test would be measuring the wrong thing entirely.
+  const page: any = {
+    url: () => here,
+    waitForTimeout: async () => {},
+    evaluate: async (fn: any, arg: any) => fn(arg),
+    keyboard: { type: async (t: string) => { input.value += t; }, press: async (k: string) => { if (k === 'Enter' && input.value) here = `${HOME}search?q=${encodeURIComponent(input.value)}`; } },
+  };
+  const s: any = { launches: 0, opened: [] as string[], specs: [] as any[][], raw: {}, ensureReady: async () => page, open: async (u: string) => { s.opened.push(u); here = u; input.value = ''; return page; }, call: async () => ({}), clicks };
   return use(s);
 };
 
@@ -108,7 +146,7 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
   use(s);
   return { s, page };
 };
-test.afterEach(() => { setSession(null); delete (globalThis as any).document; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; });
+test.afterEach(() => { setSession(null); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -163,7 +201,10 @@ test('search_items never hands back the recommendation rail as results', async (
   await assert.rejects(run('search_items')({ query: 'x220', attempts: 3 }), (e: any) => {
     assert.ok(e instanceof SearchUnavailableError);
     assert.equal(e.message.includes('木瓜丝'), false, 'a rail card title leaked into the refusal');
-    assert.match(e.message, /declined per page load/);
+    // The refusal must name the rail and the evidence, not the mechanism that produced it. The old
+    // wording ("declined per page load") described direct-URL navigation, which the searchbox rewrite
+    // replaced; what still has to be true is that the rail was seen, and refused.
+    assert.match(e.message, /"rail":"猜你喜欢"/);
     return true;
   });
   assert.equal(s.opened.length, 3, 'it retried with fresh loads before giving up');
@@ -200,7 +241,11 @@ test('search_items accepts a later load that serves real matches, counts only th
   assert.ok(out.items.every((i: any) => i.matches_query));
   // and no card calls itself a recommendation
   assert.equal('source' in out.items[0], false);
-  assert.deepEqual({ rendered: out.attempt_log[0].rendered, rail: out.attempt_log[0].rail, query_hits: out.attempt_log[0].query_hits }, { rendered: true, rail: '猜你喜欢', query_hits: 0 });
+  // The declined first attempt is in the log. Index 0 is the typed-search step rather than the
+  // scrape, since the searchbox path logs that too; the scrape entry is the one carrying `rendered`.
+  const declined = out.attempt_log.find((e: any) => 'rendered' in e);
+  assert.deepEqual({ rendered: declined.rendered, rail: declined.rail, query_hits: declined.query_hits }, { rendered: true, rail: '猜你喜欢', query_hits: 0 });
+  assert.equal(out.attempt_log[0].via, 'searchbox', 'the first attempt typed the query rather than navigating to a URL');
 });
 
 test('search_items over-asks the scraper, so leading non-matching cards cannot fake an empty result set', async () => {
@@ -276,7 +321,7 @@ test('search_items reads results out from under the login dialog, and never clic
   const out = await run('search_items')({ query: 'x220', limit: 5, attempts: 1 });
   assert.deepEqual([out.count, out.query_hits, out.scraped_cards], [5, 12, 12]);
   assert.ok(out.items.every((i: any) => i.matches_query && /X220/.test(i.title)), 'the matches came out of the page, not out of a rail');
-  assert.equal(out.attempt_log[0].blocked, false, 'a page under the dialog is not a risk-control page');
+  assert.equal(out.attempt_log.find((e: any) => 'rendered' in e).blocked, false, 'a page under the dialog is not a risk-control page');
   assert.deepEqual(s.clicks, [], 'the read path clicked the dialog -- the state it used to trigger');
 
   // The tripwire has teeth: a document whose close controls are the only way its cards appear cannot
@@ -299,7 +344,12 @@ test('a wall-clock budget stops search_items instead of letting it hold the call
     assert.ok(e instanceof SearchUnavailableError);
     // and it does not claim zero attempts after a real page load, which is what the clock-break used
     // to do: it pushed a marker with no `attempt` on it and the count filtered on that field
-    assert.match(e.message, /\b1 attempt\(s\) in \d+s/);
+    // The count and the clock are asserted separately. The old regex ran them together
+    // ("1 attempt(s) in 6s"), which only ever held because the elapsed time was interpolated
+    // between the two words -- an assertion about message layout, not about the budget stopping it.
+    assert.match(e.message, /\b1 attempt\(s\)/);
+    assert.match(e.message, /in \d+s/);
+    assert.match(e.message, /stopped on: time budget reached/);
     return true;
   });
   assert.equal(s.opened.length, 1, 'it stopped on the clock, not on the attempt count');

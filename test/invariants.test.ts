@@ -259,7 +259,10 @@ test('the read path never clicks the page: the login dialog is left alone, on ev
   const toolsSrc = read(join(ROOT, 'src', 'tools.ts'));
   const search = toolsSrc.match(/const searchItems = async[\s\S]*?\n};/)?.[0] ?? '';
   assert.ok(search.includes('SCRAPE_CARDS_JS'));
-  assert.match(search, /settle\(page, 700\);\s*\n\s*\/\/ Over-ask/, 'the poll loop must go straight from waiting to reading');
+  // The wait is immediately followed by the read, with the over-ask rationale in between. The delay
+  // itself is deliberately not pinned: what matters is the order and the reason, and a test that
+  // asserted "700" broke the moment the poll interval was retuned with nothing getting worse.
+  assert.match(search, /await settle\(page, \d+\);\s*\n\s*\/\/ Over-ask[^]*?scrape\(page, SCRAPE_CARDS_JS/, 'the poll loop must go straight from waiting to reading');
   assert.equal(/\bdismiss[A-Za-z]*\(/.test(open + search), false);
   // the measurement is written down where the next reader of this function will actually see it: on
   // the doc comment above it, not only in this test file
