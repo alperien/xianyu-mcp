@@ -31,7 +31,10 @@ export const SEARCH_INPUT_JS = (mark: string): any => {
   if (!el) return { found: false, inputs: document.querySelectorAll('input').length, chars: (document.body?.innerText || '').length, path: location.pathname };
   el.setAttribute(mark, '1');
   el.focus();
-  return { found: true, focused: document.activeElement === el, inputs: document.querySelectorAll('input').length, chars: (document.body?.innerText || '').length, path: location.pathname };
+  // `value` is read from the live element the caller is about to type into, so the caller can confirm
+  // the keys arrived instead of assuming they did. The SPA re-renders this input under the cursor, and
+  // a keystroke burst that spans a re-render splits: measured, "thinkpad x220" arriving as "th".
+  return { found: true, focused: document.activeElement === el, value: String(el.value ?? ''), inputs: document.querySelectorAll('input').length, chars: (document.body?.innerText || '').length, path: location.pathname };
 };
 
 /** Step 3 of search: everything the submit poll needs, in one round-trip. `typed` is read from the

@@ -21,7 +21,15 @@ export const ITEM_FIELDS = ['title', 'price', 'want_count', 'browse_count', 'des
 // goofish renders anonymous pages as a coin flip: the same URL comes back fully rendered or as an empty shell. Retry a few times before calling it a failure. Reloads are cache-busted with a nonce, since a cached empty shell is exactly the failure to escape.
 const RENDER_ATTEMPTS = 5, RENDER_SETTLE_MS = 3500;
 const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
-const ITEM_READY_POLLS = 24;   // 6s of readiness polling, spent once per item_view call rather than once per attempt
+// Readiness polling for the item page, spent once per item_view call rather than once per attempt.
+// Measured: the item page is a 512-character footer-only shell for as long as 26s on a slow link
+// (20s of that on a warm page, 3.4s of it indistinguishable from the shell), and `detail_rendered`
+// only flips once the detail block paints. The old 24 polls at 250ms were 6s -- comfortably inside
+// the shell window, so item_view gave up on every load and reported a *partial* success with
+// `fields_missing: "title|want_count"` while price, seller, description and images all came back.
+// 32s covers the measured worst case with room for a slower link; the poll is bounded by the call's
+// own budget either way, so a generous constant costs nothing on a page that renders early.
+const ITEM_READY_POLLS = 128;
 // ---- search is not a URL, it is a keystroke. A 2x2x2 matrix (headed/headless x fresh/persistent
 // profile x direct-URL/search-input), one fresh browser per cell, and the only cell that returned
 // results was headed + fresh + the SPA's own search input: 30 cards, 29 of whose titles really
@@ -173,7 +181,22 @@ const typeSearch = async (page: Page, query: string, deadline: number): Promise<
     await settle(page, 400);
   }
   if (!box?.found) return { retryable: 'no-search-input-on-homepage', inputs_on_page: box?.inputs ?? 0, page_chars: box?.chars ?? 0, home_path: box?.path || '' };
-  await page.keyboard.type(query, { delay: 60 });
+  // Type, then READ BACK what the input actually holds. goofish's SPA re-renders the search input
+  // under the cursor, and a `keyboard.type` burst that spans a re-render is silently truncated:
+  // measured, "thinkpad x220" landing as "th", which then submits an empty-ish keyword and returns
+  // the rail, which used to be reported as a refusal. The input is refocused and the missing tail
+  // re-sent until it holds the whole query, so a lost keystroke is a retry rather than a wrong answer.
+  // A cleared field is typed from the start (the SPA discarded the prefix, not just the tail).
+  for (let tries = 0; tries < 4; tries++) {
+    const held = String(box?.value ?? '');
+    if (held === query) break;
+    if (held && query.startsWith(held)) await page.keyboard.type(query.slice(held.length), { delay: 60 });
+    else { await scrape(page, SEARCH_INPUT_JS, SEARCH_MARK, 'search input refocus'); await page.keyboard.type(query, { delay: 60 }); }
+    await settle(page, 350);
+    box = await scrape(page, SEARCH_INPUT_JS, SEARCH_MARK, 'search input read-back');
+    if (box?.value === query) break;
+  }
+  if (box?.value !== query) return { retryable: 'incomplete-keystrokes', typed: String(box?.value ?? ''), wanted: query, home_path: box?.path || '' };
   await page.keyboard.press('Enter');
   let state: any = { typed: '', on_search: false, cards: 0 }, lostContexts = 0;
   for (let until = Date.now() + Math.min(SEARCH_RESULT_WAIT_MS, Math.max(0, deadline - Date.now())); Date.now() < until;) {
@@ -234,7 +257,7 @@ const searchItems = async ({ query, limit = 30, attempts = SEARCH_ATTEMPTS }: Se
   }
   const typed = log.filter((e) => e.via === 'searchbox'), last = log.filter((e) => e.scraped_cards !== undefined || e.error || e.retryable).pop() || {};
   throw new SearchUnavailableError(`goofish never served a usable result set for ${JSON.stringify(q)} in ${Math.round((Date.now() - started) / 1000)}s, over ${log.filter((e) => e.attempt).length} attempt(s) of which ${typed.length} typed the query into the search box. `
-    + 'Search here is a keystroke, not a URL: navigating to /search?q= is measured to serve the 猜你喜欢 rail instead of results (20 cards, zero query hits), so the query is typed into the header input and submitted. Typed attempts fail in three ways, all retried, and the counts say which: `no-search-input-on-homepage` means the homepage came back as a footer-only shell with no input at all, `enter-did-not-submit` means the keys landed (`typed`) but the router never moved off `/`, and a `blocked: true` attempt is goofish serving its "非法访问 / 请使用正常浏览器" page instead of the app, which is server-side and lifts after a pause. A `token_hits` above `query_hits` means the page held matches that contain every word of the query but not the query as one substring.\n  stopped on: '
+    + 'Search here is a keystroke, not a URL: navigating to /search?q= is measured to serve the 猜你喜欢 rail instead of results (20 cards, zero query hits), so the query is typed into the header input and submitted. Typed attempts fail in four ways, all retried, and the counts say which: `no-search-input-on-homepage` means the homepage came back as a footer-only shell with no input at all, `incomplete-keystrokes` means the SPA re-rendered the input mid-typing and swallowed part of the query (`typed` is what actually landed, `wanted` the full query; the input is refocused and the tail re-sent before this is reported), `enter-did-not-submit` means the keys landed (`typed`) but the router never moved off `/`, and a `blocked: true` attempt is goofish serving its "非法访问 / 请使用正常浏览器" page instead of the app, which is server-side and lifts after a pause. A `token_hits` above `query_hits` means the page held matches that contain every word of the query but not the query as one substring.\n  stopped on: '
     + `${log.find((e) => e.stopped)?.stopped || 'the attempt count'}\n  last attempt: ${JSON.stringify(last)}\n  page text: ${JSON.stringify(String(payload.text_preview || '').slice(0, 140))}\n  the wall-clock budget XIANYU_SEARCH_BUDGET_S (150s default) is what bounds the retries, and one typed attempt is a 10-25s page load plus up to 15s waiting for the input to mount plus ~12s after Enter, so at the default budget the attempts argument above 3 never runs: raise the budget, not \`attempts\`. browse_feed and search_count are unaffected and always available.`);
 };
 
@@ -243,7 +266,10 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
   const item = normalizeItemId(item_id);
   if (!item) throw new XianyuError(`item_id must be digits or a goofish item URL, got ${JSON.stringify(item_id)}`);
   // The clock starts before the load, not after it: a budget that ignores the slowest step in the call is not a budget.
-  const started = Date.now(), deadline = started + budget('ITEM_VIEW', 45) * 1000;
+  // 90s, not 45: the slowest measured load is 25s and the readiness poll now runs up to 32s, so a
+  // 45s budget would cut the poll short on exactly the slow pages the longer poll exists for. A
+  // budget smaller than the work it bounds is the same defect as no wait at all.
+  const started = Date.now(), deadline = started + budget('ITEM_VIEW', 90) * 1000;
   const session = getSession(), page = await session.open(`${HOME}item?id=${item}`);
   let payload: any = {}, tries = 0;
   for (tries = 1; tries <= RENDER_ATTEMPTS; tries++) {
