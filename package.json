@@ -1,0 +1,24 @@
+{
+  "name": "xianyu-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only Xianyu (Goofish) MCP server that needs no Xianyu account. No cookies, no login, no stored credentials, no write tools.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "playwright": "^1.63.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^5.9.0"
+  }
+}
