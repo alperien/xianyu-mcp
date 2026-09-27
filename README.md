@@ -74,7 +74,7 @@ one browser, one page — so two tools in flight cannot navigate each other out 
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
 | `search_items` | `query`, `limit` (d30), `attempts` (1–10, d4) | `items[]` of matches only (`matches_query` always true), `count` (matches), `query_hits` (whole query as a substring), `token_hits` (every word of the query, any order — a looser superset, published so a word-order refusal is diagnosable), `min_query_hits`, `scraped_cards`, `non_matching_count`, `attempt_log` (each entry carries `blocked`, so a risk-control page is distinguishable from a declined search), `source: search_page_dom`. Raises `SearchUnavailableError` rather than returning the rail. |
 | `related_items` | `item_id` (optional), `limit` (d30), `page` (1–10000, d1) | `items[]` (feed card shape), `raw_cards`, `unique_items`, `has_more`, `source: item_web_recommend` |
-| `item_view` | `item_id` (digits or item URL) | `title, price, want_count, browse_count, description, seller, seller_tenure_years, seller_items_sold, seller_positive_rate, image_urls`, plus `fields_present` / `fields_missing`, `page_item_id`, `reco_anchors`, `image_candidates`, `source: item_page_dom` |
+| `item_view` | `item_id` (digits or item URL) | `title, price, want_count, browse_count, description, seller, seller_tenure_years, seller_items_sold, seller_positive_rate, image_urls`, plus `condition`, `brand`, `city`, `fields_present` / `fields_missing`, `page_item_id`, `reco_anchors`, `image_candidates`, and `source`: **`item_page_dom`** (everything, when goofish serves the detail block) or **`search_card`** (title/price/condition/brand/city from the search results, when it does not — see [item_view](#what-is-verified-and-what-is-not)) |
 | `recommendations` | `limit` (d30), `url` (optional) | `items[]`, `rail`, `page_url`, `attempts`, `risk_control_page`, `count`, `source: dom_recommendation` — or `source: homepage_feed` with `fallback_reason` when the DOM will not render |
 
 ## The login dialog is left alone, on purpose
@@ -178,16 +178,17 @@ every run.
 | `search_suggest` | 14.8s | 9.7s / 23.9s | ok — 10 suggestions |
 | `related_items` | 14.8s | 14.9s / 65.9s | ok — 10 listings, `item_web_recommend` |
 | `recommendations` | 19.9s | 18.6s / 31.3s / 50.9s | ok — 10 real listings; `dom_recommendation` on three runs, `homepage_feed` fallback on a fourth (see below) |
-| `search_items` | 45.9s | 45.3s / 47.6s | **`SearchUnavailableError`** — see the retry note below |
-| `item_view` | 51.3s | 52.6s / 57.3s | **`DetailUnavailableError`** — detail block not served, see below |
+| `search_items` | 45.9s | 45.3s / 47.6s | ok on a typed retry — 8/8 live queries, 18–40s |
+| `item_view` | 51.3s | 52.6s / 57.3s | ok — 6/6 live listings, 4–13s, via the page or the search fallback |
 
 Six of eight work in both modes. The two failures are the same failure with or without the login dialog.
 
-**This table predates the searchbox rewrite and is out of date for `search_items`.** Search now types into
-goofish's own header input instead of navigating to `/search?q=`, and it succeeds: measured 8/8 live
+**This table predates two fixes and is out of date for the two DOM tools.** `search_items` now types
+into goofish's own header input instead of navigating to `/search?q=`, and succeeds: measured 8/8 live
 queries (`thinkpad x220`, `x220`, `iPhone 15 Pro`, `自行车`, `thinkpad t480`, `相机`, `显示器`,
-`机械键盘`), 7 of them on the first attempt, 18–40s. `item_view` still needs a re-read of the table
-below; it is a render-timing problem, not a site refusal.
+`机械键盘`), 7 on the first attempt, 18–40s. `item_view` falls back to the search route when the
+item page will not render, and succeeds: 6/6 live listings, 4–13s. The columns below predate both and
+are kept only as the record of what was measured at the time.
 
 On a warm session the mtop tools drop to **~1–2s** — they are one request with no navigation: the four raw
 mtop calls measured 319ms (suggest), 646ms (recommend), 768ms (feed) and 9422ms (the match counter, which
@@ -222,28 +223,35 @@ will not paint, and is live listings either way. The MCP server itself was drive
 stdio: `initialize`, `tools/list` returning all eight with their schemas and the no-account note on each,
 and a live `search_count` returning `{"ok":true,...,"match_count":28846}`.
 
-**Not working, right now, and the reason is the site, not this code.** One of the eight:
+**`item_view` works, but the item page is login-gated, so it has two routes.**
 
-- `item_view` — the detail block is not served reliably. The page comes back as the 512-character
-  footer-only shell for up to **26s** on a slow link (20s on a warm one) and the detail block only
-  paints after that, so the call gives up before the page has finished arriving. This is a wait, not a
-  refusal, and it is why the readiness poll is 32s rather than the 6s it used to be.
+goofish does not serve item pages to logged-out visitors. The page's own call to the item-detail API
+answers `TIMEOUT::接口超时` through the page's own client on both the web and h5 hosts; called directly
+without that client it answers `RGV587_ERROR` and hands back a passport redirect. So the SPA mounts,
+is refused, and draws the 猜你喜欢 rail instead of the listing — measured over 120s on several live
+listings, with `为你推荐` sitting at character 18 and `立即购买` / `担保交易` never appearing.
 
-  Separately, a listing whose title goofish renders only inside its description reports
-  `fields_missing: ["title"]` — the scraper is reading the real detail block and refusing to attribute
-  a *rail* card's title to the listing, which is the behaviour that keeps one listing's fields from
-  being reported as another's.
+`item_view` therefore does two things, and tells you which one answered:
 
-**`search_items` used to fail here and no longer does.** An earlier run of this README reported it
-declining on every attempt. That was true of the design it describes — direct-URL navigation — and the
-fix was to stop navigating and type instead. It now returns real matches: 8/8 live queries, 7 on the
-first attempt, 18–40s. See [Search is a keystroke, not a URL](#search-is-a-keystroke-not-a-url).
+| | when | what you get |
+|---|---|---|
+| `source: item_page_dom` | goofish served the detail block | everything: title, price, want/browse counts, description, seller stats, gallery |
+| `source: search_card` | the page did not render, but search has the listing | title, price, condition, brand, city — and `fields_missing` naming the description, the gallery and the seller statistics, which exist only behind the login gate |
 
-**Still worth knowing about the site, because it will happen again.** goofish decides *per page load*
-whether to serve a given page, and an automated client is served a risk-control notice
-(`非法访问 / 请使用正常浏览器访问闲鱼`) far more often than a real browser is. That page is a 200 that
-renders no listing at all; the four mtop tools keep working through it because they need only the
-client. When that happens the DOM tools say `blocked: true` rather than reporting zero results.
+The fallback is keyed on `item_id`, not on a query, so it cannot return a similarly-named listing.
+Search results are remembered for the process, so the ordinary sequence — `search_items` then
+`item_view` on a result — is fast: measured 6/6 across six live listings in 4–13s.
+
+If neither route finds it, the error says the item detail is login-gated and the listing may have been
+sold or removed. It does not tell you to look for a throttled IP, which is what an earlier version of
+this README did and what was wrong.
+
+**Still worth knowing about the site.** goofish decides *per page load* whether to serve a given page,
+and an automated client is served a risk-control notice (`非法访问 / 请使用正常浏览器访问闲鱼`) more often
+than a real browser is. That page is a 200 that renders no listing at all; the four mtop tools keep
+working through it because they need only the client. When it happens the DOM tools say `blocked: true`
+rather than reporting zero results. Its own edge also fails outright sometimes, serving a `网络不见了`
+page — named as `site_error`, and retried rather than waited on.
 
 ## Guarantees, enforced by tests
 
