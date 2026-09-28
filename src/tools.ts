@@ -35,7 +35,7 @@ const ITEM_MOUNT_WAIT_MS = 8_000;
 // rail-only page is a rail-only page; the old five is what turned a 15s answer into a 2 minute one.
 const HOPELESS_LOADS = 1;
 // How long item_view may spend looking for its listing through the anonymous search route.
-const SEARCH_FIND_MS = 100_000;
+const SEARCH_FIND_MS = 45_000;
 // ---- search is not a URL, it is a keystroke. A 2x2x2 matrix (headed/headless x fresh/persistent
 // profile x direct-URL/search-input), one fresh browser per cell, and the only cell that returned
 // results was headed + fresh + the SPA's own search input: 30 cards, 29 of whose titles really
@@ -283,6 +283,27 @@ const searchItems = async ({ query, limit = 30, attempts = SEARCH_ATTEMPTS }: Se
     + `${log.find((e) => e.stopped)?.stopped || 'the attempt count'}\n  last attempt: ${JSON.stringify(last)}\n  page text: ${JSON.stringify(String(payload.text_preview || '').slice(0, 140))}\n  the wall-clock budget XIANYU_SEARCH_BUDGET_S (150s default) is what bounds the retries, and one typed attempt is a 10-25s page load plus up to 15s waiting for the input to mount plus ~12s after Enter, so at the default budget the attempts argument above 3 never runs: raise the budget, not \`attempts\`. browse_feed and search_count are unaffected and always available.`);
 };
 
+/** The shape item_view returns when the answer came from a search card rather than the item page.
+ *  A search card really does carry title, price, condition, brand and city. The description, the
+ *  gallery, the seller and the seller's statistics live only behind the login-gated detail API, and
+ *  stay empty so `fields_missing` names them rather than the tool implying it looked and found
+ *  nothing. `pageAttempts` is 0 for a cache hit, which never loaded a page. */
+const cardEnvelope = (item: string, card: any, pageAttempts: number, scrapeAttempts: number): Data => {
+  const fields = {
+    title: card.title || '', price: String(card.price || '').replace(/^¥/, ''), description: '',
+    want_count: '', browse_count: '', seller: '', seller_tenure_years: '', seller_items_sold: '',
+    seller_positive_rate: '', image_urls: [],
+    condition: card.condition || '', brand: card.brand || '', city: card.city || '',
+  };
+  return { item_id: item, page_item_id: item, url: `${HOME}item?id=${item}`, source: 'search_card', account_required: false,
+    attempts: pageAttempts || scrapeAttempts || 1, page_attempts: pageAttempts,
+    reco_anchors: 0, image_candidates: 0,
+    fields_present: ITEM_FIELDS.filter((f) => present(fields[f])), fields_missing: ITEM_FIELDS.filter((f) => !present(fields[f])),
+    ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])),
+    condition: fields.condition, brand: fields.brand, city: fields.city,
+    note: 'goofish does not serve item pages to logged-out visitors: the page\'s own item-detail call is login-gated (RGV587_ERROR -> passport) and times out through the page\'s client, so only the 猜你喜欢 rail renders. This is the listing as the search results publish it, not the detail block. The description, the photo gallery and the seller\'s tenure and sales figures exist only behind that login-gated API and are reported missing rather than guessed.' };
+};
+
 /** Find one listing by id, through the anonymous search route.
  *
  *  The item page is login-gated (see itemView), so this is the only anonymous way to a specific
@@ -294,7 +315,7 @@ const searchItems = async ({ query, limit = 30, attempts = SEARCH_ATTEMPTS }: Se
  *
  *  Bounded by the caller's remaining budget, and it shares the one browser: the page is already
  *  parked on goofish by the time this runs. */
-const FIND_QUERIES = ['二手', '闲置', '全新', '包邮', 'iPhone', '相机', '笔记本', '显示器', '家具', '自行车', '手机', '键盘'];
+const FIND_QUERIES = ['二手', '相机', '笔记本', 'iPhone', '显示器', '家具', '全新', '包邮'];
 /** Ids search has already returned this process, newest last. `search_items` fills it, and item_view
  *  checks it first: searching for a term and then viewing a result is the ordinary sequence, and in
  *  that case the listing is already in hand and the lookup is free. A cache miss changes nothing --
@@ -304,7 +325,7 @@ const seenIds = new Map<string, any>();
 const rememberCard = (it: any): void => { if (it?.item_id) { seenIds.delete(String(it.item_id)); seenIds.set(String(it.item_id), it); if (seenIds.size > 500) seenIds.delete(seenIds.keys().next().value as string); } };
 const findCardBySearch = async (item: string, budgetMs: number): Promise<any | null> => {
   const cached = seenIds.get(item);
-  if (cached) return cached;
+  if (cached) return cached;   // a listing this process already returned; no sweep needed
   const deadline = Date.now() + Math.min(budgetMs, SEARCH_FIND_MS);
   for (const q of FIND_QUERIES) {
     if (Date.now() >= deadline) return null;
@@ -331,6 +352,10 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
   // call timed out on exactly the slow loads the wait exists for, while a warm load sailed through in
   // 8s. 150s covers the measured cold path with room for the retries that a genuine shell still needs.
   const started = Date.now(), deadline = started + budget('ITEM_VIEW', 150) * 1000;
+  // Try the item page first, always: when goofish serves the detail block it carries ten fields, and
+  // the search card carries two. A cache hit short-circuits only the *search sweep* below -- the route
+  // that costs a dozen page loads -- not the page itself. An earlier version returned the cached card
+  // outright and threw away the eight fields the page was about to supply.
   const session = getSession(), page = await session.open(`${HOME}item?id=${item}`);
   let payload: any = {}, tries = 0;
   for (tries = 1; tries <= RENDER_ATTEMPTS; tries++) {
@@ -395,31 +420,14 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
     // seller, city, want_count, image_urls -- for real listings. So answer from there, keyed on the
     // id rather than the query, and say plainly which fields that route cannot supply.
     const card = await findCardBySearch(item, Math.max(0, deadline - Date.now()));
-    if (card) {
-      // Map the search card onto item_view's documented fields. A search card really does carry
-      // title, price, condition, brand and city; the description, the gallery, the seller and the
-      // seller's statistics live only behind the login-gated detail API, and stay empty so that
-      // fields_missing names them rather than the tool implying it looked and found nothing.
-      const fields = {
-        title: card.title || '', price: (card.price || '').replace(/^¥/, ''), description: '',
-        want_count: '', browse_count: '', seller: '', seller_tenure_years: '', seller_items_sold: '',
-        seller_positive_rate: '', image_urls: [],
-        condition: card.condition || '', brand: card.brand || '', city: card.city || '',
-      };
-      return { item_id: item, page_item_id: item, url: `${HOME}item?id=${item}`, source: 'search_card', account_required: false,
-        attempts: tries, page_attempts: tries, reco_anchors: 0, image_candidates: (card.image_urls || []).length,
-        fields_present: ITEM_FIELDS.filter((f) => present(fields[f])), fields_missing: ITEM_FIELDS.filter((f) => !present(fields[f])),
-        ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])),
-        condition: fields.condition, brand: fields.brand, city: fields.city,
-        note: 'goofish does not serve item pages to logged-out visitors: the page\'s own item-detail call is login-gated (RGV587_ERROR -> passport) and times out through the page\'s client, so only the 猜你喜欢 rail renders. This is the listing as the search results publish it, not the detail block. The description, the photo gallery and the seller\'s tenure and sales figures exist only behind that login-gated API and are reported missing rather than guessed.' };
-    }
+    if (card) return cardEnvelope(item, card, tries, 0);
     // Nothing to report. Name the cause rather than the symptom -- "would not render" sent the
     // previous reader looking for a throttled IP, which is not what this is.
     const why = payload?.site_error ? 'goofish served its own "网络不见了" error page on every attempt'
       : payload?.rail_only ? 'every load mounted the app and held only recommendation cards, with no listing in it'
       : 'the page stayed an empty shell';
     throw new DetailUnavailableError(
-      `item ${item} could not be read for this anonymous visitor after ${tries} page load(s) in ${Math.round((Date.now() - started) / 1000)}s: ${why}, and the listing was not reachable through search either. goofish gates item detail behind a login -- the API answers RGV587_ERROR and redirects to passport -- so there is no anonymous route to this item; it may have been sold or removed. `
+      `item ${item} could not be read for this anonymous visitor after ${tries} page load(s) in ${Math.round((Date.now() - started) / 1000)}s: ${why}, and a search sweep did not surface it either. goofish gates item detail behind a login -- the API answers RGV587_ERROR and redirects to passport -- so an item is reachable anonymously only if some live search result still carries it. This id is most likely sold, removed, or too old to appear in current results. If you got it from an earlier search_items call in this session, item_view returns it from that result without re-searching. `
       + `Page text: ${JSON.stringify(String(payload?.head_preview || '').slice(0, 160))}`);
   }
   // Unconditional: a page that renders the detail block but has no `?id=` in its URL is a redirect or a challenge page, not the listing, and skipping the check when `served` is empty is what let an off-site page's fields be reported as this item's.

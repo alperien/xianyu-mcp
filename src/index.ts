@@ -29,4 +29,19 @@ if (process.stdin.isTTY) {
 }
 const transport = new StdioServerTransport();
 transport.onclose = () => { void getSession().close(); };   // do not leave a Chromium process running
+// A client that stops reading, or a supervisor that sends a signal, closes neither the transport nor
+// stdin -- and this process holds a real windowed Chromium, so the browser has to be torn down on the
+// way out rather than left for the OS. `once`, and re-entrant, because SIGINT then SIGTERM within a
+// second of each other is the normal shape of a Ctrl-C and a supervisor following it.
+let closing = false;
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as NodeJS.Signals[]) {
+  process.on(signal, () => {
+    if (closing) return;
+    closing = true;
+    void getSession().close().catch(() => {}).finally(() => process.exit(0));
+  });
+}
+// The browser dies with us either way; this only makes it prompt rather than incidental, and covers
+// the case where a crash handler or an unhandled rejection takes the process down instead of a signal.
+process.on('exit', () => { void getSession().close(); });
 await mcp.connect(transport);
