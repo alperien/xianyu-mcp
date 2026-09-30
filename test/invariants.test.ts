@@ -52,15 +52,21 @@ test('no credential access anywhere in the tree', () => {
   assert.equal(flat(['page.context()', '  .' + 'cookies()'].join('\n')).includes('.' + 'cookies('), true);
 });
 
-test('only the five read-only mtop APIs are named anywhere: a closed list, so a new one cannot slip in', () => {
+test('only the seven read-only mtop APIs are named anywhere: a closed list, so a new one cannot slip in', () => {
   const readApis = [
     'mtop.taobao.idlehome.home.webpc.feed',
     'mtop.taobao.idle.filter.hitnum.pc.get',
     'mtop.taobao.idlemtopsearch.pc.search.suggest',
     'mtop.taobao.idle.item.web.recommend.list',
     'mtop.taobao.idlemessage.pc.loginuser.get',
+    // The last two are never called by us -- they are named because the *page* calls them and
+    // item_view / search_items read the replies off the wire. Re-issuing either through the page's
+    // own mtop client answers TIMEOUT, because goofish stamps the calls its bundle originates with a
+    // per-call anti-bot blob. See `MtopTap`.
+    'mtop.taobao.idle.pc.detail',
+    'mtop.taobao.idlemtopsearch.pc.search',
   ];
-  assert.equal(readApis.length, 5);
+  assert.equal(readApis.length, 7);
   // `window.lib.mtop.request` is the page's own client method -- the one call this server is built
   // on -- not an API name. Everything else shaped like `mtop.<something>` is an API and is closed.
   const notAnApi = 'mtop.request';
@@ -77,7 +83,7 @@ test('only the five read-only mtop APIs are named anywhere: a closed list, so a 
     });
   }
   assert.deepEqual(offenders, []);
-  // every one of the five is actually reached, not just allowed
+  // every one of the seven is actually reached, not just allowed
   assert.deepEqual([...seen].sort(), [...readApis].sort());
   // and the pattern really is closed over the whole namespace, which the old two-namespace version
   // was not: a write API outside taobao/idle would have passed it. (Built by concatenation so that
@@ -101,6 +107,24 @@ test('every tool says that no account is required, and that it is read-only', ()
   }
 });
 
+test('the entry point does not serialise the tools: the lock belongs to the three DOM tools only', () => {
+  // The regression guard for a defect that shipped: index.ts wrapped *every* tool in `exclusive()`,
+  // so the four mtop-only tools queued behind a 70s search -- exactly the latency the two-page
+  // session exists to remove -- while browser.ts's own comment claimed they did not. Nothing failed,
+  // because the test that "proved" it called `t.run` directly and hand-wrapped the search itself.
+  // Read the source, because the property is about the entry point, not about any one tool's runtime.
+  const entry = readFileSync(join(ROOT, 'src', 'index.ts'), 'utf8');
+  assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all eight re-serialises the four fast tools behind every slow one.');
+  // ...and the lock really is on the three DOM tools, so the promise is kept rather than deleted.
+  const toolsSrc = readFileSync(join(ROOT, 'src', 'tools.ts'), 'utf8');
+  for (const name of ['searchItems', 'itemView', 'recommendations']) {
+    assert.match(toolsSrc, new RegExp(`run: locked\\(${name}\\)`), `${name} reads the shared navigating page and must take the lock`);
+  }
+  for (const name of ['browseFeed', 'searchCount', 'searchSuggest', 'relatedItems', 'capabilities']) {
+    assert.equal(new RegExp(`run: locked\\(${name}\\)`).test(toolsSrc), false, `${name} never touches the dom page; locking it only adds latency`);
+  }
+});
+
 test('the published argument names and defaults are exactly these', () => {
   const shape = (t: (typeof TOOLS)[number]) => Object.fromEntries(Object.entries(t.schema).map(([k, v]: [string, any]) => {
     const parsed = v.safeParse(undefined);
@@ -112,7 +136,7 @@ test('the published argument names and defaults are exactly these', () => {
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
     search_suggest: { query: '<required>', limit: 20 },
-    search_items: { query: '<required>', limit: 30, attempts: 4 },
+    search_items: { query: '<required>', limit: 60, attempts: 4, pages: 1, detail: 0 },
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },
@@ -156,8 +180,9 @@ test('both navigation sites re-check the URL, before and after the redirect', ()
   const fresh = src.match(/async function reloadFresh\([\s\S]*?\n}/)?.[0] ?? '';
   assert.match(fresh, /ensureGoofishUrl\(page\.url\(\)/);
   assert.equal(fresh.trim().split('\n').pop(), '}', 'the allowlist check has to be the last thing it does');
-  // currentPage, the third navigation site, decides with the same check rather than a prefix test
-  assert.match(src.match(/private parkedOnGoofish[\s\S]*?\n}/)?.[0] ?? '', /ensureGoofishUrl\(this\.page!\.url\(\)\)/);
+  // revive, the third navigation site, decides with the same check rather than a prefix test
+  assert.match(src.match(/private parkedOnGoofish[\s\S]*?\n}/)?.[0] ?? '', /ensureGoofishUrl\(page\.url\(\)\)/);
+  assert.match(src.match(/private async revive[\s\S]*?\n  }/)?.[0] ?? '', /parkedOnGoofish\(live\)/);
   assert.equal(/\.url\(\)\.startsWith\(/.test(src), false, 'the startsWith check that let www.goofish.computer through is back');
   // Those checks are all point-in-time, and every caller then polls for seconds before it reads the
   // DOM. So tools.ts reads the DOM through one helper that re-checks the URL that is live *now*, in
@@ -215,13 +240,26 @@ test('the two refusals are GatedErrors, and each class name is the published err
   for (const thrown of ['boom', 42, { a: 1 }, Symbol('x'), ['a']]) assert.equal(describe(thrown).error_type, 'Error', `error_type for a ${typeof thrown} throw`);
 });
 
-test('item_view reads the rendered page, never a closed API, and item ids are normalised', () => {
+test('item_view reads the page the way an anonymous visitor does, and item ids are normalised', () => {
   const tools = read(join(ROOT, 'src', 'tools.ts'));
   const view = tools.match(/const itemView = async[\s\S]*?\n};/)?.[0] ?? '';
-  assert.ok(view.includes('ITEM_SCRAPE_JS'), 'the DOM is the source of the listing');
-  assert.ok(view.includes('detail_rendered'), 'and an unrendered page is a typed refusal, not empty data');
-  assert.ok(view.includes('page_item_id'), 'a page serving a different listing is refused');
-  assert.ok(view.indexOf('ITEM_SCRAPE_JS') < view.indexOf('page_item_id'), 'the id check comes after the read');
+  // The read itself lives in `readListing`, shared with search_items' `detail` argument, so that is
+  // where the assertions about it belong -- and item_view must still be the thing that calls it.
+  assert.ok(view.includes('readListing'), 'item_view delegates the read it publishes');
+  const reader = tools.match(/const readListing = async[\s\S]*?\n};/)?.[0] ?? '';
+  // The detail call is the page's own, read off the wire. It is never re-issued through the mtop
+  // client: measured, the same API with the same payload answers TIMEOUT::接口超时 that way, because
+  // goofish attaches a per-call anti-bot blob to requests its own bundle originates. So the answer
+  // has to come off the page, and the page has to be loaded for it.
+  assert.ok(reader.includes('DETAIL_API'), 'item_view reads the page\'s own detail reply');
+  assert.ok(!/call\(\[\['detail'/.test(view), 'it must not re-issue the detail call through the mtop client');
+  assert.ok(reader.includes('ITEM_SCRAPE_JS'), 'the DOM stays the fallback, not the only source');
+  assert.ok(reader.includes('detail_rendered'), 'and an unrendered page is a typed refusal, not empty data');
+  // Both routes check the listing is the one that was asked for, and both before the answer is
+  // published: `detailListing` refuses a payload for another id, and the DOM route reads page_item_id.
+  const extract = read(join(ROOT, 'src', 'extract.ts'));
+  assert.match(extract.match(/export const detailListing[\s\S]*?\n};/)?.[0] ?? '', /wanted && id !== String\(wanted\)/);
+  assert.ok(reader.includes('page_item_id'), 'a page serving a different listing is refused');
   // the rail markers reach both scrapers as an argument, so the pattern is built from the list
   assert.match(ITEM_SCRAPE_JS.toString(), /new RegExp\(spec\.rails\.join\('\|'\)\)/, 'the item scraper must cut the page at the rail markers it is handed');
   assert.deepEqual(RAIL_MARKERS, ['为你推荐', '猜你喜欢', '猜你想看']);
@@ -243,11 +281,30 @@ test('the read path never clicks the page: the login dialog is left alone, on ev
   // no path needs the dialog closed. The guard is structural rather than behavioural on purpose: it
   // is the one change that must not be able to come back quietly, and no live page load can be part
   // of a unit test.
+  // There is exactly one click in this server, and it is the search results pager. It is not a
+  // dialog dismissal: it is the page's own pagination control, and it is the only way past 30 results,
+  // because the search API cannot be re-issued (replaying the page's own payload answers TIMEOUT).
+  // Measured 5-9.5s per page against 13-25s for a fresh load, 30 new items each, zero overlap.
+  //
+  // So the blanket "no click anywhere" ban becomes what it was always protecting: no click on the
+  // login dialog, and no pointer simulation anywhere. Both still hold absolutely.
+  const clicks = (src: string) => src.split('\n').map((l, i) => [i + 1, l] as const)
+    .filter(([, l]) => /[^\w.]click\s*\(/.test(l) && !isJustNamingIt(l));
+  const pagerJs = read(join(ROOT, 'src', 'extract.ts')).match(/export const PAGER_CLICK_JS[\s\S]*?\n};/)?.[0] ?? '';
   for (const p of sources) {
-    // `.click(` is the whole surface: nothing in this server simulates a pointer, by construction.
-    const hits = read(p).split('\n').map((l, i) => [i + 1, l] as const).filter(([, l]) => /[^\w.]click\s*\(/.test(l) && !/isJustNamingIt/.test(l));
-    assert.deepEqual(hits, [], `${p} clicks something in the page; the read path is not allowed to`);
+    // every click, in the whole tree, has to be inside PAGER_CLICK_JS or be a call to it
+    for (const [line, text] of clicks(read(p))) {
+      assert.ok(pagerJs.includes(text.trim()) || /PAGER_CLICK_JS/.test(text), `${p}:${line} clicks something that is not the search pager: ${text.trim()}`);
+    }
   }
+  // and it must be a DOM click, not a Playwright pointer click: the anonymous login dialog's
+  // ant-modal-mask is exactly what makes Playwright's actionability check time out, so a pointer click
+  // on the pager is the one implementation that would not work.
+  assert.ok(pagerJs.includes('.click()'), 'the pager click is a DOM click');
+  assert.equal(/\.locator\(|\.click\(\{|force:\s*true/.test(read(join(ROOT, 'src', 'tools.ts'))), false,
+    'no Playwright pointer click: the login dialog\'s mask would eat it');
+  // nothing in the page-machinery modules is allowed to click at all
+  for (const p of sources.filter((f) => !f.includes('extract.ts'))) assert.deepEqual(clicks(read(p)), [], `${p} clicks something`);
   // the selectors the dismisser used are gone with it, not left behind as dead machinery
   const extract = read(join(ROOT, 'src', 'extract.ts')), browser = read(join(ROOT, 'src', 'browser.ts'));
   for (const gone of ['DISMISS_LOGIN_JS', 'dismissLogin', 'baxia-dialog', 'closeIcon', 'modal-close', 'dialog-close']) {
@@ -268,6 +325,26 @@ test('the read path never clicks the page: the login dialog is left alone, on ev
   // the doc comment above it, not only in this test file
   const why = toolsSrc.slice(0, toolsSrc.indexOf('const searchItems')).split('/**').pop() ?? '';
   assert.match(why, /closes? its close controls was measured|never rendered|left alone/i, 'say why the dialog is left alone');
+});
+
+test('a second shutdown does not exit while the teardown is still running', () => {
+  // Closing stdin emits BOTH `end` and `close`, and Ctrl-C is SIGINT then SIGTERM. The re-entrancy
+  // guard used to call `process.exit` on the second one, which killed the process mid-`browser.close()`
+  // and left the windowed Chromium running, reparented to init: measured, 15 orphaned processes after
+  // one audit run. The guard has to let the in-flight teardown finish -- `Session.close` is bounded at
+  // 5s and escalates to SIGKILL, so it is not the thing that can hang.
+  const idx = read(join(ROOT, 'src', 'index.ts'));
+  const shutdown = idx.match(/const shutdown = [\s\S]*?\n};/)?.[0] ?? '';
+  assert.match(shutdown, /if \(closing\) return;/, 'the re-entrant path returns instead of exiting');
+  assert.equal(/if \(closing\)[^;]*process\.exit/.test(shutdown), false, 'it must not exit on the way in');
+  // and there is exactly one exit, after the teardown
+  assert.equal((shutdown.match(/process\.exit/g) ?? []).length, 1, 'one exit, and it is after the close');
+  assert.ok(shutdown.indexOf('getSession().close()') < shutdown.indexOf('process.exit'), 'close first, then exit');
+  // every way out funnels through it, and the crash path does something synchronous and real
+  for (const route of ['transport.onclose = () => shutdown(0)', "process.stdin.on('end', () => shutdown(0))", "process.stdin.on('close', () => shutdown(0))", "process.on(signal, () => shutdown(0))"]) {
+    assert.ok(idx.includes(route), `${route} is gone, so a client could walk away and take the browser with it`);
+  }
+  assert.match(idx.match(/process\.on\('exit'[\s\S]*?\}\);/)?.[0] ?? '', /killBrowser\(\)/, 'the exit hook must kill synchronously -- it cannot await');
 });
 
 test('the browser launches windowed by default, because headless is served the risk-control page', () => {

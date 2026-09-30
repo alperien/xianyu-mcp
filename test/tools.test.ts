@@ -13,8 +13,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BOOT_URL, exclusive, HOME, reloadFresh, Session, setSession } from '../src/browser.ts';
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
-import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
-import { budget, TOOLS } from '../src/tools.ts';
+import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
+import { budget, resetCardCache, TOOLS } from '../src/tools.ts';
 
 const run = (name: string) => {
   const t = TOOLS.find((x) => x.name === name);
@@ -22,19 +22,38 @@ const run = (name: string) => {
   return t.run;
 };
 
+/** A stand-in for the network tap on a page. `feed` hands back each reply once, in order, so a test
+ *  can drive the two tools that now read the page's own mtop replies -- `mtop: { detail: {...} }`
+ *  makes item_view answer from `mtop.taobao.idle.pc.detail`, `mtop: { search: {...} }` does the same
+ *  for search_items -- and can hand back a refusal (`{ ret: 'RGV587_ERROR' }`) as readily as a result. */
+const makeTap = (feed: Record<string, any[]> = {}) => {
+  const left: Record<string, any[]> = { ...feed };
+  return {
+    record: () => {},
+    // No-op on purpose. The seed models a reply the page is about to make, not a backlog of ones it
+    // has already made, and the code calls `clear()` immediately before it provokes the next call --
+    // so clearing here would throw away the reply the test is trying to hand over.
+    clear: () => {},
+    peek: (api: string) => { const l = left[api] ?? []; return l.length ? l[l.length - 1] : null; },
+    take: async (api: string) => { const l = left[api] ?? []; return l.length ? l.shift() : null; },
+  };
+};
+const ok = (data: any) => ({ ret: 'SUCCESS::调用成功', ok: true, data });
+const refused = (ret: string) => ({ ret, ok: false, data: null });
+
 /** Payloads are keyed by in-page script. `sleepMs` makes the fake's waits cost real time, and `hijack`
  *  moves the page off goofish to that URL: at `hijackAfter: 'open'`, on the first tick after `open`
  *  resolves -- after `open`'s own allowlist check, before the caller's first read, the window the
  *  reviewer read a lookalike host off-site in. At `'read'`, on the first wait *after* a read, which is
  *  item_view's 6s readiness poll and the second read site. */
-const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
+const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]> } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
   const queues: Record<any, any[]> = { [FEED_NORMALIZE_JS as any]: [...(payloads.cards ?? [])], [ITEM_SCRAPE_JS as any]: [...(payloads.item ?? [])], [SCRAPE_CARDS_JS as any]: [...(payloads.scrape ?? [])] };
   // The searchbox, as a real page holds it: mounted or not, with the keys that have landed so far.
   const search = { mounted: 'search' in payloads ? payloads.search !== null : true, value: '' };
   let at = HOME, reads = 0;
   const page: any = {
     url: () => { reads++; return at; },
-    waitForTimeout: async (ms: number) => { if (hijack && hijackAfter === 'read' && reads > 0) at = hijack; if (sleepMs) await new Promise((r) => setTimeout(r, sleepMs)); },
+    waitForTimeout: async () => { if (hijack && hijackAfter === 'read' && reads > 0) at = hijack; if (sleepMs) await new Promise((r) => setTimeout(r, sleepMs)); },
     goto: async (u: string) => { at = u; search.value = ''; },
     // Only what typeSearch needs: the two in-page reads and the two key actions. `keyboard.type`
     // truncates at `swallow` characters to reproduce the SPA eating a burst across a re-render.
@@ -42,11 +61,16 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
       type: async (text: string) => { search.value = payloads.swallow ? text.slice(0, payloads.swallow) : text; },
       press: async (key: string) => { if (key === 'Enter' && search.value) at = `${HOME}search?q=${encodeURIComponent(search.value)}`; },
     },
-    evaluate: async (fn: any) => {
+    evaluate: async (fn: any, arg: any) => {
       if (fn === MTOP_READY_JS) return 'ready';
       if (fn === SEARCH_INPUT_JS) return search.mounted
         ? { found: true, focused: true, value: search.value, inputs: 1, chars: 1200, path: '/' }
         : { found: false, inputs: 0, chars: 512, path: '/', value: '' };
+      if (fn === PAGER_CLICK_JS) { s.pagers.push(String(arg.page)); return { ok: s.max_page >= Number(arg.page), on_page: arg.page }; }
+      // The real normaliser, on the rows the tool actually passed. A canned queue cannot express this:
+      // how many cards come out of the pool depends on how many pages were walked, which is the thing
+      // under test.
+      if (fn === FEED_NORMALIZE_JS && s.runRealNormalizer) return FEED_NORMALIZE_JS(arg);
       if (fn === SEARCH_STATE_JS) {
         const onSearch = at.includes('/search');
         return { typed: search.value, path: onSearch ? '/search' : '/', on_search: onSearch, cards: onSearch ? 30 : 0 };
@@ -57,8 +81,12 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
     },
   };
   const s: any = {
-    launches: 0, opened: [] as string[], specs: [] as any[][], raw, search,
+    launches: 0, opened: [] as string[], specs: [] as any[][], raw, search, pagers: [] as string[], max_page: 99, runRealNormalizer: false,
     ensureReady: async () => page,
+    domReady: async () => page,
+    // The dom page is a separate page from the api page, so the four mtop-only tools never wait on a
+    // search; the fake keeps one `page` for both because nothing under test depends on them differing.
+    apiTap: makeTap(), domTap: makeTap(payloads.mtop),
     // NOT the real guard: this stand-in records what a tool asked for and loads it, nothing more.
     // The real `Session.open`, and the `ensureGoofishUrl` it runs before and after every goto, is
     // exercised for real in the two navigation tests below, against a fake Page.
@@ -134,7 +162,8 @@ const domSession = (titles: string[], at = HOME, dialog = false) => {
     evaluate: async (fn: any, arg: any) => fn(arg),
     keyboard: { type: async (t: string) => { input.value += t; }, press: async (k: string) => { if (k === 'Enter' && input.value) here = `${HOME}search?q=${encodeURIComponent(input.value)}`; } },
   };
-  const s: any = { launches: 0, opened: [] as string[], specs: [] as any[][], raw: {}, ensureReady: async () => page, open: async (u: string) => { s.opened.push(u); here = u; input.value = ''; return page; }, call: async () => ({}), clicks };
+  const s: any = { launches: 0, opened: [] as string[], specs: [] as any[][], raw: {}, ensureReady: async () => page, domReady: async () => page,
+    apiTap: makeTap(), domTap: makeTap(), open: async (u: string) => { s.opened.push(u); here = u; input.value = ''; return page; }, call: async () => ({}), clicks };
   return use(s);
 };
 
@@ -142,17 +171,42 @@ const domSession = (titles: string[], at = HOME, dialog = false) => {
  *  around every goto -- is the thing under test. No Chromium is launched. */
 const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
   const s = new Session(), page = drivenPage(opts);
-  (s as any).page = page;
+  (s as any).apiPage = page; (s as any).domPage = page;
   use(s);
   return { s, page };
 };
-test.afterEach(() => { setSession(null); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; });
+// The search-card cache is module state that outlives a call, so it is cleared between tests the same
+// way the env budget is: a test that seeds it would otherwise have the next item_view answered from it.
+test.afterEach(() => { setSession(null); resetCardCache(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
 
 const RENDERED = { detail_rendered: true, page_item_id: '42', title: '男士羊毛呢大衣', price: '1999', want_count: '2', browse_count: '110', description: '专柜入手。', seller: '汴梁', seller_tenure_years: '4', seller_items_sold: '27', seller_positive_rate: '100', image_urls: ['https://img.alicdn.com/x.jpg'], head_preview: '...', reco_anchors: 30, image_candidates: 4 };
 const UNRENDERED = { detail_rendered: false, head_preview: '阿里巴巴集团 淘宝 天猫' };
+/** A `mtop.taobao.idlemtopsearch.pc.search` reply, in the shape the page's own call returns: each
+ *  result's card is split between `clickParam.args` (the price, the want count, the ids) and
+ *  `exContent` (the title, the picture, the city). `cards` is [title, itemId, price, city, wantNum].
+ *
+ *  `searchCase` returns that payload together with the rows the *real* feed normaliser produces from
+ *  it, so a test's `cards:` fake and its mtop reply describe the same thirty listings rather than two
+ *  fixtures that happen to agree. */
+const searchReply = (keyword: string, cards: string[][]) => ({
+  resultList: cards.map(([title, itemId, price, area, wantNum], i) => ({
+    data: { item: { main: {
+      clickParam: { args: { item_id: itemId, price, wantNum, keyword, index: String(i), page: '1', cCatId: '126854525', catId: '50025387', seller_id: 'jRM3w0UnqSvHrFFMpqPdsQ==', publishTime: '1784640276000' } },
+      exContent: { area, detailParams: { itemId, title, soldPrice: price, userNick: '卖家' + i, picUrl: `https://img.alicdn.com/bao/uploaded/i1/${itemId}.jpg`, isVideo: 'false' } },
+    } } },
+    style: 'card', type: 'item',
+  })),
+});
+const searchCase = (keyword: string, cards: string[][]) => ({
+  mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(searchReply(keyword, cards))] },
+  rows: cards.map(([title, itemId, price, area, wantNum]) => ({
+    item_id: itemId, title, price, city: area, want_count: wantNum, seller: '卖家', image_urls: [`https://img.alicdn.com/bao/uploaded/i1/${itemId}.jpg`],
+    url: `https://www.goofish.com/item?id=${itemId}`,
+  })),
+});
 const NEVER_RENDERED = { rendered: false, query_hits: 0, cards_scanned: 0, rail: '', says_no_results: false, blocked: false, text_preview: '阿里巴巴集团 淘宝 天猫', items: [] };
 // What goofish serves when it declines: unrelated cards under the 猜你喜欢 rail.
 const SEARCH_RAIL = { rendered: true, query_hits: 0, cards_scanned: 40, rail: '猜你喜欢', says_no_results: true, text_preview: '小闲鱼没有找到你想要的宝贝~ 猜你喜欢', items: [{ item_id: '900', title: '木瓜丝广西特产', price: '9', condition: '', brand: '', city: '南宁', url: 'https://www.goofish.com/item?id=900', matches_query: false }] };
@@ -227,7 +281,7 @@ test('search_items never hands back the recommendation rail as results', async (
 
 test('search_items accepts a later load that serves real matches, counts only the matches, and logs the decline that came first', async () => {
   // 3 of 4 cards on this page carry the query; the fourth is a card that merely got scraped.
-  const page = { rendered: true, cards_scanned: 4, rail: '', says_no_results: false, text_preview: 'x220', query_hits: 3, items: [
+  const page = { rendered: true, cards_scanned: 4, rail: '', says_no_results: false, text_preview: 'x220', query_hits: 3, token_hits: 3, items: [
     { item_id: '1', title: '联想X220 电池', price: '300', condition: '', brand: '', city: '北京', url: 'u1', matches_query: true },
     { item_id: '2', title: 'X220 屏幕总成', price: '200', condition: '', brand: '', city: '北京', url: 'u2', matches_query: true },
     { item_id: '3', title: 'x220 主板 2620m', price: '180', condition: '', brand: '', city: '上海', url: 'u3', matches_query: true },
@@ -268,12 +322,22 @@ test('search_items over-asks the scraper, so leading non-matching cards cannot f
   const spaced = await run('search_items')({ query: 'x220  键盘', limit: 3, attempts: 1 });
   assert.deepEqual([spaced.count, spaced.query], [3, 'x220 键盘']);
 
-  // A multi-word query whose words all appear but never as one substring is still refused -- the
-  // strict guard stands -- but the looser count is published, so the refusal is diagnosable rather
-  // than a bare "no results", and the card count is on the failure path too.
+  // A multi-word query whose words all appear but never as one substring. This used to be refused --
+  // "the strict guard stands" -- and refusing it is what made the tool useless on this site, where a
+  // search for `机械硬盘4t` has 70,146 listings by goofish's own counter and the titles read
+  // `西数4T机械硬盘`. All the terms are there; only the searcher's word order is not. Accepted now,
+  // and `matched_by` says which rule did it so a caller is not left guessing.
   domSession(Array.from({ length: 8 }, (_, i) => `联想 X220 键盘 ${i}`));
-  await assert.rejects(run('search_items')({ query: '键盘 x220 联想', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
-    && /"query_hits":0/.test(e.message) && /"token_hits":8/.test(e.message) && /"scraped_cards":8/.test(e.message) && /\b1 attempt\(s\)/.test(e.message));
+  const reordered = await run('search_items')({ query: '键盘 x220 联想', attempts: 1 });
+  assert.equal(reordered.count, 8);
+  assert.equal(reordered.query_hits, 0, 'no title carries the phrase');
+  assert.equal(reordered.token_hits, 8, 'all eight carry every term');
+  assert.equal(reordered.matched_by, 'all_terms', 'and the envelope says the phrase was not the match');
+
+  // ...and the guard still has teeth: a page carrying only some of the terms is a rail, not results.
+  domSession(Array.from({ length: 8 }, (_, i) => `机械硬盘 台式机内存条 ${i}`));
+  await assert.rejects(run('search_items')({ query: '机械硬盘4t', attempts: 1 }), (e: any) => e instanceof SearchUnavailableError
+    && /"query_hits":0/.test(e.message) && /"token_hits":0/.test(e.message) && /"scraped_cards":8/.test(e.message) && /\b1 attempt\(s\)/.test(e.message));
 });
 
 test('every DOM read re-checks the URL first, so a page moved off goofish mid-call is refused', async () => {
@@ -365,6 +429,335 @@ test('a wall-clock budget stops search_items instead of letting it hold the call
   await assert.rejects(run('search_items')({ query: 'x220', attempts: 10 }), (e: any) => e instanceof SearchUnavailableError && /ERR_ADDRESS_UNREACHABLE/.test(e.message));
   const spent = Date.now() - began;
   assert.ok(opens < 10 && spent < 9000, `${opens} page loads in ${spent}ms: the budget did not bind the load-failure path`);
+});
+
+test('item_view answers from the page\'s own detail reply, with the fields the DOM could not reach', async () => {
+  // This is the reply `mtop.taobao.idle.pc.detail` returns when the *page* makes the call, captured
+  // off the wire. The DOM route could not produce a title at all (measured: empty on 6 of 6 live
+  // listings) and returned goofish's promo banners as the gallery.
+  const s = use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({
+    itemDO: {
+      itemId: '42', title: '腾亚40C瓦斯钉抢，功能正常使用', soldPrice: '366', originalPrice: '0',
+      desc: '刚保养清洗干净，收到就可以用', wantCnt: 1, browseCnt: 34, collectCnt: 2, quantity: 1,
+      itemStatusStr: '在线', transportFee: '0.00',
+      imageInfos: [{ url: 'http://img.alicdn.com/bao/uploaded/i1/4197327154/a.jpg' }, { url: 'http://img.alicdn.com/bao/uploaded/i1/4197327154/b.jpg' }],
+      cpvLabels: [{ propertyName: '品牌', valueName: 'Toua/腾亚' }, { propertyName: '成色', valueName: '明显使用痕迹' }, { propertyName: '已用年限', valueName: '1年(含)-3年(不含)' }],
+    },
+    sellerDO: { nick: '今生有缘xy', city: '台州', userRegDay: 2256, hasSoldNumInteger: 369, itemCount: 655, newGoodRatioRate: '80%', replyRatio24h: '97%', signature: '二手电动工具，', zhimaAuth: true, portraitUrl: 'http://gtms03.alicdn.com/a.png', lastVisitTime: '3小时前来过' },
+  })] } }));
+  const out = await run('item_view')({ item_id: '42' });
+  assert.equal(out.source, 'item_detail_api');
+  assert.equal(out.title, '腾亚40C瓦斯钉抢，功能正常使用', 'the field the DOM could never fill');
+  assert.equal(out.price, '366');
+  assert.equal(out.want_count, '1'); assert.equal(out.browse_count, '34');
+  assert.equal(out.description, '刚保养清洗干净，收到就可以用');
+  assert.equal(out.seller, '今生有缘xy');
+  assert.equal(out.seller_tenure_years, '6', 'userRegDay is in days: 2256 days is 6 years');
+  assert.equal(out.seller_items_sold, '369');
+  assert.equal(out.seller_positive_rate, '80');
+  assert.deepEqual(out.fields_missing, [], 'every promised field is present on this payload');
+  // the seller's own photos, https-normalised, not a promo banner
+  assert.deepEqual(out.image_urls, ['https://img.alicdn.com/bao/uploaded/i1/4197327154/a.jpg', 'https://img.alicdn.com/bao/uploaded/i1/4197327154/b.jpg']);
+  // and the fifteen-odd fields the DOM never exposed
+  assert.equal(out.brand, 'Toua/腾亚');
+  assert.equal(out.condition, '明显使用痕迹');
+  assert.equal(out.used_years, '1年(含)-3年(不含)');
+  assert.equal(out.seller_city, '台州');
+  assert.equal(out.seller_signature, '二手电动工具，');
+  assert.equal(out.seller_reply_rate_24h, '97');
+  assert.equal(out.seller_items_listed, '655');
+  assert.equal(out.collect_count, '2');
+  assert.equal(out.seller_zhima_verified, true);
+  assert.equal(out.seller_avatar, 'https://gtms03.alicdn.com/a.png');
+  assert.equal(out.item_status, '在线');
+  assert.deepEqual(Object.entries(out.attributes).map(([k, v]) => `${k}=${v}`), ['品牌=Toua/腾亚', '成色=明显使用痕迹', '已用年限=1年(含)-3年(不含)']);
+  // the page was still loaded: that is where the call comes from
+  assert.deepEqual(s.opened, ['https://www.goofish.com/item?id=42']);
+});
+
+test('item_view refuses a detail reply about a different listing, and reports a refusal as a refusal', async () => {
+  // The page decides which listing to render. An answer about another id is not a partial success.
+  use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({ itemDO: { itemId: '999', title: '别人的东西', soldPrice: '1' }, sellerDO: {} })] } }));
+  await assert.rejects(run('item_view')({ item_id: '42' }), (e: any) => e instanceof DetailUnavailableError && /instead of 42/.test(e.message));
+  // goofish's own code is quoted rather than summarised: RGV587 is an IP throttle and says nothing
+  // about whether the listing exists, and a reader cannot tell those apart without it.
+  use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [refused('RGV587_ERROR::SM::哎哟喂,被挤爆啦,请稍后重试!')] } }));
+  await assert.rejects(run('item_view')({ item_id: '42' }), (e: any) => e instanceof DetailUnavailableError && /RGV587/.test(e.message));
+});
+
+test('a browser close that hangs is bounded and escalated, and never orphans the process', async () => {
+  // This runs on the way out of the server, and a `close()` that hangs -- an evaluate in flight
+  // against a page that has stopped answering -- used to leave a windowed Chromium running after the
+  // process had exited, invisible to the client that had already gone. Measured: one to two orphaned
+  // browser processes per session.
+  const s = new Session();
+  const killed: string[] = [];
+  const browser: any = {
+    close: () => new Promise(() => {}),                    // never settles
+    process: () => ({ exitCode: null, killed: false, kill: (sig: string) => killed.push(sig) }),
+  };
+  (s as any).browser = browser;
+  (s as any).context = { close: async () => { throw new Error('target closed'); } };
+  const began = Date.now();
+  await s.close();
+  const spent = Date.now() - began;
+  assert.ok(spent < 8000, `close() took ${spent}ms: a hung close holds the process open`);
+  assert.deepEqual(killed, ['SIGKILL'], 'a browser that would not close is killed, not left running');
+  // and it is idempotent: the signal path and the exit path can both reach it
+  await s.close();
+  assert.equal(killed.length, 1, 'the second close did not kill an already-closed browser again');
+  // `killBrowser` is the synchronous half, for the paths where there is no event loop left to await:
+  // a `process.on('exit')` hook, and a teardown that was cut short. It must tolerate a browser that is
+  // already gone rather than throwing on the way out of the process.
+  const gone = new Session();
+  (gone as any).browser = { process: () => { throw new Error('the connection is already closed'); } };
+  assert.doesNotThrow(() => gone.killBrowser());
+  assert.equal(gone.browserProcess(), null);
+});
+
+test('concurrent mtop calls launch and park the browser once, and never navigate it twice at once', async () => {
+  // The mtop-only tools stopped queueing behind the DOM tools, so they now genuinely arrive together
+  // -- and two `page.goto`s on one page abort each other, which is a `net::ERR_ABORTED` out of a
+  // perfectly healthy browser. This drives the real `Session` against a fake page that throws if it
+  // is navigated while a navigation is still in flight, which is exactly what two racing callers did.
+  const s = new Session();
+  const inFlight: string[] = [];
+  const page: any = {
+    url: () => (inFlight.length ? '' : 'https://www.goofish.com/x'),
+    isClosed: () => false,
+    reload: async () => {},
+    waitForTimeout: async () => {},
+    goto: async (u: string) => {
+      if (inFlight.length) throw new Error(`ERR_ABORTED: navigated while ${inFlight[0]} was still loading`);
+      inFlight.push(u);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight.pop();
+    },
+    evaluate: async (fn: any, arg: any) => {
+      if (fn === MTOP_READY_JS) return 'ready';
+      // answer whatever was asked for, so the tools under test see a working client
+      if (Array.isArray(arg?.calls)) return Object.fromEntries(arg.calls.map(([label, api]: any) => [label, { ret: 'SUCCESS', ok: true, data: api.includes('hitnum') ? { hitnum: 28800 } : api.includes('suggest') ? { items: [], totalCount: 0 } : { cardList: [] } }]));
+      return {};
+    },
+  };
+  (s as any).apiPage = page; (s as any).domPage = page;
+  use(s);
+  const [a, b, c] = await Promise.all([
+    run('search_count')({ query: 'x220' }),
+    run('search_count')({ query: 'ipad' }),
+    run('search_suggest')({ query: 'thinkpad' }),
+  ]);
+  // none of them raised, and none of them navigated while another was in flight
+  assert.equal(a.match_count + b.match_count + c.total_count >= 0, true);
+  assert.deepEqual(inFlight, []);
+});
+
+test('item_view reads the page for a listing a search already returned, and falls back to the card', async () => {
+  // Searching and then opening a result is the ordinary sequence. The page is still read, because
+  // the detail call is 4-10s and carries a dozen fields the card does not -- short-circuiting on the
+  // cache would have bought nothing and thrown them away. The card is what is left when the page
+  // will not answer, which is what a sold or removed listing looks like.
+  const c = searchCase('x220', [['联想Thinkpad X220 笔记本电脑', '856961429564', '329', '北京', '5']]);
+  use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  // the search itself seeds the card cache, which is the state under test here
+  const found = await run('search_items')({ query: 'x220', limit: 5 });
+  assert.equal(found.source, 'search_api');
+  assert.equal(found.items[0].item_id, '856961429564');
+  assert.equal(found.items[0].want_count, '5', 'the search reply carries a want count the DOM card never showed');
+  assert.equal(found.items[0].city, '北京', 'and the city, and the image');
+  assert.ok(found.items[0].image_urls.length, 'and an image');
+
+  // the page answers, and the answer is the detail block, not the card
+  use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({ itemDO: { itemId: '856961429564', title: '联想Thinkpad X220 笔记本电脑', soldPrice: '329', wantCnt: 5, browseCnt: 900, desc: '成色好' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } })] } }));
+  const out = await run('item_view')({ item_id: '856961429564' });
+  assert.equal(out.source, 'item_detail_api');
+  assert.equal(out.seller, '卖家');
+  assert.equal(out.browse_count, '900');
+
+  // the page will not answer: then, and only then, the card this process already holds answers
+  use(makeSession({ item: [UNRENDERED, UNRENDERED, UNRENDERED] }));
+  const fallback = await run('item_view')({ item_id: '856961429564' });
+  assert.equal(fallback.source, 'search_card_cache');
+  assert.equal(fallback.title, '联想Thinkpad X220 笔记本电脑');
+  assert.ok(fallback.page_attempts > 0, 'the page really was tried first');
+  // a card is not a detail block, and does not pretend to be one
+  assert.ok(fallback.fields_missing.includes('description'));
+  assert.ok(fallback.fields_missing.includes('browse_count'));
+  assert.match(fallback.note, /earlier search in this session/);
+});
+
+test('search_items answers from the page\'s own search reply, and holds it to the same relevance guard', async () => {
+  // 30 results, 26 of which really contain the query.
+  const cards = Array.from({ length: 30 }, (_, i) => [`联想Thinkpad X220 笔记本 ${i}`, String(856961429564 + i), String(100 + i), '北京', '3']);
+  cards.push(['完全无关的自行车', '999', '1', '上海', '0']);
+  const c = searchCase('thinkpad x220', cards);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  const out = await run('search_items')({ query: 'thinkpad x220', limit: 10 });
+  assert.equal(out.source, 'search_api');
+  assert.equal(out.count, 10, 'limit still applies to a 30-result reply');
+  assert.equal(out.scraped_cards, 31, 'the guard is over every result, not the ten kept');
+  assert.equal(out.query_hits, 30);
+  assert.equal(out.non_matching_count, 1);
+  assert.ok(out.items.every((i: any) => /X220/.test(i.title)), 'only real matches came back');
+  assert.ok(out.items.every((i: any) => i.want_count && i.city && i.image_urls.length), 'and each carries the card fields the DOM scrape lost');
+  assert.equal(out.attempts, 1);
+  assert.deepEqual(s.opened, ['https://www.goofish.com/'], 'one page load: the reply answers it');
+});
+
+test('search_items refuses a search reply that is really the recommendation rail', async () => {
+  // A declined anonymous search answers SUCCESS with 30 recommendations and no matches. A `hits > 0`
+  // test would pass that; a fraction over the whole reply does not, and the DOM fallback still runs.
+  const cards = Array.from({ length: 30 }, (_, i) => [`推荐商品 ${i}`, String(1000 + i), '5', '北京', '0']);
+  const c = searchCase('thinkpad x220', cards);
+  use(makeSession({ cards: [c.rows], scrape: [{ items: [], cards_scanned: 0, rendered: false, rail: '猜你喜欢' }], mtop: c.mtop }));
+  await assert.rejects(run('search_items')({ query: 'thinkpad x220', attempts: 1, limit: 5 }), (e: any) => e instanceof SearchUnavailableError);
+});
+
+test('the four mtop-only tools do not queue behind a search on the shared page', async () => {
+  // One page meant a 70s search held up a feed call that does 1.5s of work. The api page and the dom
+  // page are separate, and only the dom tools take the exclusive lock.
+  //
+  // This used to call `run('search_items')` inside its own `exclusive()` and assert the lock, which
+  // proved nothing about the shipped server: the entry point wrapped every tool in `exclusive()`, so
+  // the four mtop tools queued behind a search anyway, and this test never saw it. The lock now lives
+  // on the tools themselves, so the calls below go through `TOOLS[i].run` exactly as index.ts invokes
+  // them -- no hand-wrapping -- and still do not queue.
+  const c = searchCase('x220', [['联想 X220 笔记本电脑', '4242', '99', '北京', '1']]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }, { hitnum: { ok: true, ret: 'SUCCESS', data: { hitnum: 28800 } } }));
+  let searchDone = false;
+  // `search_items` is registered locked, so this call takes the lock itself -- exactly as the entry
+  // point now does, because index.ts no longer wraps anything.
+  const searching = run('search_items')({ query: 'x220', limit: 1 }).then(() => { searchDone = true; });
+  // not locked: this is the point -- an mtop-only call does not take the lock at all
+  const counted = await run('search_count')({ query: 'x220' });
+  assert.equal(counted.match_count, 28800);
+  assert.equal(searchDone, false, 'the search is still running, and the count did not wait for it');
+  await searching;
+  assert.equal(searchDone, true);
+  // and two DOM tools at once still serialise, because they share the one navigating page
+  let order: string[] = [];
+  const slow = exclusive(async () => { order.push('a-start'); await new Promise((r) => setTimeout(r, 30)); order.push('a-end'); });
+  const fast = exclusive(async () => { order.push('b'); });
+  await Promise.all([slow, fast]);
+  assert.deepEqual(order, ['a-start', 'a-end', 'b']);
+  assert.equal(s.launches, 0);
+});
+
+test('the lock is on the three DOM tools and nowhere else, through the registered tool table', async () => {
+  // The regression guard for the defect above, stated about the tool table itself rather than about
+  // one hand-wrapped call. Which tools take the shared-page lock is a contract with index.ts -- it
+  // must not wrap them again, or the four fast tools queue behind every slow one -- so assert it here.
+  const LOCKED = ['search_items', 'item_view', 'recommendations'];
+  const free = TOOLS.filter((t) => !LOCKED.includes(t.name)).map((t) => t.name);
+  assert.deepEqual(free.sort(), ['browse_feed', 'capabilities', 'related_items', 'search_count', 'search_suggest']);
+  // `capabilities` is deliberately free: it only reads, never navigates, and it is the tool an agent
+  // calls when something else is stuck -- queueing it behind the stuck search would be perverse.
+  // Proof by behaviour: an mtop call in flight while a DOM call holds the lock still answers.
+  const c = searchCase('x220', [['联想 X220 笔记本电脑', '4242', '99', '北京', '1']]);
+  const s = use(makeSession({ cards: [c.rows], mtop: c.mtop }, { hitnum: { ok: true, ret: 'SUCCESS', data: { hitnum: 28800 } } }));
+  let released = false;
+  const domHeld = exclusive(async () => { await new Promise((r) => setTimeout(r, 25)); released = true; });
+  const count = await run('search_count')({ query: 'x220' });   // must not wait for the held lock
+  assert.equal(released, false, 'the count answered while the lock was held -- it does not queue');
+  assert.equal(count.match_count, 28800);
+  await domHeld;
+  assert.equal(released, true);
+});
+
+test('search_items walks the pager for more pages, and the guard runs over the whole pooled set', async () => {
+  // One reply is 30 listings and the search API cannot be re-issued, so the page's own pager is the
+  // only way deeper. Three replies of 10, pooled, and the guard has to judge all thirty at once --
+  // judging page 3 on its own could throw away two good pages.
+  const page = (n: number, titles: string[]) => ok(searchReply('x220', titles.map((t, i) => [t, String(n * 100 + i), '50', '北京', '1'])));
+  const t1 = Array.from({ length: 10 }, (_, i) => `联想 X220 键盘 ${i}`);
+  const t2 = Array.from({ length: 10 }, (_, i) => `ThinkPad X220 笔记本 ${i}`);
+  const t3 = Array.from({ length: 10 }, (_, i) => `X220 屏幕 ${i}`);
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [page(1, t1), page(2, t2), page(3, t3)] } }));
+  s.runRealNormalizer = true;
+  // `limit` 100 against 30 available listings: the pool is short, so the walk tops up past the three
+  // pages asked for, and stops when the pager runs out of replies. Measured live, this is what makes
+  // `pages: 2` return 55 matches one run and 25 the next without either being a silent shortfall.
+  const deep = await run('search_items')({ query: 'x220', pages: 3, limit: 100, attempts: 1 });
+  assert.equal(deep.source, 'search_api');
+  assert.equal(deep.pages_fetched, 3, 'three pages were pooled, not one');
+  assert.equal(deep.scraped_cards, 30, 'and the guard saw all thirty');
+  assert.deepEqual(s.pagers, ['2', '3', '4'], 'the third page left the pool short of limit, so it walked one more');
+  assert.ok(deep.count > 0);
+
+  // And the other half: a pool that already satisfies `limit` does not walk past what was asked for.
+  const s2 = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [page(1, t1), page(2, t2), page(3, t3)] } }));
+  s2.runRealNormalizer = true;
+  const exact = await run('search_items')({ query: 'x220', pages: 2, limit: 10, attempts: 1 });
+  assert.equal(exact.pages_fetched, 2);
+  assert.deepEqual(s2.pagers, ['2'], 'ten of the first page\'s ten was enough, so no top-up');
+});
+
+test('search_items stops walking when the pager has no such page, and says why', async () => {
+  // A real pager runs out at page 10 (`1..10 ... 50`) and a declined one may not be there at all.
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [ok(searchReply('x220', Array.from({ length: 12 }, (_, i) => [`联想 X220 ${i}`, String(i), '50', '北京', '1'])))] } }));
+  s.runRealNormalizer = true;
+  s.max_page = 1;   // the page offers nothing beyond what we have
+  const out = await run('search_items')({ query: 'x220', pages: 5, limit: 20, attempts: 1 });
+  assert.equal(out.pages_fetched, 1, 'one page, and the walk did not invent the rest');
+  assert.deepEqual(s.pagers, ['2']);
+  const stopped = out.attempt_log.find((e: any) => e.pager && e.ok === false);
+  assert.equal(stopped.pager, 2, 'and the refusal is in the log, with the page it stopped on');
+});
+
+test('the `detail` argument reads the top N in full, and reports which ones it could not', async () => {
+  const rows = Array.from({ length: 8 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), String(100 + i * 10), '北京', '2']);
+  const c = searchCase('x220', rows);
+  // the detail reply comes back for three of the four requested, and the fourth is refused
+  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', wantCnt: 4, browseCnt: 900, desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } });
+  // one tap for both: the search reply that produces the cards, and the detail replies that deepen them
+  use(makeSession({ cards: [c.rows], mtop: {
+    'mtop.taobao.idlemtopsearch.pc.search': c.mtop['mtop.taobao.idlemtopsearch.pc.search'],
+    'mtop.taobao.idle.pc.detail': [detail('300'), detail('301'), detail('302'), refused('RGV587_ERROR::SM::哎哟喂')],
+  } }));
+  const out = await run('search_items')({ query: 'x220', detail: 4, limit: 8, attempts: 1 });
+  assert.equal(out.detail_requested, 4);
+  assert.equal(out.detail_report.length, 4);
+  // The fourth was refused by goofish, so it falls back to the search card this same call just
+  // returned -- a real listing, but a card. It is reported as what it answered from rather than
+  // dropped, which is the difference between a shorter list and a dishonest one.
+  const fourthReport = out.detail_report.find((r: any) => r.item_id === '303');
+  assert.equal(fourthReport.ok, true);
+  assert.equal(fourthReport.source, 'search_card_cache');
+  assert.equal(out.detail_report.filter((r: any) => r.source === 'item_detail_api').length, 3);
+  assert.ok(out.detail_ms > 0, 'and what the depth cost, so a caller can price the next call');
+  // the three that worked carry the detail fields; the fourth is still a card
+  const first = out.items.find((i: any) => i.item_id === '300');
+  assert.equal(first.description, '成色好，功能正常');
+  assert.equal(first.seller, '卖家');
+  assert.equal(first.seller_items_sold, '12');
+  assert.equal(first.detailed, true);
+  const fourth = out.items.find((i: any) => i.item_id === '303');
+  assert.equal(fourth.detailed, true, 'it came back, from the search card rather than the page');
+  assert.equal(fourth.detail_source, 'search_card_cache', 'and says so');
+  assert.equal(fourth.description, '', 'so nothing pretends the description was read');
+  assert.equal(out.items.length, 8, 'and the other four are untouched');
+});
+
+test('a search card carries the seller, tags, avatar and publish time, not just a title and a price', async () => {
+  // All of it is in the reply we already had. The seller was the visible gap: a search card's name is
+  // `exContent.userNickName`, and reading `userNick` -- which does not exist on a search card -- left
+  // every search result with an empty seller while the feed cards had one.
+  const reply = searchReply('thinkpad x220', [['联想Thinkpad X220 笔记本', '1', '329', '北京', '5']]);
+  const main = reply.resultList[0].data.item.main;
+  main.exContent.detailParams = { ...main.exContent.detailParams, itemId: '1', title: '联想Thinkpad X220 笔记本', soldPrice: '329', picUrl: 'https://img.alicdn.com/bao/uploaded/i1/1.jpg' };
+  Object.assign(main.exContent, { userNickName: '松花江逃跑的香蕉', userAvatarUrl: 'http://img.alicdn.com/bao/uploaded/i1/avatar.jpg', userFishShopLabel: { config: { x: 1 } }, showVideoIcon: true, want: '5',
+    fishTags: { r2: { tagList: [{ data: { content: '18天内降价' } }] }, r4: { tagList: [{ data: { content: '卖家信用极好' } }] }, r1: { tagList: [{ data: { content: 'freeShippingIcon' } }] } } });
+  main.clickParam.args.publishTime = '1784640276000';
+  const { FEED_NORMALIZE_JS, searchListings } = await import('../src/extract.ts');
+  const row = FEED_NORMALIZE_JS({ rows: searchListings(reply) })[0];
+  assert.equal(row.seller, '松花江逃跑的香蕉', 'the seller name lives in userNickName');
+  assert.equal(row.seller_avatar, 'https://img.alicdn.com/bao/uploaded/i1/avatar.jpg');
+  assert.equal(row.seller_shop, true);
+  assert.equal(row.is_video, true);
+  assert.equal(row.want_count, '5');
+  assert.equal(row.publish_time, '1784640276000');
+  assert.deepEqual(row.tags, ['18天内降价', '卖家信用极好'], 'the tag strip, minus the icon placeholder');
+  assert.equal(row.price, '329');
 });
 
 test('item_view reports every promised field, and missing ones as missing rather than filled in', async () => {
@@ -460,14 +853,14 @@ test('a page parked on a lookalike host is re-parked, and reloadFresh refuses to
   // here, so ensureReady and call ran our JS on whatever the page was.
   for (const lookalike of ['https://www.goofish.com.evil.com/', 'https://www.goofish.com@evil.com/', 'https://www.goofish.computer/', 'https://www.goofish.com.attacker.tld/', 'https://sub.www.goofish.com/']) {
     const { s, page } = realSession({ start: lookalike });
-    await s.currentPage();
+    await s.ensureReady();
     // one assertion, because the recorded goto already implies the URL: it re-navigated to the boot
     // page, and that was the only navigation
     assert.deepEqual(page.calls, [BOOT_URL], `${lookalike} was treated as goofish, or was not re-parked`);
   }
   // if it will not settle on goofish, that is a refusal rather than a page to scrape
   const stuck = realSession({ start: 'https://www.goofish.computer/', land: () => 'https://www.goofish.computer/' });
-  await assert.rejects(stuck.s.currentPage(), (e: any) => e.constructor.name === 'NavigationError');
+  await assert.rejects(stuck.s.ensureReady(), (e: any) => e.constructor.name === 'NavigationError');
   // reloadFresh is the second goto site and re-checks where the redirect landed: it is called from
   // search_items, item_view and recommendations, which scrape whatever is here next.
   await assert.rejects(reloadFresh(drivenPage({ land: () => 'https://evil.com/steal' })), (e: any) => e.constructor.name === 'NavigationError');

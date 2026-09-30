@@ -4,7 +4,9 @@
 stored credentials, no write tools.** TypeScript, run directly by Node — unflagged type stripping
 landed in 23.6 and was backported to **22.18**, so that is the floor: on 22.6–22.17 `node src/index.ts`
 and `node --test` both fail with `ERR_UNKNOWN_FILE_EXTENSION` unless you add
-`--experimental-strip-types`. There is no build step and no dist/.
+`--experimental-strip-types`. A checkout runs straight from `src/`; `npm run build` emits `dist/` for
+the published tarball, which is prebuilt because Node will not strip types from files under
+`node_modules/`.
 
 It drives its own throwaway Chromium with Playwright and reads goofish the way an anonymous visitor's
 browser does — including calling goofish's own JS client (`window.lib.mtop.request`) rather than
@@ -46,12 +48,12 @@ See [Headless vs headed](#headless-vs-headed) for what `XIANYU_HEADLESS=1` costs
 |---|---|---|
 | `XIANYU_BROWSER_PATH` | Playwright's Chromium | use a specific Chrome/Chromium binary |
 | `XIANYU_HEADLESS` | `0` (windowed) | `1` runs headless. Headed is the default because goofish serves headless Chromium its risk-control page instead of the app — see [Headless vs headed](#headless-vs-headed). Needs a display (`DISPLAY=:0`, or Xvfb). |
-| `XIANYU_SEARCH_BUDGET_S` | 150 | wall-clock budget for the `search_items` retry loop (5–600s) |
+| `XIANYU_SEARCH_BUDGET_S` | 90 | wall-clock budget for the `search_items` retry loop (5–600s) |
 | `XIANYU_ITEM_VIEW_BUDGET_S` | 90 | wall-clock budget for the `item_view` retry loop (5–600s) |
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
 
 The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
-flight runs to completion: at the 150s default and a 10–25s load you get several attempts, and a call
+flight runs to completion: at the 90s default and a 10–25s load you get several attempts, and a call
 can overshoot its budget by roughly one page load.
 
 **The server runs windowed and needs a display.** goofish serves headless Chromium its risk-control
@@ -72,9 +74,9 @@ one browser, one page — so two tools in flight cannot navigate each other out 
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed` |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error — but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
-| `search_items` | `query`, `limit` (d30), `attempts` (1–10, d4) | `items[]` of matches only (`matches_query` always true), `count` (matches), `query_hits` (whole query as a substring), `token_hits` (every word of the query, any order — a looser superset, published so a word-order refusal is diagnosable), `min_query_hits`, `scraped_cards`, `non_matching_count`, `attempt_log` (each entry carries `blocked`, so a risk-control page is distinguishable from a declined search), `source: search_page_dom`. Raises `SearchUnavailableError` rather than returning the rail. |
+| `search_items` | `query`, `limit` (d60), `attempts` (1–10, d4), **`pages`** (1–10, d1), **`detail`** (0–50, d0) | `items[]` of matches only, each with price, want_count, city, seller, seller_avatar, tags, image_urls and rank — and, for the `detail` top N, the full listing: description, every photo, browse_count, collect_count, brand, condition, used_years, attributes, item_status, and the seller with city, tenure, sales, rating, reply rate, signature and 芝麻 status. `count` (matches), `pages_fetched`, `scraped_cards`, `query_hits` (whole query as a phrase), `token_hits` (every term, any order — the looser rule that makes Chinese work), `matched_by`, `min_query_hits`, `non_matching_count`, `detail_requested` / `detailed` / `detail_ms` / `detail_report` (per-listing: which answered, from where, and what goofish said when it did not), `attempt_log`, `source: search_api`. Raises `SearchUnavailableError` rather than returning the rail. |
 | `related_items` | `item_id` (optional), `limit` (d30), `page` (1–10000, d1) | `items[]` (feed card shape), `raw_cards`, `unique_items`, `has_more`, `source: item_web_recommend` |
-| `item_view` | `item_id` (digits or item URL) | `title, price, want_count, browse_count, description, seller, seller_tenure_years, seller_items_sold, seller_positive_rate, image_urls`, plus `condition`, `brand`, `city`, `fields_present` / `fields_missing`, `page_item_id`, `reco_anchors`, `image_candidates`, and `source`: **`item_page_dom`** (everything, when goofish serves the detail block) or **`search_card`** (title/price/condition/brand/city from the search results, when it does not — see [item_view](#what-is-verified-and-what-is-not)) |
+| `item_view` | `item_id` (digits or item URL) | `title, price, want_count, browse_count, description, seller, seller_tenure_years, seller_items_sold, seller_positive_rate, image_urls`, plus `seller_city, seller_signature, seller_reply_rate_24h, seller_items_listed, seller_avatar, seller_zhima_verified, brand, condition, used_years, attributes, collect_count, quantity, item_status, shipping_fee`, `fields_present` / `fields_missing`, `page_item_id`, and `source`: **`item_detail_api`** (the full listing), **`item_page_dom`** (the rendered page) or **`search_card_cache`** (an earlier search result in this session — see [item_view](#item_view-reads-the-calls-the-page-makes)) |
 | `recommendations` | `limit` (d30), `url` (optional) | `items[]`, `rail`, `page_url`, `attempts`, `risk_control_page`, `count`, `source: dom_recommendation` — or `source: homepage_feed` with `fallback_reason` when the DOM will not render |
 
 ## The login dialog is left alone, on purpose
@@ -112,7 +114,13 @@ harmful.
 ## Search is a keystroke, not a URL
 
 `search_items` does not navigate to `/search?q=`. It loads goofish's **homepage**, finds the SPA's own
-header search input, focuses it, types the query and presses Enter.
+header search input, focuses it, types the query and presses Enter — and the results it returns are the
+search call the page makes for itself, read off the wire. That call cannot be re-issued by this server:
+`mtop.taobao.idlemtopsearch.pc.search`, with the payload the page itself sent, answers
+`TIMEOUT::接口超时` when it is, for the same reason item detail does (see
+[item_view](#item_view-reads-the-calls-the-page-makes)). Letting the page ask is the only route, and
+it is the richer one: 30 structured results per query, each with a price, a want count, a city and a
+photo, where the DOM card this used to scrape could see a title and little else.
 
 This is measured, not preferred. A 2x2x2 matrix — headed/headless x fresh/persistent profile x
 direct-URL/search-input, one fresh browser per cell — returned results from exactly one cell:
@@ -125,9 +133,78 @@ direct-URL/search-input, one fresh browser per cell — returned results from ex
 | headless, all cells | 20 | 0 | risk-control page |
 
 So a direct-URL search on this client returns the recommendation rail, not results, and no amount of
-retrying fixes it. The first three attempts load the homepage and type; the last is the one direct-URL
-navigation, kept so a refusal can quote a real page rather than a guess — it is expected to be refused,
-and is reported as what it is.
+retrying fixes it. The first three attempts type; the last is the one direct-URL navigation, kept so a
+refusal can quote a real page rather than a guess — it is expected to be refused, and is reported as
+what it is.
+
+### Depth: `pages` and `detail`
+
+One search reply is 30 listings, and the search API cannot be re-issued — replaying the page's own
+payload through the same client answers `TIMEOUT::接口超时`, for the same anti-bot reason item detail
+does. Scrolling the results page does not paginate. So the only way past 30 is the page's own pager,
+which this server clicks: a DOM `click()`, not a Playwright pointer click, so the login dialog's
+`ant-modal-mask` cannot intercept it the way it eats every other click here. It is the search page's
+own pagination control, not a dialog dismissal.
+
+Measured: **30 new listings per page, 5–9.5s, zero overlap**, against 13–25s for a fresh page load.
+
+**How many of a page's 30 actually match is not 30.** goofish's ranking drifts between requests, so
+across three separate sessions `pages: 2` gave **25, 28 and 55** matches of 60 scanned, and a page
+three sometimes returned items already seen on pages one and two. `pages` is therefore a floor, not a
+ceiling: if the pages it walked leave fewer than `limit` matches, up to two more are walked. That bounds
+a thin market at about 14s extra rather than letting a degraded page silently under-deliver — and
+`pages_fetched` and `count` are both in the envelope, so what you actually got is never a guess.
+
+| | scanned | matches | time |
+|---|---|---|---|
+| `pages: 1` | 30 | 24–26 | 27s |
+| `pages: 2` | 60 | 25 / 28 / 55 | 21–36s |
+| `pages: 4` | 90 | **81–82** | 19–36s |
+
+`detail: N` reads the top N of the ranked results in full — description, every photo, and the seller
+with their city, tenure, sales count, rating, reply rate, signature and 芝麻 status. It is **one page
+load per listing — measured **7.5s and 10.1s** on the same box at different loads — and it does not
+parallelise**: four browser tabs loading four item pages at once measured 8.2s per listing against
+~9s serially, because goofish throttles per IP. Concurrency buys nothing and only risks more
+declines, so it is walked serially. Budget for 6–9 minutes on 50.
+
+**`search_items("thinkpad x220", pages: 2, limit: 50, detail: 50)`, measured:**
+
+| | |
+|---|---|
+| 50 listings, **50 read in full, 0 failures** | 410s and 548s on two runs (374s / 506s of it detail) |
+| 39 fields per listing, 50 descriptions | 45–46 of 50 with a seller rating on file |
+| 246–247 photos, price ¥80–¥499.9, median ¥228–248 | 104–108 KB of JSON, the token cost |
+
+The card fields are the reason `detail` is optional. Every listing in the reply already has a price, a
+want count, a city, the seller, their avatar, a photo and the tag strip (free shipping, price drop,
+seller credit) — all free, because it is in the reply we already had. The seller was the visible gap:
+a search card's name is `exContent.userNickName`, and reading `userNick` — which does not exist on a
+search card — left every search result with an empty seller. So ask for `detail` only on the shortlist
+you want in depth, not on all fifty.
+
+`detail_report` is published for exactly this reason: it names every listing by id, whether it
+answered, from which route, and what goofish said when it did not. A listing that will not answer
+falls back to the search card rather than being dropped, and says so in `detail_source` — a shorter
+list is fine, a dishonest one is not.
+
+**A query matches by its terms, in any order — this is not a detail.** goofish titles are in whatever
+word order the seller typed, and Chinese has no spaces to learn word boundaries from, so an exact
+substring test rejects nearly everything on this site. Measured, before this was fixed: a search for
+`机械硬盘4t` — 70,146 listings by goofish's own counter — returned *nothing*, because the titles say
+`西数4T机械硬盘`; `i350网卡` failed because titles say `Intel i350 网卡`. The query is split at
+whitespace and at every CJK↔Latin boundary (with a bare number and its unit kept together, so
+`显示器24寸` is `显示器` + `24寸`), and a listing matches when its title carries *all* of the terms in
+any order. The rail is still refused: a page full of bicycles does not contain `机械硬盘` and `4t`
+together. `matched_by` reports `phrase` when the strict and loose rules agreed and `all_terms` when
+the loose one admitted the set on its own.
+
+**Only the first search of a session pays for a page load.** If the dom page is already showing
+results, the next query is typed into the header input *there* — an SPA route change, measured 13–15s
+against 21s for a cold load. The input is selected-and-retyped rather than appended to, because on a
+warm page it still holds the previous query and `thinkpad x220` + `ipad air` submits as one nonsense
+keyword that legitimately finds nothing. That was a real bug the warm path introduced, and the
+relevance guard is what surfaced it rather than a plausible-looking result set.
 
 **The input is focused, not clicked.** goofish's login dialog puts an `ant-modal-mask` over the header,
 and Playwright's click actionability check times out against it (measured: a 10s timeout with the element
@@ -164,51 +241,44 @@ Set `XIANYU_HEADLESS=1` to opt back in; the cost is the DOM tools.
 
 ## Latency
 
-Measured live on 2026-09-27, one fresh browser process per tool, on a shared 4-core box running at load
-~12 (one goofish page load is 10–25s here, and Chromium launch is ~5s). Headed figures are the range
-across two full runs; the box was under different load for each, so treat these as order of magnitude,
-not a benchmark. The outcome column is what is stable — the same six tools, and the same two failures,
-every run.
+Measured live on 2026-09-29, headed, on a shared 4-core box at load ~12 (one goofish page load is
+10–25s here, Chromium launch is ~5s). One process, one browser: the first row is the cold start, every
+other figure is that same warm session. Treat these as order of magnitude, not a benchmark.
 
-| tool | headless | headed | result |
-|---|---|---|---|
-| `capabilities` | 40.4s | 14.2s / 37.0s | ok — `logged_out`, `feed_reachable: true` |
-| `browse_feed` | 19.0s | 13.2s / 55.4s | ok — 10 listings, `homepage_feed` |
-| `search_count` | 26.9s | 11.6s / 21.8s | ok — 28,841 / 29,671 / 28,844 for `x220` across runs |
-| `search_suggest` | 14.8s | 9.7s / 23.9s | ok — 10 suggestions |
-| `related_items` | 14.8s | 14.9s / 65.9s | ok — 10 listings, `item_web_recommend` |
-| `recommendations` | 19.9s | 18.6s / 31.3s / 50.9s | ok — 10 real listings; `dom_recommendation` on three runs, `homepage_feed` fallback on a fourth (see below) |
-| `search_items` | 45.9s | 45.3s / 47.6s | ok on a typed retry — 8/8 live queries, 18–40s |
-| `item_view` | 51.3s | 52.6s / 57.3s | ok — 6/6 live listings, 4–13s, via the page or the search fallback |
+| tool | warm | result |
+|---|---|---|
+| cold start (launch + first feed) | 24.7s | — |
+| `capabilities` | 1.9s | `logged_out`, `feed_reachable: true` |
+| `search_count` | 0.5s | 28,8xx for `thinkpad x220` |
+| `search_suggest` | 0.4s | 10 suggestions |
+| `related_items` | 2.2s | 20 listings, `item_web_recommend` |
+| `browse_feed` | 1.5s | 20 listings, `homepage_feed` |
+| `search_items` — first of a session | 20.9s | 10 matches, `search_api` |
+| `search_items` — later, warm page | 13.6–14.9s | 10 matches, `search_api` |
+| `item_view` | 6.4–9.5s | 5/5 live listings, `item_detail_api`, `fields_missing: []` |
+| `recommendations` | 17.7s | 20 real listings, `dom_recommendation` |
 
-Six of eight work in both modes. The two failures are the same failure with or without the login dialog.
-
-**This table predates two fixes and is out of date for the two DOM tools.** `search_items` now types
-into goofish's own header input instead of navigating to `/search?q=`, and succeeds: measured 8/8 live
-queries (`thinkpad x220`, `x220`, `iPhone 15 Pro`, `自行车`, `thinkpad t480`, `相机`, `显示器`,
-`机械键盘`), 7 on the first attempt, 18–40s. `item_view` falls back to the search route when the
-item page will not render, and succeeds: 6/6 live listings, 4–13s. The columns below predate both and
-are kept only as the record of what was measured at the time.
-
-On a warm session the mtop tools drop to **~1–2s** — they are one request with no navigation: the four raw
-mtop calls measured 319ms (suggest), 646ms (recommend), 768ms (feed) and 9422ms (the match counter, which
-is the one the server actually waits on). The figures above are cold-process, so each one also carries a
-Chromium launch and usually a page load, and on a loaded box the launch alone dominated the spread.
+Two things do the work. The four mtop-only tools run on a page of their own that never navigates, so
+they cost one request and no page load — 0.4–2.2s warm — and they no longer queue behind a search. And
+only the *first* `search_items` of a session pays for a page load: later ones retype into the header
+input of the page already showing results, which is an SPA route change, 13–15s against 21s for a cold
+load. `item_view` reads the call the page makes for itself, which is both the only route that works and
+far cheaper than the reload-and-retry loop it replaced.
 
 The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
-flight runs to completion: at the 150s default and a 10–25s load you get several attempts, and a call
-can overshoot its budget by roughly one page load.
+flight runs to completion: at the 90s default and a 10–25s load you get several attempts, and a call
+can overshoot its budget by roughly one page load. At that default `attempts: 4` is reachable without
+raising anything. Note that raising the budget alone does not help when the site is declining every
+load: a 280s budget with the default 4 attempts still stopped at 90s on the attempt cap, and 200s of
+continuous polling on one page load never produced a result.
 
 **The server runs windowed and needs a display.** goofish serves headless Chromium its risk-control
 page instead of the app, which leaves the three DOM tools with nothing to read, so headed is the
-default and a headless machine needs `xvfb-run` or an X server. The four mtop tools work either way. With the 45s default `attempts: 4` is
-unreachable — raise `XIANYU_SEARCH_BUDGET_S`, not `attempts`. Note that raising the budget alone does not
-help when the site is declining every load: a 280s budget with the default 4 attempts still stopped at
-90s on the attempt cap, and 200s of continuous polling on one page load never produced a result.
+default and a headless machine needs `xvfb-run` or an X server. The four mtop tools work either way.
 
 ## What is verified, and what is not
 
-**Verified against the live site, on 2026-09-27.** The mtop endpoints behind `browse_feed`,
+**Verified against the live site, on 2026-09-29.** The mtop endpoints behind `browse_feed`,
 `search_count`, `search_suggest` and `related_items` all answer anonymously, in *both* headless and
 headed: 8 feed pages / 157 unique listings with 0 duplicates, the match counter at 28,841 and 29,671
 for `x220` on consecutive runs (it drifts, so treat the number as a magnitude, not a constant) and 0 for
@@ -223,28 +293,41 @@ will not paint, and is live listings either way. The MCP server itself was drive
 stdio: `initialize`, `tools/list` returning all eight with their schemas and the no-account note on each,
 and a live `search_count` returning `{"ok":true,...,"match_count":28846}`.
 
-**`item_view` works, but the item page is login-gated, so it has two routes.**
+### `item_view` reads the calls the page makes
 
-goofish does not serve item pages to logged-out visitors. The page's own call to the item-detail API
-answers `TIMEOUT::接口超时` through the page's own client on both the web and h5 hosts; called directly
-without that client it answers `RGV587_ERROR` and hands back a passport redirect. So the SPA mounts,
-is refused, and draws the 猜你喜欢 rail instead of the listing — measured over 120s on several live
-listings, with `为你推荐` sitting at character 18 and `立即购买` / `担保交易` never appearing.
+goofish does not serve item detail to a request *this server* makes. Its own detail call,
+`mtop.taobao.idle.pc.detail`, answers `TIMEOUT::接口超时` when re-issued through the page's mtop client
+with the payload the page itself sent — goofish stamps the requests its own bundle originates with a
+per-call anti-bot blob, and a request we synthesise does not carry it. The same API, called by the page,
+answers `SUCCESS::调用成功` and carries the listing.
 
-`item_view` therefore does two things, and tells you which one answered:
+So `item_view` loads the item page and reads the reply that page makes for itself, off the wire. That
+is the only route that works, and it is also the richer one: the reply holds the title, the full photo
+gallery, the description, the 品牌/成色/已用年限 attribute block, the seller's city, tenure, sales
+count, positive rate, signature, reply rate and avatar, plus favourites, quantity and shipping.
+
+This replaces a premise this README used to state, in three comments in the source and in the tool
+description: that "goofish does not serve item pages to logged-out visitors". It does. Measured on
+2026-09-29: the detail block paints, the API answers anonymously, and 6/6 live listings returned in
+4–10s. The DOM path the tool fell back to is the thing that was actually broken — it could not produce
+a title at all (empty on 6 of 6 live listings, because the title is not in the page's text; it is in
+the document title), and its photo selector returned goofish's own promo banners, four `-tps-242-150.png`
+strips on a page whose listing was a nail gun.
 
 | | when | what you get |
 |---|---|---|
-| `source: item_page_dom` | goofish served the detail block | everything: title, price, want/browse counts, description, seller stats, gallery |
-| `source: search_card` | the page did not render, but search has the listing | title, price, condition, brand, city — and `fields_missing` naming the description, the gallery and the seller statistics, which exist only behind the login gate |
+| `source: item_detail_api` | the page's detail call answered | everything listed above, exact |
+| `source: item_page_dom` | no API reply, but the detail block rendered | the ten DOM-scrapable fields, title included |
+| `source: search_card_cache` | the page would not answer, but an earlier search in this session returned the id | title, price, city, want count, photo — and `fields_missing` naming the description and the seller statistics |
 
-The fallback is keyed on `item_id`, not on a query, so it cannot return a similarly-named listing.
-Search results are remembered for the process, so the ordinary sequence — `search_items` then
-`item_view` on a result — is fast: measured 6/6 across six live listings in 4–13s.
+The card route is keyed on `item_id`, not on a query, so it cannot return a similarly-named listing.
+It is the *last* resort rather than the first, now that the page itself is fast; it replaced a fallback
+that ran up to eight whole keyword searches, each a fresh 10–25s page load.
 
-If neither route finds it, the error says the item detail is login-gated and the listing may have been
-sold or removed. It does not tell you to look for a throttled IP, which is what an earlier version of
-this README did and what was wrong.
+If none of them find it, the error quotes what goofish actually said — most often that this id is
+sold, removed, or too old to still be live, since goofish answers a dead id with no listing rather than
+an error. It does not tell you to look for a throttled IP, which is what an earlier version of this
+README did and what was wrong.
 
 **Still worth knowing about the site.** goofish decides *per page load* whether to serve a given page,
 and an automated client is served a risk-control notice (`非法访问 / 请使用正常浏览器访问闲鱼`) more often
@@ -261,12 +344,24 @@ page — named as `site_error`, and retried rather than waited on.
 - **No credentials.** No cookie, storage-state or persistent-profile API appears anywhere in `src/`
   or `test/`; the test that enforces it matches `.cookies(` with whitespace stripped, so
   `page.context().cookies()` and a call split across lines cannot slip through either.
-- **Read-only.** No publish, delete, message, upload or account tool exists. The five mtop API names
+- **No orphaned browsers.** The server holds a real windowed Chromium, so shutdown is deliberate: a
+client closing stdin, a signal, and an unexpected exit all route through one bounded teardown, and a
+`browser.close()` that hangs is SIGKILLed rather than left running. Two measured defects are behind
+that guarantee, and both were invisible from inside the process. The SDK's stdio transport does not
+listen for the end of stdin, so a client that simply went away left the server running indefinitely.
+And closing stdin emits *both* `end` and `close`, so the second one hit the re-entrancy guard and
+called `process.exit` while the teardown was still in flight — the node process died mid-`close()` and
+left the browser reparented to init: **15 orphaned processes after one audit run**. The guard now lets
+the in-flight teardown finish, and a `process.on('exit')` hook SIGKILLs the browser synchronously for
+the path where the event loop has already stopped. Verified after every fix: 0 processes left, 0 orphans.
+- **Read-only.** No publish, delete, message, upload or account tool exists. The seven mtop API names
   the server may use are a closed list — only `window.lib.mtop.request`, the client method the whole
-  design rests on, is exempt — and a test fails if any other `mtop.*` name appears.
+  design rests on, is exempt — and a test fails if any other `mtop.*` name appears. Five are called by
+  this server; the other two (`idle.pc.detail`, `idlemtopsearch.pc.search`) are named because the *page*
+  calls them and the server reads the replies — see [item_view](#item_view-reads-the-calls-the-page-makes).
 - **goofish only, over https.** Every navigation passes a host *and* scheme allowlist checked against
   the *parsed* URL, and re-checked against the URL goofish itself landed on, at both `goto` sites and in
-  `currentPage`. Those checks are point-in-time, and a caller then polls for seconds before it reads
+  `revive`. Those checks are point-in-time, and a caller then polls for seconds before it reads
   anything, so every DOM read also re-checks the URL that is live *now*, in the same statement as the
   read — one helper, and no scraper may bypass it (a test fails the build if one does).
   `https://www.goofish.com@evil.com/`, `https://www.goofish.computer/` and
@@ -282,7 +377,7 @@ page — named as `site_error`, and retried rather than waited on.
 ## Development
 
 ```bash
-npm test                 # 40 tests, no network, no browser
+npm test                 # 56 tests, no network, no browser
 npm run typecheck        # tsc --noEmit over src and test
 npm run build            # src/*.ts -> dist/*.js, what the tarball ships
 node src/index.ts        # stdio, run from source; refuses to run interactively
