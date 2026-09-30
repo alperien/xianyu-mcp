@@ -379,7 +379,7 @@ the path where the event loop has already stopped. Verified after every fix: 0 p
 ## Development
 
 ```bash
-npm test                 # 56 tests, no network, no browser
+npm test                 # 58 tests, no network, no browser
 npm run typecheck        # tsc --noEmit over src and test
 npm run build            # src/*.ts -> dist/*.js, what the tarball ships
 node src/index.ts        # stdio, run from source; refuses to run interactively
@@ -389,3 +389,15 @@ node src/index.ts        # stdio, run from source; refuses to run interactively
 clone needs no build step. `tsconfig.build.json` is the emit config for the published artifact, and the
 two differ only in that. Any import in `src/` keeps its `.ts` extension and `rewriteRelativeImportExtensions`
 turns it into a `.js` one at build time; do not hand-write `.js` imports.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+This is a TypeScript rewrite. The repository's `main` branch is the TypeScript port; the original
+Python implementation is preserved on the `python-original` branch. The endpoint knowledge, the
+search-relevance rules and the item/search extractors derive from
+[fancyboi999/goofish-cli](https://github.com/fancyboi999/goofish-cli), which is credited in `NOTICE`.
+
+Security policy, including what this server deliberately does not hold and how to report a problem:
+[SECURITY.md](SECURITY.md).
