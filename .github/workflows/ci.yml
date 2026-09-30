@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The suite's slowest tests are timer-bound retry loops, not I/O, so this is generous rather than tight.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the exact floor, not `^22`: unflagged type stripping landed in 22.18, and
+      # 22.6-22.17 fail with ERR_UNKNOWN_FILE_EXTENSION. A caret range would let a runner bump
+      # reintroduce that as an intermittent, hard-to-read failure.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.18'
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      # Hermetic: the suite drives a fake session (setSession), imports no Playwright, and never
+      # contacts goofish.com -- so this needs neither a browser nor network access. `npm ci` does
+      # not download Chromium either, because playwright has no install script.
+      - run: npm test
+
+      # Guards the one thing the build can silently break: the emitted JS must carry .js specifiers,
+      # not the .ts ones the sources import.
+      - run: npm run build
+
+      - name: the built entry point carries .js specifiers, not .ts
+        run: |
+          if grep -q "from \"\./[a-z]*\.ts\"" dist/index.js; then
+            echo "dist/index.js still imports .ts -- rewriteRelativeImportExtensions is not taking effect"
+            exit 1
+          fi
+          node --check dist/index.js
