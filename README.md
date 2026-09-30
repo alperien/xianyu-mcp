@@ -1,5 +1,7 @@
 # xianyu-mcp
 
+[![ci](https://github.com/alperien/xianyu-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alperien/xianyu-mcp/actions/workflows/ci.yml)
+
 **Read-only Xianyu (闲鱼 / Goofish) MCP server that needs no Xianyu account. No cookies, no login, no
 stored credentials, no write tools.** TypeScript, run directly by Node — unflagged type stripping
 landed in 23.6 and was backported to **22.18**, so that is the floor: on 22.6–22.17 `node src/index.ts`

@@ -724,7 +724,12 @@ test('the `detail` argument reads the top N in full, and reports which ones it c
   assert.equal(fourthReport.ok, true);
   assert.equal(fourthReport.source, 'search_card_cache');
   assert.equal(out.detail_report.filter((r: any) => r.source === 'item_detail_api').length, 3);
-  assert.ok(out.detail_ms > 0, 'and what the depth cost, so a caller can price the next call');
+  // `detail_ms` is what the depth cost, so a caller can price the next call. Assert the field is
+  // present and is the sum of the per-listing costs -- not that it is nonzero. The fake session
+  // answers with no delay, so three reads can legitimately total 0ms; a wall-clock assertion here
+  // passes on a fast machine and fails on a loaded one, which is how it reached CI green-then-red.
+  assert.equal(typeof out.detail_ms, 'number');
+  assert.equal(out.detail_ms, out.detail_report.reduce((a: number, r: any) => a + (r.ms ?? 0), 0));
   // the three that worked carry the detail fields; the fourth is still a card
   const first = out.items.find((i: any) => i.item_id === '300');
   assert.equal(first.description, '成色好，功能正常');
