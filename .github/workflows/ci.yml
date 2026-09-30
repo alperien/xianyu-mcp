@@ -2,7 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [master]
+    # `main` is the branch this repository publishes on; `master` is kept so a local
+    # rename does not silently stop CI.
+    branches: [main, master]
   pull_request:
   workflow_dispatch:
 
