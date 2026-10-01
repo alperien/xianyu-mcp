@@ -23,9 +23,15 @@ It never clicks anything in the page, and [the login dialog is deliberately left
 From a clone:
 
 ```bash
-npm install                      # deps: @modelcontextprotocol/sdk, playwright, zod
+npm install                      # deps: @modelcontextprotocol/sdk, zod
 npx playwright install chromium  # or point XIANYU_BROWSER_PATH at a Chrome/Chromium binary
 ```
+
+`playwright` is an *optional* dependency and is loaded the first time a browser is actually launched,
+not at startup. That keeps it off the critical path: the server reaches MCP-ready in ~30ms instead of
+paying ~4s for the import, and a tool call that never needs a Chromium never pays for one. If
+playwright is missing entirely, the failure is a launch-time error naming the browser, not a
+`MODULE_NOT_FOUND` at startup.
 
 As a dependency (`npm install xianyu-mcp`), the published tarball is prebuilt — `dist/` — and
 `npx playwright install chromium` is still needed. The build exists because Node refuses to strip
