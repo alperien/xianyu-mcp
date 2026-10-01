@@ -1,2 +1,14 @@
 node_modules/
 dist/
+
+# Agent tooling (Gas Town / Claude Code / editor state)
+.runtime/
+.beads/
+.claude/
+.opencode/
+.logs/
+__pycache__/
+state.json
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
