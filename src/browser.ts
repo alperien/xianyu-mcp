@@ -12,7 +12,6 @@
  * honest way to read item detail or search results is to let the page make the call and read what
  * comes back, rather than to re-issue it and get a TIMEOUT. See `observe`.
  */
-import { chromium } from 'playwright';
 import type { Browser, BrowserContext, Page } from 'playwright';
 import { BrowserError, NavigationError } from './errors.ts';
 import { MTOP_CALL_JS, MTOP_READY_JS } from './extract.ts';
@@ -211,6 +210,15 @@ export class Session {
     const opts = { headless: process.env.XIANYU_HEADLESS !== '1',
       ...(process.env.XIANYU_BROWSER_PATH ? { executablePath: process.env.XIANYU_BROWSER_PATH } : {}),
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check', '--disable-gpu'] };
+    // Playwright is loaded here rather than at module scope. It is the heaviest thing this server
+    // depends on (measured: 19M of a 73M tree, most of it playwright-core), and a top-level import
+    // pays that on every start whether or not a browser is ever launched -- including the four
+    // mtop-only tools, which need a page but no Chromium of their own beyond the one they share.
+    // Dynamic import also turns "playwright is not installed" into a launch-time message carrying
+    // LAUNCH_HINT, instead of a MODULE_NOT_FOUND at startup that says nothing about a browser.
+    let chromium;
+    try { ({ chromium } = await import('playwright')); }
+    catch (e) { throw new BrowserError(`playwright could not be loaded: ${e}\n${LAUNCH_HINT}`); }
     try { this.browser = await chromium.launch(opts); }
     catch (e) { await this.close(); throw new BrowserError(`could not launch Chromium: ${e}\n${LAUNCH_HINT}`); }
     try {   // a brand-new context every time: no profile directory, nothing persisted

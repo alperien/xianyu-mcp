@@ -40,8 +40,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",
-    "playwright": "^1.63.0",
     "zod": "^4.6.5"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.63.0"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
