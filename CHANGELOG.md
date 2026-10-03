@@ -15,12 +15,24 @@ From here on, each release gets a commit behind it and this file grows normally.
 The Python implementation this is a port of is not in this history at all: it lives on the
 `python-original` branch as a single commit (`cfe401d`, 2026-09-27).
 
-## [Unreleased]
+## [0.2.0] — 2026-10-03
 
 ### Added
 
+- `XIANYU_SEARCH_MAX_ITEMS`: a runtime ceiling on one `search_items` call, clamped to 30–300 and read
+  per call like the budget overrides. It clamps both `limit` and how deep the pager walk goes (one
+  page of 30 per 30 of the cap), so even `pages: 10, limit: 500` stops inside
+  `XIANYU_SEARCH_BUDGET_S`. A test pins the walk stopping at the cap, and that the recommendation
+  rail is still refused as results.
 - This file, and a test that the version the MCP handshake advertises is read from `package.json`
   rather than written down a second time.
+
+### Changed
+
+- `search_items` defaults to 120 results instead of 60, and its published maximum is 300 — the full
+  pager depth — instead of the shared 500. Depth is still two arguments: `pages` walks the pager and
+  `detail` reads the top N in full, and both still ride the one shared dom page without relaunching
+  the browser.
 
 ### Fixed
 

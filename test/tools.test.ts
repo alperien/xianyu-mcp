@@ -177,7 +177,7 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
 };
 // The search-card cache is module state that outlives a call, so it is cleared between tests the same
 // way the env budget is: a test that seeds it would otherwise have the next item_view answered from it.
-test.afterEach(() => { setSession(null); resetCardCache(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; });
+test.afterEach(() => { setSession(null); resetCardCache(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -702,6 +702,31 @@ test('search_items stops walking when the pager has no such page, and says why',
   assert.deepEqual(s.pagers, ['2']);
   const stopped = out.attempt_log.find((e: any) => e.pager && e.ok === false);
   assert.equal(stopped.pager, 2, 'and the refusal is in the log, with the page it stopped on');
+});
+
+test('the deeper walk stops at XIANYU_SEARCH_MAX_ITEMS, and the rail is still never returned as results', async () => {
+  // Full-depth pages on offer (99), and a call that asks for everything: pages 10, limit 300.
+  // With XIANYU_SEARCH_MAX_ITEMS=60 the walk must stop after two pages -- one page of 30 per 30 of
+  // the cap -- rather than climbing to ten, and it must do so without another page load: one warm
+  // search, then pager clicks only.
+  const pgs = (n: number) => ok(searchReply('x220', Array.from({ length: 30 }, (_, i) => [`联想 X220 ${n}-${i}`, String(n * 100 + i), '50', '北京', '1'])));
+  process.env.XIANYU_SEARCH_MAX_ITEMS = '60';
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [pgs(1), pgs(2), pgs(3), pgs(4)] } }));
+  s.runRealNormalizer = true;
+  const capped = await run('search_items')({ query: 'x220', pages: 10, limit: 300, attempts: 1 });
+  assert.deepEqual(s.pagers, ['2'], 'the walk stopped at the cap, not at the pager');
+  assert.equal(capped.pages_fetched, 2);
+  assert.equal(capped.scraped_cards, 60, 'the guard pooled exactly the two capped pages');
+  assert.ok(capped.count <= 60, 'limit itself is clamped by the cap');
+  assert.equal(s.opened.length, 1, 'one page load; the deeper walk rides the shared page, no extra launches');
+
+  // The cap does not weaken the relevance guard: a search reply that is really the recommendation
+  // rail is still refused as results, end to end, through the same walk.
+  delete process.env.XIANYU_SEARCH_MAX_ITEMS;
+  const railReply = ok(searchReply('x220', Array.from({ length: 30 }, (_, i) => [`推荐商品 ${i}`, String(2000 + i), '5', '北京', '0'])));
+  const railDom = { rendered: true, query_hits: 0, cards_scanned: 40, rail: '猜你喜欢', says_no_results: true, text_preview: '猜你喜欢', items: [] };
+  use(makeSession({ scrape: [railDom], mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [railReply, railReply] } }));
+  await assert.rejects(run('search_items')({ query: 'x220', pages: 3, attempts: 1 }), (e: any) => e instanceof SearchUnavailableError && /"rail":"猜你喜欢"/.test(e.message));
 });
 
 test('the `detail` argument reads the top N in full, and reports which ones it could not', async () => {
