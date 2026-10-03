@@ -402,7 +402,8 @@ turns it into a `.js` one at build time; do not hand-write `.js` imports.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Release notes are in
+[CHANGELOG.md](CHANGELOG.md).
 
 This is a TypeScript rewrite. The repository's `main` branch is the TypeScript port; the original
 Python implementation is preserved on the `python-original` branch. The endpoint knowledge, the
