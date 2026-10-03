@@ -34,7 +34,7 @@ const RECOMMEND_PAGE_SIZE = 30, RECOMMEND_SEED_ITEM_ID = '809806779491';
 // goofish's own feed runs out of pages long before this; the bound only exists so a nonsense page_number cannot become a nonsense request.
 const MAX_PAGES = 25, MAX_LIMIT = 500, MAX_PAGE_NUMBER = 10_000;
 // Every field item_view reports, in one place so the honesty contract (fields_present / fields_missing) and the scraper cannot drift apart. Exported, and a test asserts every entry is a key the scraper actually returns.
-export const ITEM_FIELDS = ['title', 'price', 'want_count', 'browse_count', 'description', 'seller', 'seller_tenure_years', 'seller_items_sold', 'seller_positive_rate', 'image_urls'] as const;
+export const ITEM_FIELDS = ['title', 'price', 'want_count', 'browse_count', 'description', 'seller', 'seller_tenure_years', 'seller_items_sold', 'seller_positive_rate', 'image_urls', 'collect_count', 'quantity', 'item_status', 'shipping_fee', 'seller_city', 'seller_signature', 'seller_reply_rate_24h', 'seller_items_listed', 'seller_avatar', 'seller_zhima_verified', 'brand', 'condition', 'used_years', 'location', 'publish_time'] as const;
 // goofish renders anonymous pages as a coin flip: the same URL comes back fully rendered or as an empty shell. Retry a few times before calling it a failure. Reloads are cache-busted with a nonce, since a cached empty shell is exactly the failure to escape.
 const RENDER_ATTEMPTS = 5, RENDER_SETTLE_MS = 3500;
 const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
@@ -69,6 +69,38 @@ const GATE_MARKERS = ['mini_login', 'RGV587', 'FAIL_SYS_SESSION_EXPIRED', 'FAIL_
 const NO_SESSION_MARKERS = ['SESSION_EXPIRED', 'TOKEN', '令牌过期'];
 
 // ---------------------------------------------------------------- pure helpers
+// ------------------------------------------------- v0.2 listing schema shaping
+// The normalisers in extract.ts stay close to the wire -- raw strings, in goofish's own shapes -- because the tests pin that contract. This one place is where the published listing schema is produced: typed values, and an explicit `missing` list that names every documented field the page did not render. Raw stays raw in extract.ts; typed starts here.
+/** Numeric at the boundary. '366', '¥1,299.00' and raw transport sums all become a plain number; anything unreadable is null, not a silently invented 0. */
+const toNum = (v: unknown): number | null => { const s = String(v ?? '').replace(/[^\d.]/g, ''); if (!s) return null; const n = Number(s); return Number.isFinite(n) ? n : null; };
+/** goofish carries epochs as numbers or numeric strings, milliseconds in practice (a 13-digit fixture), seconds in some payloads. Anything that does not parse is null rather than a garbage date. An already-ISO string passes through so a detail reply that supplied one is not double-converted and lost. */
+const epochToIso = (v: unknown): string | null => {
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) return v;
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const d = new Date(n >= 1e11 ? n : n * 1000);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+};
+const NUMERIC_KEYS = new Set(['price', 'original_price', 'shipping_fee', 'want_count', 'browse_count', 'collect_count', 'quantity', 'image_count', 'seller_tenure_years', 'seller_items_sold', 'seller_items_listed', 'seller_positive_rate', 'seller_reply_rate_24h']);
+const TEXT_KEYS = ['title', 'description', 'seller', 'seller_city', 'seller_avatar', 'seller_signature', 'seller_last_active', 'brand', 'condition', 'used_years', 'item_status', 'city', 'category_id'];
+/** The documented fields whose null/empty state is reported in an item's `missing` list. Booleans are deliberately absent: `is_video: false` is an answer, not a gap. */
+const MISSING_CHECK = ['title', 'price', 'original_price', 'description', 'seller', 'seller_city', 'seller_avatar', 'seller_signature', 'seller_last_active', 'seller_tenure_years', 'seller_items_sold', 'seller_items_listed', 'seller_positive_rate', 'seller_reply_rate_24h', 'brand', 'condition', 'used_years', 'item_status', 'city', 'category_id', 'image_count', 'want_count', 'browse_count', 'collect_count', 'quantity', 'shipping_fee', 'want_count', 'publish_time', 'location', 'image_urls', 'tags'];
+/** Shape one raw listing into the documented v0.2 item: typed values, every omitted field of the schema family named in `missing`. Absent keys are filled with null where the schema expects the key to be there, so two routes that answered different parts of the listing produce items with the same key surface -- a detail page, a search card and a feed card differ only in which values are null, never in which keys exist. */
+const normalizeItem = (item: any): any => {
+  const out: any = { ...item };
+  for (const k of Object.keys(out)) if (NUMERIC_KEYS.has(k)) out[k] = toNum(out[k]);
+  for (const k of TEXT_KEYS) if (out[k] === '') out[k] = null;
+  out.publish_time = 'publish_time' in out ? epochToIso(out.publish_time) : null;
+  if (out.location === undefined || out.location === '' || out.location === null) {
+    const c = (typeof out.seller_city === 'string' && out.seller_city) || (typeof out.city === 'string' && out.city) || null;
+    out.location = c ? { city: c } : null;
+  }
+  for (const k of ['shipping_fee', 'browse_count', 'condition', 'brand', 'original_price', 'want_count']) if (!(k in out)) out[k] = null;
+  out.missing = MISSING_CHECK.filter((f) => out[f] === null || out[f] === undefined || out[f] === '' || (Array.isArray(out[f]) && out[f].length === 0));
+  return out;
+};
+
 const clamp = (value: unknown, low: number, high: number): number => { const n = Number(value); return Number.isFinite(n) ? Math.max(low, Math.min(Math.trunc(n), high)) : low; };
 const itemIdFromUrl = (url: unknown): string => String(url ?? '').match(/[?&]id=(\d+)/)?.[1] ?? '';
 /** Accept a bare item id or a goofish item URL and return the bare digits. */
@@ -86,8 +118,15 @@ const dedupe = (items: any[]): any[] => {
   return items.filter((it) => { const key = it?.item_id || itemIdFromUrl(it?.url); if (!key || seen.has(key)) return false; seen.add(key); return true; });
 };
 const rankItems = (items: any[], limit: number): any[] => items.slice(0, limit).map((it, i) => ({ ...it, rank: i + 1 }));
-/** "Non-empty" presence: an array is truthy in JS, so a gallery that never loaded must not be reported as if it were there. */
-const present = (v: unknown): boolean => (Array.isArray(v) ? v.length > 0 : Boolean(v));
+/** "Non-empty" presence: an array is truthy in JS, so a gallery that never loaded must not be reported as if it were there. With the typed schema, 0 and false are real answers (a listing with no wants, a seller that is not zhima-verified), not missing values. */
+const present = (v: unknown): boolean => {
+  if (v === null || v === undefined || v === '') return false;
+  if (Array.isArray(v)) return v.length > 0;
+  if (typeof v === 'number') return Number.isFinite(v);
+  if (typeof v === 'boolean') return true;
+  if (typeof v === 'object') return Object.keys(v).length > 0;
+  return Boolean(v);
+};
 /** Wall-clock budget for one best-effort tool's retry *loop*, overridable via XIANYU_<NAME>_BUDGET_S, floored at 5s and capped at 600s: a floor keeps the tools usable, and a ceiling keeps the override from restoring the multi-minute hang the function exists to prevent. It does not bound the call -- a page load costs 10-25s on a slow link, and one already in flight runs to completion. Read per call, so a script can change it. */
 export const budget = (name: string, defaultS: number): number => { const raw = process.env[`XIANYU_${name}_BUDGET_S`]; const n = Number(raw); return raw?.trim() && Number.isInteger(n) ? clamp(n, 5, 600) : defaultS; };
 /** The runtime ceiling on one search_items call, overridable via XIANYU_SEARCH_MAX_ITEMS and read
@@ -122,7 +161,7 @@ const browseFeed = async ({ page_number = 1, pages = 1, limit = 60 }: FeedArgs):
     throw new ParseError(`feed returned no cards for pages [${wanted}]: ${JSON.stringify(pageReports)}. The card shape may have changed.`);
   }
   const normalized = await evaluate(page, FEED_NORMALIZE_JS, { rows: rows.map((r) => r?.cardData || r) }, 'feed normalization');
-  const items = dedupe((normalized || []).filter((i: any) => i.item_id));
+  const items = dedupe((normalized || []).filter((i: any) => i.item_id)).map(normalizeItem);
   if (!items.length) throw new ParseError(`feed returned cards but none had an item id -- the response shape likely changed. First card keys: ${Object.keys(rows[0] || {}).sort().slice(0, 12)}`);
   const ranked = rankItems(items, clamp(limit, 1, MAX_LIMIT));
   return { source: 'homepage_feed', account_required: false, requested_pages: wanted, page_reports: pageReports, raw_cards: rows.length, unique_items: items.length, count: ranked.length, items: ranked };
@@ -169,7 +208,7 @@ const relatedItems = async ({ item_id, limit = 30, page = 1 }: RelatedArgs): Pro
   const payload = entry.data || {}, cards = Array.isArray(payload.cardList) ? payload.cardList : [];
   if (!cards.length) throw new ParseError(`recommendation endpoint returned no cards for item ${iid || '(generic)'}: keys=${Object.keys(payload).sort().slice(0, 10)}`);
   const normalized = await evaluate(pg, FEED_NORMALIZE_JS, { rows: cards.map((c: any) => c?.cardData || c) }, 'recommendation normalizer');
-  const items = dedupe((normalized || []).filter((i: any) => i.item_id));
+  const items = dedupe((normalized || []).filter((i: any) => i.item_id)).map(normalizeItem);
   if (!items.length) throw new ParseError('recommendation cards had no item ids; the payload shape likely changed');
   const ranked = rankItems(items, clamp(limit, 1, MAX_LIMIT));
   return { item_id: iid || null, page: clamp(page, 1, MAX_PAGE_NUMBER), account_required: false, source: 'item_web_recommend', raw_cards: cards.length, unique_items: items.length, has_more: Boolean(payload.hasMore), count: ranked.length, items: ranked };
@@ -191,7 +230,7 @@ const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => 
     const feed = await browseFeed({ pages: 1, limit: cap });
     return { ...feed, source: 'homepage_feed', requested_url: target, fallback_reason: `the DOM at ${page.url()} rendered no cards after ${Math.min(attemptNo, RENDER_ATTEMPTS)} attempt(s) in ${Math.round((Date.now() - started) / 1000)}s (goofish serves anonymous visitors an empty shell part of the time); returned live feed listings instead` };
   }
-  const items = rankItems(dedupe(payload.items), cap);
+  const items = rankItems(dedupe(payload.items), cap).map(normalizeItem);
   return { source: 'dom_recommendation', rail: payload.rail || '', page_url: page.url(), account_required: false, attempts: attemptNo, says_no_results_for_query: Boolean(payload.says_no_results), risk_control_page: Boolean(payload.blocked), count: items.length, items };
 };
 
