@@ -10,8 +10,8 @@ page.on('response', async (res) => {
 });
 const url = process.argv[2];
 await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-await page.waitForTimeout(12000);
-console.log('URL:', page.url());
+try { await page.waitForTimeout(12000); } catch {}
+console.log("URL:", page.url());// eslint-disable-line page.url());
 console.log('TITLE:', await page.title());
 const seen = new Set();
 for (const t of taps) { if (seen.has(t.api)) continue; seen.add(t.api); console.log(t.api, '|', t.ret.slice(0,60), '| keys:', Object.keys(t.data ?? {}).slice(0,10).join(',')); }
