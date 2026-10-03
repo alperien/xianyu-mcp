@@ -381,11 +381,15 @@ the path where the event loop has already stopped. Verified after every fix: 0 p
   search results.
 - **The page is never clicked.** A structural test fails if a `.click(` call appears anywhere in
   `src/` or `test/`, and if the dismisser's selectors come back.
+- **One version, written once.** The version in the MCP handshake is read out of `package.json` at
+  startup, and a test fails if a semver literal reappears anywhere in `src/`. It used to be written
+  down in both places, so `npm version` could bump the package while every client was still told the
+  previous release existed.
 
 ## Development
 
 ```bash
-npm test                 # 58 tests, no network, no browser
+npm test                 # 59 tests, no network, no browser
 npm run typecheck        # tsc --noEmit over src and test
 npm run build            # src/*.ts -> dist/*.js, what the tarball ships
 node src/index.ts        # stdio, run from source; refuses to run interactively

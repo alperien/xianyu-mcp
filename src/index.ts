@@ -1,12 +1,20 @@
 #!/usr/bin/env node
 /** MCP stdio entry point. Register it with an MCP client exactly as README.md shows it -- `node /path/to/xianyu-mcp/dist/index.js` as `command` + `args`; this file used to carry an inline config snippet of its own and it was not valid MCP config. No Xianyu account, no cookies, no stored credentials, no write tools: the server launches its own Chromium and reads goofish the way an anonymous visitor's browser does. */
+import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { getSession } from './browser.ts';
 import { describe } from './errors.ts';
 import { TOOLS } from './tools.ts';
 
-const mcp = new McpServer({ name: 'xianyu', version: '0.1.0' }, {
+// The version the MCP handshake advertises is package.json's, read rather than written down a second
+// time. It used to be a literal here, and the two drifted without anything noticing: `npm version`
+// moved package.json and the server went on claiming the old number to every client that asked.
+// `../package.json` is one level up from src/ (run straight from a checkout) and from dist/ (the
+// prebuilt tarball) alike, and npm always ships package.json even though `files` does not list it.
+const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
+
+const mcp = new McpServer({ name: 'xianyu', version }, {
   instructions: 'Read-only access to Xianyu/Goofish with NO Xianyu account required. All eight tools -- capabilities, browse_feed, search_count, search_suggest, search_items, related_items, item_view, recommendations -- work logged out. Search is a keystroke rather than a URL and is declined by goofish on some page loads, so search_items retries and refuses to return the recommendation rail as results; item_view and search_items read the calls the page makes for itself, which is the only way those two answer. The four mtop-only tools run on their own page and do not queue behind a search. Call capabilities for the current verified picture.',
 });
 

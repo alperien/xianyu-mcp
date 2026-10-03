@@ -125,6 +125,24 @@ test('the entry point does not serialise the tools: the lock belongs to the thre
   }
 });
 
+test('the advertised version is read from package.json, not written down a second time', () => {
+  // The entry point used to carry `version: '0.1.0'` as a literal beside package.json's own "0.1.0".
+  // Nothing compared them, so `npm version` would bump the package and leave every MCP client being
+  // told the previous release existed. Asserted over the source rather than at runtime because the
+  // property is that there is no second copy to fall out of step -- importing index.ts would start
+  // the stdio server.
+  const idx = read(join(ROOT, 'src', 'index.ts'));
+  assert.match(idx, /createRequire\(import\.meta\.url\)\('\.\.\/package\.json'\)/, 'the version must come from package.json');
+  const pkg = JSON.parse(read(join(ROOT, 'package.json'))) as { version: string };
+  assert.match(pkg.version, /^\d+\.\d+\.\d+/, `package.json version looks wrong: ${pkg.version}`);
+  assert.match(idx, /new McpServer\(\{ name: 'xianyu', version \}/, 'the handshake must use the value it just read');
+  // No literal semver anywhere in src/: that is the shape the drift took.
+  for (const p of sources.filter((f) => f.includes(`${ROOT}/src/`))) {
+    const literal = SRC[p].match(/version: ['"]\d+\.\d+\.\d+['"]/);
+    assert.equal(literal, null, `${p.replace(`${ROOT}/`, '')} writes down a version literal (${literal?.[0]})`);
+  }
+});
+
 test('the published argument names and defaults are exactly these', () => {
   const shape = (t: (typeof TOOLS)[number]) => Object.fromEntries(Object.entries(t.schema).map(([k, v]: [string, any]) => {
     const parsed = v.safeParse(undefined);
