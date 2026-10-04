@@ -59,6 +59,7 @@ See [Headless vs headed](#headless-vs-headed) for what `XIANYU_HEADLESS=1` costs
 | `XIANYU_SEARCH_BUDGET_S` | 90 | wall-clock budget for the `search_items` retry loop (5–600s) |
 | `XIANYU_ITEM_VIEW_BUDGET_S` | 90 | wall-clock budget for the `item_view` retry loop (5–600s) |
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
+| `XIANYU_SELLER_PROFILE_BUDGET_S` | 90 | wall-clock budget for the item-page hop `seller_profile` / `seller_items` make when given an `item_id` (5–600s). A lookup by `user_id` runs no loop and spends none of it |
 | `XIANYU_SEARCH_MAX_ITEMS` | 300 | ceiling for one `search_items` call, in listings — clamps both `limit` and how deep the pager walk goes (30–300), so a huge walk stays inside `XIANYU_SEARCH_BUDGET_S` |
 
 The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
@@ -67,7 +68,7 @@ can overshoot its budget by roughly one page load.
 
 **The server runs windowed and needs a display.** goofish serves headless Chromium its risk-control
 page instead of the app, which leaves the three DOM tools with nothing to read, so headed is the
-default and a headless machine needs `xvfb-run` or an X server. The four mtop tools work either way.
+default and a headless machine needs `xvfb-run` or an X server. The mtop-only tools work either way.
 
 ## Tools
 
@@ -83,63 +84,57 @@ one browser, one page — so two tools in flight cannot navigate each other out 
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing` — see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error — but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
-| `search_items` | `query`, `limit` (d120, ≤300), `attempts` (1–10, d4), **`pages`** (1–10, d1), **`detail`** (0–50, d0) | `items[]` of matches only, each with price, want_count, city, seller, seller_avatar, tags, image_urls and rank — and, for the `detail` top N, the full listing: description, every photo, browse_count, collect_count, brand, condition, used_years, attributes, item_status, and the seller with city, tenure, sales, rating, reply rate, signature and 芝麻 status. `count` (matches), `pages_fetched`, `scraped_cards`, `query_hits` (whole query as a phrase), `token_hits` (every term, any order — the looser rule that makes Chinese work), `matched_by`, `min_query_hits`, `non_matching_count`, `detail_requested` / `detailed` / `detail_ms` / `detail_report` (per-listing: which answered, from where, and what goofish said when it did not), `attempt_log`, `source: search_api`, and `typed` + `missing` on every item. Raises `SearchUnavailableError` rather than returning the rail. |
-| `related_items` | `item_id` (optional), `limit` (d30), `page` (1–10000, d1) | `items[]` (feed card shape, each with `typed` + `missing`), `raw_cards`, `unique_items`, `has_more`, `source: item_web_recommend` |
-| `item_view` | `item_id` (digits or item URL) | `title, price, want_count, browse_count, description, seller, seller_tenure_years, seller_items_sold, seller_positive_rate, image_urls`, plus `seller_city, seller_signature, seller_reply_rate_24h, seller_items_listed, seller_avatar, seller_zhima_verified, brand, condition, used_years, attributes, collect_count, quantity, item_status, shipping_fee`, `typed` / `missing`, `fields_present` / `fields_missing`, `page_item_id`, and `source`: **`item_detail_api`** (the full listing), **`item_page_dom`** (the rendered page) or **`search_card_cache`** (an earlier search result in this session — see [item_view](#item_view-reads-the-calls-the-page-makes)) |
-| `recommendations` | `limit` (d30), `url` (optional) | `items[]` (each with `typed` + `missing`), `rail`, `page_url`, `attempts`, `risk_control_page`, `count`, `source: dom_recommendation` — or `source: homepage_feed` with `fallback_reason` when the DOM will not render |
+| `seller_profile` | `user_id` **or** `item_id` (exactly one) | `display_name, avatar_url, signature, seller_credit, buyer_credit, level, level_score, praise_ratio, review_count, listings_count, ratings_count, followers, following, verified_real_name, verified_real_person, verified_zhima`, plus `city, tenure_years, items_sold, items_listed, positive_rate, reply_rate_24h, last_active` **only when given an `item_id`**, `profile_url`, `item_id`, `fields_present` / `fields_missing`, and `source`: **`idle_user_page_head`** (given a `user_id`, one mtop call, no page load) or **`item_detail+idle_user_page_head`** (given an `item_id`, one item page load). A seller that does not exist raises `DetailUnavailableError`; a throttle raises `GatedError`. See [seller tools](#the-two-seller-tools). |
+| `seller_items` | `user_id` **or** `item_id` (exactly one), `limit` (d20), `page` (1–50, d1) | `items[]` of `rank, item_id, title, price, category_id, want_count, tags, image_urls, url`, `has_more` (from goofish's own `nextPage` — walk `page`, do not assume 20), `raw_cards`, `count`, `profile_url`, `source: idle_xyh_item_list`. An empty shop and a page past the end are both `count: 0`, not an error; a payload carrying none of the endpoint's own keys is a `ParseError`. goofish serves at most 50 pages of 20, so walk `has_more` rather than asking for a page number up front. |
 
-Every listing those five tools publish — in `items[]` and, for `item_view`, at the top level — also
-carries **`typed`** and **`missing`**. See [the typed block](#the-typed-block-every-listing-carries).
+## The two seller tools
 
-## The typed block every listing carries
+`seller_profile` and `seller_items` answer the two questions about a seller that nothing else here can:
+what their standing is, and what else they have for sale. On a marketplace with no ratings and no
+feedback threads, that is the whole of due diligence.
 
-The flat fields above are the site's own strings, and they stay that way: `price` is `"366"`, not
-`366`. That is deliberate — a field that changes type under an existing caller is a breaking change
-wearing a version number — so rather than retype them in place, every listing gains one sibling key
-that reads the same values *as types*:
+Both take the same choice, and it is a choice about cost:
 
-```jsonc
-{
-  "price": "1,299",                    // unchanged: still the site's string
-  "browse_count": "110",
-  "typed": {
-    "price_amount": 1299,              // the same value, parsed
-    "want_count": 366,
-    "view_count": 110,
-    "collect_count": null,
-    "condition": "明显使用痕迹",
-    "published_at": "2026-07-21T13:24:36.000Z",   // goofish sends an epoch; sometimes ms, sometimes s
-    "updated_at": null,
-    "location": { "province": "浙江省", "city": "台州" },
-    "shipping": { "fee": 0, "free_shipping": true },
-    "seller_stats": {
-      "tenure_years": 6, "items_sold": 369, "positive_rate": 80,
-      "reply_rate_24h": 97, "zhima_verified": true
-    }
-  },
-  "missing": ["collect_count", "updated_at"]
-}
-```
+| you pass | what it costs | what you get |
+|---|---|---|
+| `user_id` | **one mtop call, no page load** | the standing: credit tier, shop level and score, praise ratio, review count, followers, listing count, identity checks |
+| `item_id` | **one item page load** | the standing *plus* the seller's city, tenure, sales count and positive rate — and `seller_items` means that listing's seller |
 
-Three rules, and they are the whole contract:
+Passing both is refused rather than one quietly winning: a caller who passes both has no way to see from
+the envelope which one was ignored. Passing neither gets the same treatment. The four fields in the
+bottom row are named in `fields_missing` when you passed a `user_id`, because the profile endpoint has
+no answer for them at all and a blank there would read as "this seller has no history".
 
-1. **Every key in `typed` is always present.** The block does not change shape with the route that
-   answered — a homepage feed card, a search card, a DOM-scraped card, the item page and the detail
-   API all publish the same ten keys. Only the values differ, so "which of these is absent" is a
-   question about the answer rather than about which tool you called.
-2. **A value the site did not render is `null`, and named in `missing`.** Never inferred from a
-   sibling and never defaulted. `missing` holds the paths inside `typed` that are null, dotted where
-   they are nested (`location.province` when the city was read and the province was not). It is *not*
-   the same list as `item_view`'s older `fields_missing`, which walks the flat `ITEM_FIELDS` instead;
-   both are published, and neither is derived from the other.
-3. **A `0` the site sent is a `0`, not a gap.** Nobody wanting an item, nobody viewing it, nobody
-   favouriting it and a `¥0` transport fee are all facts, and they publish as numbers.
-   `shipping.free_shipping` is the one derived value in the block, and it is only ever derived from a
-   fee the payload actually carried.
+**How the profile is reached at all** is the part worth knowing. `mtop.idle.web.user.page.head` is the
+endpoint goofish's own `/personal?userId=` page calls, and this server reads it by *issuing* it through
+that page's own mtop client — from a page that never makes the call. That works, and it is the opposite
+of what happens with `mtop.taobao.idle.pc.detail`:
 
-Nothing here is scraped twice. The block is built once, in Node, from the same reply the flat fields
-came out of — which is why a listing whose page rendered no province reports `location.province:
-null` rather than a province guessed from the city string.
+| endpoint | the page calls it? | issued by this server |
+|---|---|---|
+| `mtop.taobao.idle.pc.detail` (item detail) | yes | **`TIMEOUT::接口超时`** |
+| `mtop.taobao.idlemtopsearch.pc.search` | yes | **`TIMEOUT::接口超时`** |
+| `mtop.idle.web.user.page.head` (seller profile) | no | **`SUCCESS::调用成功`** |
+| `mtop.idle.web.xyh.item.list` (seller's listings) | no | **`SUCCESS::调用成功`** |
+
+goofish stamps a per-call anti-bot blob onto the requests its own bundle originates, and a request we
+synthesise does not carry it. So for an endpoint the current page happens to use, the only honest route
+is to let the page make the call and read the reply off the wire — which is what `item_view` and
+`search_items` do, and what the seller tools do for the one hop they cannot avoid. For an endpoint the
+page never uses there is nothing to stamp, so the same client answers directly. Response interception
+can only ever report a call the page already decided to make, which is why a seller profile was not
+reachable before and is now.
+
+That asymmetry is also why `seller_profile` given an `item_id` still costs a page load: the seller of a
+listing is behind `mtop.taobao.idle.pc.detail`, and no feed or recommendation card carries a seller id
+(measured — the recommend endpoint's cards have no `user` or `detailParams` at all). So the hop reads
+the item page's own detail reply, under the shared-page lock, and releases it before the profile call.
+
+**One field is deliberately not published.** The profile payload carries `module.base.ipLocation`, which
+reads like the seller's city and is not: it is where goofish thinks *this request* came from. Measured,
+it answered `上海市` for a seller whose own listing record says `北京`. Publishing it would put a wrong
+city in the field an agent would most trust it in. The seller's city comes from the listing's detail
+record, which is why it is in the bottom row of the table above.
 
 ## The login dialog is left alone, on purpose
 
@@ -320,7 +315,7 @@ other figure is that same warm session. Treat these as order of magnitude, not a
 | `item_view` | 6.4–9.5s | 5/5 live listings, `item_detail_api`, `fields_missing: []` |
 | `recommendations` | 17.7s | 20 real listings, `dom_recommendation` |
 
-Two things do the work. The four mtop-only tools run on a page of their own that never navigates, so
+Two things do the work. The mtop-only tools run on a page of their own that never navigates, so
 they cost one request and no page load — 0.4–2.2s warm — and they no longer queue behind a search. And
 only the *first* `search_items` of a session pays for a page load: later ones retype into the header
 input of the page already showing results, which is an SPA route change, 13–15s against 21s for a cold
@@ -336,7 +331,7 @@ continuous polling on one page load never produced a result.
 
 **The server runs windowed and needs a display.** goofish serves headless Chromium its risk-control
 page instead of the app, which leaves the three DOM tools with nothing to read, so headed is the
-default and a headless machine needs `xvfb-run` or an X server. The four mtop tools work either way.
+default and a headless machine needs `xvfb-run` or an X server. The mtop-only tools work either way.
 
 ## What is verified, and what is not
 
@@ -352,7 +347,7 @@ and `FAIL_SYS_SESSION_EXPIRED::Session过期` for `loginuser.get` — so the ses
 dom_recommendation`, in both modes, with the login dialog up — on three of four runs; the fourth fell
 back to `source: homepage_feed` with a `fallback_reason`, which is the designed behaviour when the rail
 will not paint, and is live listings either way. The MCP server itself was driven over
-stdio: `initialize`, `tools/list` returning all eight with their schemas and the no-account note on each,
+stdio: `initialize`, `tools/list` returning all ten with their schemas and the no-account note on each,
 and a live `search_count` returning `{"ok":true,...,"match_count":28846}`.
 
 ### `item_view` reads the calls the page makes
@@ -393,7 +388,7 @@ README did and what was wrong.
 
 **Still worth knowing about the site.** goofish decides *per page load* whether to serve a given page,
 and an automated client is served a risk-control notice (`非法访问 / 请使用正常浏览器访问闲鱼`) more often
-than a real browser is. That page is a 200 that renders no listing at all; the four mtop tools keep
+than a real browser is. That page is a 200 that renders no listing at all; the mtop-only tools keep
 working through it because they need only the client. When it happens the DOM tools say `blocked: true`
 rather than reporting zero results. Its own edge also fails outright sometimes, serving a `网络不见了`
 page — named as `site_error`, and retried rather than waited on.
@@ -416,11 +411,23 @@ called `process.exit` while the teardown was still in flight — the node proces
 left the browser reparented to init: **15 orphaned processes after one audit run**. The guard now lets
 the in-flight teardown finish, and a `process.on('exit')` hook SIGKILLs the browser synchronously for
 the path where the event loop has already stopped. Verified after every fix: 0 processes left, 0 orphans.
-- **Read-only.** No publish, delete, message, upload or account tool exists. The seven mtop API names
+- **Read-only.** No publish, delete, message, upload or account tool exists. The nine mtop API names
   the server may use are a closed list — only `window.lib.mtop.request`, the client method the whole
-  design rests on, is exempt — and a test fails if any other `mtop.*` name appears. Five are called by
+  design rests on, is exempt — and a test fails if any other `mtop.*` name appears. Seven are called by
   this server; the other two (`idle.pc.detail`, `idlemtopsearch.pc.search`) are named because the *page*
   calls them and the server reads the replies — see [item_view](#item_view-reads-the-calls-the-page-makes).
+- **The lock is taken where a page is read, not by a list of tools.** The three DOM tools hold the
+  shared navigating page, and the mtop-only ones never queue behind a 70s search. The two seller tools
+  are the case that forces the rule to be stated that way: mtop-only given a `user_id`, and holding the
+  lock for exactly one item-page hop given an `item_id`, released before their mtop calls. A test reads
+  the source and fails if either is wrapped in the blanket lock, if `resolveSeller` stops taking the
+  shared one, or if either grows a lock of its own.
+- **A field that cannot be filled is null and named.** `seller_profile` publishes `fields_missing`
+  covering the four facts the profile endpoint does not carry, rather than an empty-looking profile that
+  reads as "no history". It refuses a payload whose `kcUserId` is not the seller asked for, on the same
+  grounds as `item_view` refusing a detail reply about another listing — and the profile payload's
+  `ipLocation` is dropped rather than published as a city, because it is the request's origin and
+  measured 上海市 for a 北京 seller.
 - **goofish only, over https.** Every navigation passes a host *and* scheme allowlist checked against
   the *parsed* URL, and re-checked against the URL goofish itself landed on, at both `goto` sites and in
   `revive`. Those checks are point-in-time, and a caller then polls for seconds before it reads
@@ -443,7 +450,7 @@ the path where the event loop has already stopped. Verified after every fix: 0 p
 ## Development
 
 ```bash
-npm test                 # 59 tests, no network, no browser
+npm test                 # 71 tests, no network, no browser
 npm run typecheck        # tsc --noEmit over src and test
 npm run build            # src/*.ts -> dist/*.js, what the tarball ships
 node src/index.ts        # stdio, run from source; refuses to run interactively

@@ -314,11 +314,128 @@ export const detailListing = (data: any, wanted: string): any | null => {
     seller_avatar: asText(seller.portraitUrl).replace(/^http:\/\//, 'https://'),
     seller_last_active: asText(seller.lastVisitTime),
     seller_zhima_verified: seller.zhimaAuth === true,
+    // Not in `ITEM_FIELDS`, so `fields_present` / `fields_missing` are unchanged and item_view's
+    // envelope does not grow a field: this is the one hop from a listing to the seller behind it, and
+    // `seller_profile` / `seller_items` need it. `sellerId` is goofish's plain numeric user id --
+    // `kcUserId` in the profile payload, and the `userId` that /personal?userId= takes. Measured, live:
+    // a detail reply's sellerDO carries `sellerId` and no `userId`/`userIdStr` at all, so a normaliser
+    // that guessed at those two names would come back empty and the second hop would never run.
+    seller_id: asText(seller.sellerId),
     brand: asText(attributes['品牌']),
     condition: asText(attributes['成色']),
     used_years: asText(attributes['已用年限']),
     attributes,
     image_urls: images,
+  };
+};
+
+/** The tags out of an `xyh.item.list` card's `itemLabelDataVO`: the strip goofish prints under the
+ *  title -- "2人想要", "验货宝", "卖家信用极好". Same idea as the search card's `fishTags` reader and a
+ *  different key, which is why it is its own function: `labelData` is `{r1: {tagList: [...]}, r3: ...}`
+ *  and each tag's text is at `tagList[].data.content`.
+ *
+ *  The icon-name filter is NOT optional here, and this function started without it and shipped a
+ *  `freeShippingIcon` as if it were a fact about the listing -- caught by a live run, not by a test.
+ *  An `img` tag carries its label text in `content` and its icon name in a sibling field, but free
+ *  shipping arrives as a bare `content: 'freeShippingIcon'` with no text at all, so the only way to
+ *  tell the two apart is the same `/Icon$/` rule the `fishTags` reader already uses. */
+const labelContents = (labelData: any): string[] => {
+  const out: string[] = [];
+  for (const group of Object.values(labelData ?? {})) {
+    for (const t of (group as any)?.tagList ?? []) {
+      const c = asText(t?.data?.content);
+      if (c && !/Icon$/.test(c) && !out.includes(c)) out.push(c);
+    }
+  }
+  return out;
+};
+
+/** The listings one seller currently has up, out of a captured `mtop.idle.web.xyh.item.list` payload.
+ *
+ *  Deliberately NOT `FEED_NORMALIZE_JS`. That reader puts `detailParams.title` first in its title
+ *  chain, because on a feed or search card that is the listing title -- and here it is not always: this
+ *  endpoint's `cardData.title` is what goofish renders as the listing name, and for a seller who typed
+ *  prose into it ("专柜入手，穿过几次…") that prose *is* the title, on both fields. Reading them through
+ *  the feed normaliser would also have re-derived a web `url` this endpoint never sends, because its
+ *  own `detailUrl` is a `fleamarket://` app deep link that no browser can open.
+ *
+ *  `totalCount` is in the payload and is always 0 -- measured, two page sizes, a seller with six live
+ *  listings -- so it is not read here. `nextPage` is the field that does work.
+ *
+ *  A `SUCCESS` reply with no `cardList` at all is this endpoint's way of saying "no listings on this
+ *  page": measured, page 2 of a six-listing seller came back `SUCCESS` with `cardList` absent and every
+ *  other key present. So the caller must not read a missing card list as a shape change -- which is
+ *  exactly what the first version of `seller_items` did, and a live run turned it into a `ParseError`
+ *  for the most ordinary call there is. Cards with no id are dropped, so a renamed `detailParams`
+ *  shortens the list instead of publishing listings without one. */
+export const sellerListings = (data: any): any[] => {
+  const cards: any[] = [];
+  for (const entry of Array.isArray(data?.cardList) ? data.cardList : []) {
+    const card = entry?.cardData || entry || {};
+    const dp = card.detailParams || {};
+    const itemId = asText(dp.itemId) || asText(card.id);
+    if (!itemId) continue;
+    const images: string[] = [];
+    for (const u of [dp.picUrl, card.picInfo?.picUrl]) {
+      const s = asText(u).replace(/^http:\/\//, 'https://');
+      if (s && !images.includes(s)) images.push(s);
+    }
+    // "2人想要" is the only place a want count appears on this card, and it is prose rather than a
+    // number -- read as one, and left empty when the label is an image badge with no count in it.
+    const want = String(labelContents(card.itemLabelDataVO?.labelData).find((t) => /人想要/.test(t)) ?? '').match(/([\d.]+)\s*(万)?\s*人想要/);
+    cards.push({
+      item_id: itemId,
+      title: firstText(card.title, dp.title),
+      price: firstText(dp.soldPrice, card.priceInfo?.price),
+      category_id: asText(card.categoryId),
+      want_count: want ? countOf(want[2] ? Number(want[1]) * 10_000 : Number(want[1])) : '',
+      tags: labelContents(card.itemLabelDataVO?.labelData),
+      image_urls: images,
+      url: `https://www.goofish.com/item?id=${itemId}`,
+    });
+  }
+  return cards;
+};
+
+/** The profile out of a captured `mtop.idle.web.user.page.head` payload -- the endpoint the
+ *  /personal?userId= page calls for itself, which answers anonymously and is reachable through the
+ *  page's own mtop client from a page that never calls it.
+ *
+ *  One field is deliberately not read. `module.base.ipLocation` looks like the seller's city and is
+ *  not: it is where goofish thinks *this request* came from. Measured live, it answered `上海市` for a
+ *  seller whose own detail record says `北京`, because the probe was leaving Shanghai. Publishing it
+ *  would put a wrong city in a field an agent would reasonably trust, and it would be wrong in the most
+ *  confident way possible. The seller's own city is on the item page's `sellerDO`, which is where
+ *  `seller_profile` reads it from -- see `SELLER_PROFILE_FIELDS`.
+ *
+ *  Everything else is the seller's standing: their credit tier, shop level and score, praise ratio and
+ *  review count, follower and listing counts, and which identity checks they have passed. `praiseRatio`
+ *  is a bare number (100) where `newGoodRatioRate` on the detail payload is the same figure as a
+ *  string with a `%` on it, so the percent sign is dropped here to match the other counts. */
+export const sellerProfileOf = (data: any): any => {
+  const module = data?.module || {}, base = module.base || {}, shop = module.shop || {}, social = module.social || {}, tabs = module.tabs || {};
+  const tags = data?.baseInfo?.tags || {};
+  const credit = (role: string): string => firstText(...(Array.isArray(base.ylzTags) ? base.ylzTags : []).filter((t: any) => t?.attributes?.role === role).map((t: any) => t?.text));
+  return {
+    user_id: asText(data?.baseInfo?.kcUserId),
+    display_name: asText(base.displayName),
+    avatar_url: asText(base.avatar?.avatar).replace(/^http:\/\//, 'https://'),
+    signature: asText(base.introduction),
+    seller_credit: credit('seller'),
+    buyer_credit: credit('buyer'),
+    level: asText(shop.level),
+    level_score: countOf(shop.score),
+    praise_ratio: asText(shop.praiseRatio).replace('%', ''),
+    review_count: countOf(shop.reviewNum),
+    listings_count: countOf(tabs.item?.number),
+    ratings_count: countOf(tabs.rate?.number),
+    followers: firstText(social.followers),
+    following: firstText(social.following),
+    // A tag that is absent and a tag that is false both mean "not verified", and both are published as
+    // false: `verified` is a statement about the account, and an unanswered question is not a yes.
+    verified_real_name: tags.real_name_certification_77 === true,
+    verified_real_person: tags.real_person_certification_77 === true,
+    verified_zhima: tags.idle_zhima_zheng === true,
   };
 };
 
@@ -631,7 +748,7 @@ export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; limit: n
     says_no_results: /没有找到你想要的宝贝|未找到相关宝贝|没有找到相关/.test(text),
     // Measured, not guessed: goofish answers this client with a whole-page risk-control notice instead
     // of the app -- "非法访问 ... 请使用正常浏览器访问闲鱼" -- a 200 that renders no listing at all. The
-    // mtop client still comes up on it, so the four API tools keep working while every DOM tool sees
+    // mtop client still comes up on it, so the mtop-only tools keep working while every DOM tool sees
     // zero cards, which reads exactly like "no results found" unless it is named.
     blocked: /非法访问|使用正常浏览器|访问闲鱼/.test(text),
     rendered: items.length > 0,

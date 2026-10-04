@@ -8,8 +8,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, isoOrNull, ITEM_SCRAPE_JS, listingTyped, missingPaths, MTOP_CALL_JS, MTOP_READY_JS, numberOrNull, queryTerms, RAIL_MARKERS, SCRAPE_CARDS_JS } from '../src/extract.ts';
-import { ITEM_FIELDS } from '../src/tools.ts';
+import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, isoOrNull, ITEM_SCRAPE_JS, listingTyped, missingPaths, MTOP_CALL_JS, MTOP_READY_JS, numberOrNull, queryTerms, RAIL_MARKERS, SCRAPE_CARDS_JS, sellerListings, sellerProfileOf } from '../src/extract.ts';
+import { ITEM_FIELDS, SELLER_ITEM_PAGE_FIELDS, SELLER_PROFILE_FIELDS } from '../src/tools.ts';
 
 const g = globalThis as any;
 const realSetTimeout = g.setTimeout;
@@ -327,3 +327,83 @@ test('a declined anonymous search is distinguishable from a real result set, and
   assert.equal(SCRAPE_CARDS_JS({ query: 'x220', terms: queryTerms('x220'), limit: 5, rails: ['推荐位'] }).rail, '', 'a marker that is not in the list is not a rail');
 });
 
+// ---- the two seller normalisers. These are Node-side functions over a payload the page already
+// produced, so unlike the in-page scripts above they need no synthetic document -- what is pinned here
+// is the honesty of the mapping, which is the only thing a browser would not have caught.
+
+/** A `mtop.idle.web.user.page.head` reply as captured off the wire, including the field that must NOT
+ *  become a city: `ipLocation` is where goofish thinks this request came from, and it measured 上海市
+ *  for a seller whose own listing record says 北京. */
+const HEAD_PAYLOAD = {
+  baseInfo: { kcUserId: '2214350705775', encryptedUserId: 'strZSeNsALQaHGp6qPRb3g==', tags: { real_name_certification_77: true, real_person_certification_77: true, idle_zhima_zheng: true, tb_xianyu_user: false } },
+  module: {
+    base: { ipLocation: '上海市', displayName: '汴梁资深化镁', introduction: '签名', avatar: { avatar: 'http://img.alicdn.com/a.jpg' },
+      ylzTags: [{ attributes: { role: 'seller' }, text: '卖家信用极好' }, { attributes: { role: 'buyer' }, text: '买家信用极好' }] },
+    shop: { level: 'L2', score: 42, praiseRatio: 100, reviewNum: 5 },
+    social: { followers: '11', following: '3' },
+    tabs: { item: { number: 6 }, rate: { number: '19' } },
+  },
+};
+
+test('the seller profile normaliser reads standing, and drops the one field that looks like a city', () => {
+  const p = sellerProfileOf(HEAD_PAYLOAD);
+  assert.equal(p.display_name, '汴梁资深化镁');
+  assert.equal(p.avatar_url, 'https://img.alicdn.com/a.jpg');
+  assert.equal(p.city, undefined);
+  assert.equal(JSON.stringify(p).includes('上海市'), false, 'ipLocation leaked in somewhere: it is the request origin, not the seller');
+  // praiseRatio is a bare 100 here and "100%" on the detail payload; the sign is dropped so the two
+  // sources of the same figure compare.
+  assert.equal(p.praise_ratio, '100');
+  assert.equal(p.listings_count, '6');
+  assert.equal(p.ratings_count, '19');
+  assert.deepEqual([p.seller_credit, p.buyer_credit], ['卖家信用极好', '买家信用极好']);
+  // A tag that is absent and a tag that is false both mean "not verified", and both publish false: an
+  // unanswered question must not read as a yes.
+  assert.equal(p.verified_zhima, true);
+  assert.equal(p.verified_real_name, true);
+  assert.equal(sellerProfileOf({ baseInfo: { tags: {} }, module: {} }).verified_real_person, false);
+  // SELLER_PROFILE_FIELDS is what seller_profile promises, and it deliberately spans two payloads: the
+  // standing half is this function's, and the item-page half is filled from a listing's detail record
+  // instead. So the assertion is that each name has exactly one owner -- a name neither returns would
+  // mean fields_present / fields_missing describe a field nobody fills.
+  const standing = SELLER_PROFILE_FIELDS.filter((f) => !(SELLER_ITEM_PAGE_FIELDS as readonly string[]).includes(f));
+  for (const f of standing) assert.ok(f in p, `seller_profile promises ${f}, which this normaliser never returns`);
+  for (const f of SELLER_ITEM_PAGE_FIELDS) assert.equal(f in p, false, `${f} comes from the listing's detail record, not from the profile payload`);
+  assert.deepEqual([...SELLER_ITEM_PAGE_FIELDS].sort(), ['city', 'items_listed', 'items_sold', 'last_active', 'positive_rate', 'reply_rate_24h', 'tenure_years']);
+  // A payload with no module at all is a shape change, and every field comes back blank rather than
+  // throwing -- `present()` then names all of them missing, which is the honest report.
+  const empty = sellerProfileOf({});
+  assert.deepEqual(SELLER_PROFILE_FIELDS.filter((f) => empty[f] !== undefined && empty[f] !== '' && empty[f] !== false), []);
+  assert.deepEqual(sellerProfileOf(null).display_name, '');
+});
+
+test('the seller listing normaliser reads this endpoint\'s card, not the feed card\'s', () => {
+  // A real `mtop.idle.web.xyh.item.list` card. Two things here are not what the feed normaliser
+  // expects: `detailUrl` is a `fleamarket://` deep link no browser can open, and the want count is
+  // prose in the label strip rather than a number in an attributeMap.
+  const cards = sellerListings({ cardList: [{ cardType: 1003, cardData: {
+    id: '1045171414271', title: '专柜入手，穿过几次', detailUrl: 'fleamarket://awesome_detail?itemId=1045171414271', categoryId: '50106003',
+    detailParams: { itemId: '1045171414271', title: '专柜入手，穿过几次', soldPrice: '1999', picUrl: 'http://img.alicdn.com/i4/a.jpg' },
+    priceInfo: { preText: '¥', price: '1999' },
+    itemLabelDataVO: { labelData: { r1: { tagList: [{ data: { content: '验货宝' } }] }, r3: { tagList: [{ data: { content: '2人想要' } }] } } },
+  } }], totalCount: 0, nextPage: false });
+  assert.equal(cards.length, 1);
+  assert.deepEqual(cards[0], { item_id: '1045171414271', title: '专柜入手，穿过几次', price: '1999', category_id: '50106003', want_count: '2', tags: ['验货宝', '2人想要'], image_urls: ['https://img.alicdn.com/i4/a.jpg'], url: 'https://www.goofish.com/item?id=1045171414271' });
+  // 万 is read as the multiplier it is: "1.2万人想要" is 12,000 people, not 1.
+  assert.equal(sellerListings({ cardList: [{ cardData: { detailParams: { itemId: '9' }, itemLabelDataVO: { labelData: { r3: { tagList: [{ data: { content: '1.2万人想要' } }] } } } } }] })[0].want_count, '12000');
+  // No want label at all is an empty string, never a 0: 0 and "not reported" are different facts and
+  // this server never conflates them.
+  assert.equal(sellerListings({ cardList: [{ cardData: { detailParams: { itemId: '9' } } }] })[0].want_count, '');
+  // The id is in `detailParams.itemId` and on the card itself; a card with neither is dropped rather
+  // than published without one.
+  assert.equal(sellerListings({ cardList: [{ cardData: { title: 'x' } }] }).length, 0);
+  assert.equal(sellerListings({ cardList: [{ cardData: { id: '77', title: 'x' } }] })[0].item_id, '77');
+  // Neither an absent card list nor a non-array one throws: an empty shop is an answer.
+  assert.deepEqual(sellerListings({ cardList: [] }), []);
+  assert.deepEqual(sellerListings({}), []);
+  assert.deepEqual(sellerListings(null), []);
+  // `priceInfo.price` is the fallback when soldPrice is gone, and `picInfo.picUrl` the fallback for the
+  // photo -- both https-normalised, because the payload carries http.
+  const alt = sellerListings({ cardList: [{ cardData: { id: '5', priceInfo: { price: '42' }, picInfo: { picUrl: 'http://img.alicdn.com/p.jpg' } } }] })[0];
+  assert.deepEqual([alt.price, alt.image_urls], ['42', ['https://img.alicdn.com/p.jpg']]);
+});

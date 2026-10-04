@@ -15,6 +15,7 @@ import { BOOT_URL, exclusive, HOME, reloadFresh, Session, setSession } from '../
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
 import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
 import { budget, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
+import { z } from 'zod';
 
 const run = (name: string) => {
   const t = TOOLS.find((x) => x.name === name);
@@ -661,7 +662,7 @@ test('search_items refuses a search reply that is really the recommendation rail
   await assert.rejects(run('search_items')({ query: 'thinkpad x220', attempts: 1, limit: 5 }), (e: any) => e instanceof SearchUnavailableError);
 });
 
-test('the four mtop-only tools do not queue behind a search on the shared page', async () => {
+test('the mtop-only tools do not queue behind a search on the shared page', async () => {
   // One page meant a 70s search held up a feed call that does 1.5s of work. The api page and the dom
   // page are separate, and only the dom tools take the exclusive lock.
   //
@@ -694,10 +695,14 @@ test('the four mtop-only tools do not queue behind a search on the shared page',
 test('the lock is on the three DOM tools and nowhere else, through the registered tool table', async () => {
   // The regression guard for the defect above, stated about the tool table itself rather than about
   // one hand-wrapped call. Which tools take the shared-page lock is a contract with index.ts -- it
-  // must not wrap them again, or the four fast tools queue behind every slow one -- so assert it here.
+  // must not wrap them again, or the fast tools queue behind every slow one -- so assert it here.
   const LOCKED = ['search_items', 'item_view', 'recommendations'];
   const free = TOOLS.filter((t) => !LOCKED.includes(t.name)).map((t) => t.name);
-  assert.deepEqual(free.sort(), ['browse_feed', 'capabilities', 'related_items', 'search_count', 'search_suggest']);
+  // The two seller tools are in the free set for a reason that is not "they never touch the dom page":
+  // given a user_id they do not, and given an item_id they take the lock for exactly the hop that
+  // resolves the seller and release it before their mtop calls. Wrapping them whole would be the
+  // defect this test exists to catch; the scoped lock is pinned by its own invariant scan.
+  assert.deepEqual(free.sort(), ['browse_feed', 'capabilities', 'related_items', 'search_count', 'search_suggest', 'seller_items', 'seller_profile']);
   // `capabilities` is deliberately free: it only reads, never navigates, and it is the tool an agent
   // calls when something else is stuck -- queueing it behind the stuck search would be perverse.
   // Proof by behaviour: an mtop call in flight while a DOM call holds the lock still answers.
@@ -710,6 +715,39 @@ test('the lock is on the three DOM tools and nowhere else, through the registere
   assert.equal(count.match_count, 28800);
   await domHeld;
   assert.equal(released, true);
+});
+
+test('a seller lookup by user_id never waits for the lock, and one by item_id only waits for the hop', async () => {
+  // The two halves of the scoped lock, by behaviour rather than by reading the source. A lookup by
+  // seller id is one mtop call, so it must answer while a DOM call holds the shared page -- otherwise
+  // a 70s search would delay a 1.5s seller lookup for no reason at all.
+  const head = { ok: true, ret: 'SUCCESS::调用成功', data: HEAD };
+  const s = use(makeSession({}, { head }));
+  let released = false;
+  const domHeld = exclusive(async () => { await new Promise((r) => setTimeout(r, 40)); released = true; });
+  const byId = await run('seller_profile')({ user_id: '2214350705775' });
+  assert.equal(released, false, 'the seller lookup waited for a held lock, and it had no page to read');
+  assert.equal(byId.display_name, '汴梁资深化镁');
+  assert.deepEqual(s.opened, []);
+  await domHeld;
+  assert.equal(released, true);
+  // And the item_id route really does take the lock -- it navigates the dom page, which is exactly
+  // what the lock exists to serialise. Queued behind a DOM call, it waits; then it answers.
+  const s2 = use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({
+    itemDO: { itemId: '42', title: '男士羊毛呢大衣' }, sellerDO: { sellerId: '2214350705775', city: '北京' },
+  })] } }, { head }));
+  let done = false;
+  let releaseDom = () => {};
+  const held = exclusive(() => new Promise<void>((r) => { releaseDom = r; }));
+  const searching = run('seller_profile')({ item_id: '42' }).then((out: any) => { done = true; return out; });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(done, false, 'the item_id hop must queue behind whatever holds the dom page');
+  assert.deepEqual(s2.opened, [], 'and it must not have navigated while the lock is held');
+  releaseDom();
+  await held;
+  const out: any = await searching;
+  assert.equal(out.city, '北京');
+  assert.deepEqual(s2.opened, ['https://www.goofish.com/item?id=42']);
 });
 
 test('search_items walks the pager for more pages, and the guard runs over the whole pooled set', async () => {
@@ -1011,6 +1049,223 @@ test('search_suggest normalises, dedupes and respects the default limit of 20', 
   // a non-list `items` used to escape as a raw TypeError published as error_type "TypeError"
   use(makeSession({}, { sug: { ok: true, ret: 'SUCCESS', data: { totalCount: 3, items: { 0: { suggest: 'x220-0' } } } } }));
   await assert.rejects(run('search_suggest')({ query: 'x220' }), (e: any) => e instanceof ParseError && /non-list `items`/.test(e.message));
+});
+
+// ---- the two seller tools. Both fixtures below are the payloads read off the wire, not invented:
+// `mtop.idle.web.user.page.head` captured from a /personal?userId= page, and `mtop.idle.web.xyh.item.list`
+// captured from the same page's 宝贝 tab. What is NOT in them is the point of half the tests below.
+
+/** A real `mtop.idle.web.user.page.head` reply. `module.base.ipLocation` is 上海市 while the seller is
+ *  in 北京, which is the live measurement behind never publishing it as a city: it is where goofish
+ *  thinks the request came from. */
+const HEAD = {
+  baseInfo: { encryptedUserId: 'strZSeNsALQaHGp6qPRb3g==', kcUserId: '2214350705775', self: false, userType: 1,
+    tags: { real_name_certification_77: true, real_person_certification_77: true, idle_zhima_zheng: true, xianyu_user_upgrade: true, tb_xianyu_user: false } },
+  module: {
+    base: { ipLocation: '上海市', displayName: '汴梁资深化镁', introduction: '发现自己一个很不好的现象', avatar: { avatar: 'http://img.alicdn.com/bao/uploaded/i2/o.jpg' },
+      ylzTags: [{ code: 'cs_seller_level', attributes: { role: 'seller', level: 5 }, text: '卖家信用极好' }, { code: 'cs_buyer_level', attributes: { role: 'buyer', level: 5 }, text: '买家信用极好' }] },
+    shop: { level: 'L2', score: 42, praiseRatio: 100, reviewNum: 5, nextLevelNeedScore: 8, superShow: true },
+    social: { followStatus: 1, followers: '11', following: '3' },
+    tabs: { item: { number: 6, name: '宝贝' }, rate: { number: '19', name: '信用及评价' } },
+  },
+  needDecryptKeys: ['baseInfo.encryptedUserId'],
+};
+const headSession = (data: any = HEAD, extra: any = {}) => use(makeSession({}, { head: { ok: true, ret: 'SUCCESS::调用成功', data }, ...extra }));
+
+/** A real `mtop.idle.web.xyh.item.list` reply, one card. `detailParams.title` is the listing title (and
+ *  on this seller, a prose one, because that is what they typed); `detailUrl` is a `fleamarket://`
+ *  deep link no browser can open, and `totalCount` is 0 on a seller with six live listings. */
+const sellerCard = (itemId: string, title: string, price: string, extra: any = {}) => ({ cardType: 1003, cardData: {
+  id: itemId, title, detailUrl: `fleamarket://awesome_detail?itemId=${itemId}`, categoryId: '50106003',
+  detailParams: { itemId, title, soldPrice: price, picUrl: `http://img.alicdn.com/bao/uploaded/i4/${itemId}.jpg`, postInfo: '包邮' },
+  priceInfo: { preText: '¥', price }, picInfo: { hasVideo: false, picUrl: `http://img.alicdn.com/bao/uploaded/i4/${itemId}.jpg`, width: 1024 },
+  itemLabelDataVO: { labelBucketId: '5', labelData: { r3: { tagList: [{ data: { content: '2人想要' } }] } } },
+  ...extra,
+} });
+
+test('seller_profile reads a seller by id with one mtop call, and never navigates', async () => {
+  const s = headSession();
+  const out = await run('seller_profile')({ user_id: '2214350705775' });
+  // the payload is the whole parameter: no encrypted id, no cookie, nothing the profile page needed
+  assert.deepEqual(s.specs[0][0][2], { userId: '2214350705775' });
+  assert.deepEqual(s.opened, [], 'given a user_id this must not load a page -- that is the whole cost difference');
+  assert.equal(out.source, 'idle_user_page_head');
+  assert.equal(out.user_id, '2214350705775');
+  assert.equal(out.display_name, '汴梁资深化镁');
+  assert.equal(out.avatar_url, 'https://img.alicdn.com/bao/uploaded/i2/o.jpg', 'http is upgraded like every other image here');
+  assert.equal(out.signature, '发现自己一个很不好的现象');
+  assert.equal(out.seller_credit, '卖家信用极好');
+  assert.equal(out.buyer_credit, '买家信用极好');
+  assert.equal(out.level, 'L2');
+  assert.equal(out.level_score, '42');
+  assert.equal(out.praise_ratio, '100', 'a bare number here, where the detail payload carries "100%"');
+  assert.equal(out.review_count, '5');
+  assert.equal(out.listings_count, '6');
+  assert.equal(out.ratings_count, '19');
+  assert.deepEqual([out.followers, out.following], ['11', '3']);
+  assert.deepEqual([out.verified_real_name, out.verified_real_person, out.verified_zhima], [true, true, true]);
+  assert.equal(out.profile_url, 'https://www.goofish.com/personal?userId=2214350705775');
+  assert.equal(out.item_id, null);
+  assert.equal(out.account_required, false);
+  // and the one field this payload does carry, which must not be published as the seller's city
+  assert.equal(out.ip_location, undefined);
+  assert.equal(out.city, '');
+  assert.deepEqual(out.fields_missing, ['city', 'tenure_years', 'items_sold', 'items_listed', 'positive_rate', 'reply_rate_24h', 'last_active']);
+  assert.match(out.note, /pass item_id/);
+});
+
+test('seller_profile given an item_id reads the listing\'s own detail reply, and takes the lock for it', async () => {
+  // The seller of a listing is not reachable by mtop: re-issuing `mtop.taobao.idle.pc.detail` through
+  // the page's own client answers TIMEOUT, so the hop is the item page's own call read off the wire.
+  const s = use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({
+    itemDO: { itemId: '42', title: '男士羊毛呢大衣', soldPrice: '1999' },
+    sellerDO: { sellerId: '2214350705775', nick: '汴梁资深化镁', city: '北京', userRegDay: 1538, hasSoldNumInteger: 27, itemCount: 101, newGoodRatioRate: '100%', replyRatio24h: '50%', lastVisitTime: '3小时前来过' },
+  })] } }, { head: { ok: true, ret: 'SUCCESS::调用成功', data: HEAD } }));
+  const out = await run('seller_profile')({ item_id: 'https://www.goofish.com/item?id=42' });
+  assert.deepEqual(s.opened, ['https://www.goofish.com/item?id=42'], 'the hop loads the listing page, under the shared lock');
+  assert.equal(out.item_id, '42');
+  assert.equal(out.source, 'item_detail+idle_user_page_head');
+  assert.equal(out.city, '北京', 'the seller own record, not the profile payload ipLocation of 上海市');
+  assert.equal(out.tenure_years, '4', 'userRegDay is in days: 1538 days is 4 years');
+  assert.equal(out.items_sold, '27');
+  assert.equal(out.items_listed, '101');
+  assert.equal(out.positive_rate, '100');
+  assert.equal(out.reply_rate_24h, '50');
+  assert.equal(out.last_active, '3小时前来过');
+  assert.deepEqual(out.fields_missing, [], 'every promised field is filled on this payload');
+  assert.match(out.note, /detail record/);
+});
+
+test('seller_profile refuses the two ways it cannot answer, and never one seller\'s standing as another\'s', async () => {
+  use(makeSession({}, { head: { ok: false, ret: 'FAIL_BIZ_USER_NOT_FOUND::没有这个用户', data: null } }));
+  await assert.rejects(run('seller_profile')({ user_id: '1' }), (e: any) => e instanceof DetailUnavailableError && /FAIL_BIZ_USER_NOT_FOUND/.test(e.message));
+  // A throttle is not "no such seller": reporting one as the other tells a caller their seller is gone
+  // when the truth is that the IP was rate limited for a moment.
+  use(makeSession({}, { head: { ok: false, ret: 'RGV587_ERROR::SM::哎哟喂,被挤爆啦', data: null } }));
+  await assert.rejects(run('seller_profile')({ user_id: '2214350705775' }), (e: any) => e instanceof GatedError && e.constructor.name === 'GatedError' && /RGV587/.test(e.message));
+  // A payload about a different seller than the one asked for is refused, on the same grounds as a
+  // detail reply about a different listing: the page decides which seller to answer about.
+  headSession({ ...HEAD, baseInfo: { ...HEAD.baseInfo, kcUserId: '999' } });
+  await assert.rejects(run('seller_profile')({ user_id: '2214350705775' }), (e: any) => e instanceof ParseError && /999/.test(e.message));
+  // ...and a profile with no id at all is a shape change, not an empty seller.
+  headSession({ ...HEAD, baseInfo: { ...HEAD.baseInfo, kcUserId: '' } });
+  await assert.rejects(run('seller_profile')({ user_id: '2214350705775' }), ParseError);
+});
+
+test('the seller tools ask for exactly one of user_id and item_id, and refuse garbage before the browser', async () => {
+  for (const bad of [{ user_id: 'jRM3w0UnqSvHrFFMpqPdsQ==' }, { user_id: '2214350705775/../1' }, { item_id: 'not-an-id' }, { item_id: '42; DROP TABLE' }]) {
+    const s = headSession();
+    await assert.rejects(run('seller_profile')(bad), XianyuError);
+    assert.deepEqual(s.opened, [], `${JSON.stringify(bad)} touched the browser`);
+    assert.deepEqual(s.specs, [], `${JSON.stringify(bad)} reached the wire`);
+  }
+  // The encrypted id a search card carries is a different value, and page.head refuses it. Refusing it
+  // here means the message names that rather than passing it on for goofish to reject.
+  const s2 = headSession();
+  await assert.rejects(run('seller_profile')({ user_id: 'jRM3w0UnqSvHrFFMpqPdsQ==' }), (e: any) => e instanceof XianyuError && /user_id must be digits/.test(e.message));
+  assert.deepEqual(s2.specs, []);
+  // Both is refused rather than one quietly winning: a caller who passes both has no way to see from
+  // the envelope that their item_id was ignored.
+  headSession();
+  await assert.rejects(run('seller_profile')({ user_id: '2214350705775', item_id: '42' }), (e: any) => e instanceof XianyuError && /not both/.test(e.message));
+  // Neither is a question with no subject, and the message says which two answers there are.
+  headSession();
+  await assert.rejects(run('seller_profile')({}), (e: any) => e instanceof XianyuError && /user_id .* or item_id/.test(e.message));
+  await assert.rejects(run('seller_items')({}), XianyuError);
+  // A pasted /personal URL is the other spelling of a user_id.
+  const s3 = headSession();
+  assert.equal((await run('seller_profile')({ user_id: 'https://www.goofish.com/personal?userId=2214350705775' })).user_id, '2214350705775');
+  assert.deepEqual(s3.specs[0][0][2], { userId: '2214350705775' });
+});
+
+test('seller_items reads a seller\'s own listings, with nextPage as the only honest has_more', async () => {
+  const cards = [sellerCard('1045171414271', '专柜入手，穿过几次', '1999'), sellerCard('990124788759', '【牛津衬衫】AF经典小麋鹿', '161'), sellerCard('765529563758', '【现货秒发】安苏衬', '2550')];
+  const s = use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { cardList: cards, nextPage: true, totalCount: 0 } } }));
+  const out = await run('seller_items')({ user_id: '2214350705775' });
+  assert.deepEqual(s.specs[0][0][2], { needGroupInfo: true, pageNumber: 1, userId: '2214350705775', pageSize: 20 });
+  assert.deepEqual(s.opened, [], 'given a user_id this must not load a page');
+  assert.equal(out.count, 3);
+  assert.equal(out.has_more, true);
+  assert.equal(out.raw_cards, 3);
+  assert.equal(out.source, 'idle_xyh_item_list');
+  assert.deepEqual(out.items[0], { item_id: '1045171414271', title: '专柜入手，穿过几次', price: '1999', category_id: '50106003', want_count: '2', tags: ['2人想要'], image_urls: ['https://img.alicdn.com/bao/uploaded/i4/1045171414271.jpg'], url: 'https://www.goofish.com/item?id=1045171414271', rank: 1 });
+  assert.deepEqual(out.items.map((i: any) => i.rank), [1, 2, 3]);
+  // `totalCount` is in the payload and is always 0 -- measured at two page sizes against a seller with
+  // six live listings -- so it is never published as if it meant anything.
+  assert.equal(out.total_count, undefined);
+  // the web url is rebuilt from the id: this endpoint's own detailUrl is a fleamarket:// deep link
+  assert.ok(out.items.every((i: any) => i.url.startsWith('https://www.goofish.com/item?id=')));
+  // limit is applied after the call, page goes out in the payload, and a nonsense page is clamped
+  assert.equal((await run('seller_items')({ user_id: '2214350705775', limit: 2 })).count, 2);
+  const s2 = use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { cardList: cards, nextPage: false } } }));
+  const p3 = await run('seller_items')({ user_id: '2214350705775', page: 3 });
+  assert.equal(p3.page, 3);
+  assert.equal(s2.specs[0][0][2].pageNumber, 3);
+  assert.equal(p3.has_more, false);
+});
+
+test('seller_items: an empty shop and a page past the end are answers, and a shape change is not', async () => {
+  use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { cardList: [], nextPage: false, totalCount: 0 } } }));
+  const empty = await run('seller_items')({ user_id: '2214350705775' });
+  assert.deepEqual([empty.count, empty.raw_cards, empty.has_more], [0, 0, false]);
+  assert.deepEqual(empty.items, []);
+  // Page 2 of a six-listing seller: SUCCESS, and `cardList` is ABSENT rather than empty. Measured live.
+  // Treating that as a shape change was the first version's behaviour, and it made `page: 2` -- the most
+  // ordinary call there is -- raise, because walking a pager is what `has_more` is for.
+  use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { itemGroupList: [], itemTopicList: [], nextPage: false, serverTime: 1, totalCount: 0 } } }));
+  const past = await run('seller_items')({ user_id: '2214350705775', page: 2 });
+  assert.deepEqual([past.count, past.raw_cards, past.has_more, past.page], [0, 0, false, 2]);
+  assert.deepEqual(past.items, []);
+  // A payload carrying none of the endpoint's own keys is not an empty page, it is something else, and
+  // it has to say so rather than looking like a seller with nothing up.
+  use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { somethingElse: 1 } } }));
+  await assert.rejects(run('seller_items')({ user_id: '2214350705775' }), (e: any) => e instanceof ParseError && /none of its own keys/.test(e.message));
+  // The two ways this endpoint says a seller is not there, and both are named the same way rather than
+  // as a throttle: page.head says USER_NOT_FOUND, this one says NOT_FOUND.
+  use(makeSession({}, { items: { ok: false, ret: 'FAIL_BIZ_NOT_FOUND::||对方账号不存在', data: null } }));
+  await assert.rejects(run('seller_items')({ user_id: '2255' }), (e: any) => e instanceof DetailUnavailableError && /对方账号不存在/.test(e.message));
+  use(makeSession({}, { items: { ok: false, ret: 'FAIL_BIZ_FORBIDDEN::||最大可查看页数或者每页最大可查看商品数超限', data: null } }));
+  await assert.rejects(run('seller_items')({ user_id: '2214350705775', page: 99 }), (e: any) => e instanceof GatedError && /50 pages of 20/.test(e.message));
+  use(makeSession({}, { items: { ok: false, ret: 'RGV587_ERROR::SM::x', data: null } }));
+  await assert.rejects(run('seller_items')({ user_id: '2214350705775' }), (e: any) => e instanceof GatedError && /RGV587/.test(e.message));
+  // Cards with no id in any of them are dropped, which is what keeps a renamed `detailParams` from
+  // silently shortening the list.
+  use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { cardList: [{ cardData: { title: 'x' } }], nextPage: false } } }));
+  assert.equal((await run('seller_items')({ user_id: '2214350705775' })).count, 0);
+});
+
+test('seller_items page is bounded at the 50 goofish actually serves, not the shared 10,000', async () => {
+  // Measured: page 50 SUCCESS, page 51 FAIL_BIZ_FORBIDDEN::||最大可查看页数或者每页最大可查看商品数超限,
+  // and pageSize 30 refused at page 1. 50 pages of 20 is 1000 listings, which is the most a seller can
+  // have, so a bound of 10,000 would only invite an agent to walk into a refusal.
+  const cards = [sellerCard('1', 'x', '5')];
+  const s = use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { cardList: cards, nextPage: false } } }));
+  assert.equal((await run('seller_items')({ user_id: '1', page: 9e9 as any })).page, 50);
+  assert.equal(s.specs[0][0][2].pageNumber, 50);
+  const json: any = z.toJSONSchema(z.object(TOOLS.find((t) => t.name === 'seller_items')!.schema), { io: 'input' });
+  assert.equal(json.properties.page.maximum, 50, 'the published schema has to carry the bound goofish enforces');
+  // And the label strip never publishes an icon name. free shipping arrives as a bare
+  // `content: 'freeShippingIcon'` with no text, and the first version shipped it as a fact about the
+  // listing -- found by a live run, not by a test.
+  const tagCard = sellerCard('7', '包邮的东西', '9', { itemLabelDataVO: { labelData: { r1: { tagList: [{ data: { content: 'freeShippingIcon' } }, { data: { content: '验货宝' } }] } } } });
+  use(makeSession({}, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { cardList: [tagCard], nextPage: false } } }));
+  assert.deepEqual((await run('seller_items')({ user_id: '1' })).items[0].tags, ['验货宝']);
+});
+
+test('seller_items given an item_id resolves the seller first, off the listing\'s own detail reply', async () => {
+  const s = use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({
+    itemDO: { itemId: '42', title: '男士羊毛呢大衣', soldPrice: '1999' },
+    sellerDO: { sellerId: '2214350705775', nick: '汴梁资深化镁', city: '北京' },
+  })] } }, { items: { ok: true, ret: 'SUCCESS::调用成功', data: { cardList: [sellerCard('765529563758', '安苏衬', '2550')], nextPage: false } } }));
+  const out = await run('seller_items')({ item_id: '42' });
+  assert.deepEqual(s.opened, ['https://www.goofish.com/item?id=42']);
+  assert.deepEqual(s.specs[0][0][2], { needGroupInfo: true, pageNumber: 1, userId: '2214350705775', pageSize: 20 });
+  assert.equal(out.item_id, '42');
+  assert.equal(out.profile_url, 'https://www.goofish.com/personal?userId=2214350705775');
+  // A listing whose detail reply carries no seller id has no seller to look up, and the message says
+  // what to do instead rather than leaving the caller with a dead id.
+  use(makeSession({ item: [UNRENDERED, UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({ itemDO: { itemId: '42', title: 't' }, sellerDO: { nick: '无名氏' } })] } }));
+  await assert.rejects(run('seller_items')({ item_id: '42' }), (e: any) => e instanceof DetailUnavailableError && /no readable seller/.test(e.message) && /user_id directly/.test(e.message));
 });
 
 test('capabilities never throws, not even when the browser is gone, and a failed probe does not hide the others', async () => {

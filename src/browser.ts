@@ -2,7 +2,7 @@
  * The browser session. One throwaway Chromium, launched lazily and reused across tool calls (a cold launch costs ~5s, and these calls are cheap once the page is up). The context is brand new every time: no profile directory, no stored state, no account, and this package never reads cookies -- goofish sets its own anonymous ones when the page loads and we never look at them. Only https://goofish.com is ever loaded, and every navigation goes through `load` after `ensureGoofishUrl` has checked host *and* scheme.
  *
  * Two pages, not one. `apiPage` is parked on `BOOT_URL` and never navigates again: it exists only to
- * give the four mtop tools a live client, and a tool call that needs nothing but mtop must not queue
+ * give the mtop tools a live client, and a tool call that needs nothing but mtop must not queue
  * behind a 70s search. `domPage` is the one that navigates, so the DOM-scraping tools still serialise
  * against each other and still cannot be read out from under one another. Measured: with a single page
  * a `search_items` call that takes 70s blocks `browse_feed`, which does 1.5s of real work.
@@ -31,7 +31,7 @@ const MTOP_TIMEOUT_S = 240;
 const MTOP_READY_MS = 6000, PROBE_TIMEOUT_S = 5;   // how long `call` gives the mtop client to come up, and the ceiling on one readiness probe -- a hung evaluate (90s by default) inside a 6s wait is not a 6s wait
 // Playwright failures that race with the page's own navigation rather than being a real failure, so they are worth one more try. A dead target is not in here: that needs a relaunch, not a retry.
 const TRANSIENT = ['execution context', 'cannot find context', 'while navigating'];
-const LAUNCH_HINT = 'This server needs a Chromium it can launch itself. Try:\n  npx playwright install chromium\nor point XIANYU_BROWSER_PATH at an existing Chrome/Chromium binary.\nIt launches windowed because goofish serves headless Chromium its risk-control page ("非法访问") instead of the app, which leaves the three DOM tools with nothing to read; that needs a display, so set XIANYU_HEADLESS=1 to run it headless if you have to -- the four mtop tools work either way.';
+const LAUNCH_HINT = 'This server needs a Chromium it can launch itself. Try:\n  npx playwright install chromium\nor point XIANYU_BROWSER_PATH at an existing Chrome/Chromium binary.\nIt launches windowed because goofish serves headless Chromium its risk-control page ("非法访问") instead of the app, which leaves the three DOM tools with nothing to read; that needs a display, so set XIANYU_HEADLESS=1 to run it headless if you have to -- the mtop tools work either way.';
 
 // The API name is the path segment after /h5/ on any mtop host. Every response we tap is matched on
 // that rather than on the host, so a bundle, a beacon or a different service on the page is ignored
@@ -204,7 +204,7 @@ export class Session {
     // Windowed by default, and that is a measurement rather than a preference: headed gets goofish's
     // actual app (search page, item pages, 20 cards), headless gets the same URL served as the
     // risk-control page -- "非法访问 ... 请使用正常浏览器访问闲鱼" -- for as long as you watch, with zero
-    // cards and 35 bytes of text. So the three DOM tools need a display. The four mtop tools do not:
+    // cards and 35 bytes of text. So the three DOM tools need a display. The mtop-only tools do not:
     // the page's own client boots on the risk-control page too, which is what they use. XIANYU_HEADLESS=1
     // opts back in, and costs the DOM tools.
     const opts = { headless: process.env.XIANYU_HEADLESS !== '1',
@@ -310,7 +310,7 @@ export class Session {
     });
   }
 
-  /** The page that never navigates: everything the four mtop-only tools need, and nothing else. */
+  /** The page that never navigates: everything the mtop-only tools need, and nothing else. */
   async ensureReady(): Promise<Page> {
     const page = await this.revive(this.apiPage);
     if (await waitForMtop(page, 2500)) return page;

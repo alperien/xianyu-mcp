@@ -52,7 +52,7 @@ test('no credential access anywhere in the tree', () => {
   assert.equal(flat(['page.context()', '  .' + 'cookies()'].join('\n')).includes('.' + 'cookies('), true);
 });
 
-test('only the seven read-only mtop APIs are named anywhere: a closed list, so a new one cannot slip in', () => {
+test('only the nine read-only mtop APIs are named anywhere: a closed list, so a new one cannot slip in', () => {
   const readApis = [
     'mtop.taobao.idlehome.home.webpc.feed',
     'mtop.taobao.idle.filter.hitnum.pc.get',
@@ -65,8 +65,15 @@ test('only the seven read-only mtop APIs are named anywhere: a closed list, so a
     // per-call anti-bot blob. See `MtopTap`.
     'mtop.taobao.idle.pc.detail',
     'mtop.taobao.idlemtopsearch.pc.search',
+    // These two are the other side of that rule, and the list is the place the asymmetry has to stay
+    // visible. goofish stamps only the calls its OWN bundle originates, so an endpoint the current page
+    // never happens to use can be issued through the very same client and answers normally -- measured,
+    // `page.head` SUCCESS from an item page that never calls it. That is why a seller profile is
+    // reachable at all, and why intercepting responses could never have found it.
+    'mtop.idle.web.user.page.head',
+    'mtop.idle.web.xyh.item.list',
   ];
-  assert.equal(readApis.length, 7);
+  assert.equal(readApis.length, 9);
   // `window.lib.mtop.request` is the page's own client method -- the one call this server is built
   // on -- not an API name. Everything else shaped like `mtop.<something>` is an API and is closed.
   const notAnApi = 'mtop.request';
@@ -83,7 +90,7 @@ test('only the seven read-only mtop APIs are named anywhere: a closed list, so a
     });
   }
   assert.deepEqual(offenders, []);
-  // every one of the seven is actually reached, not just allowed
+  // every one of the nine is actually reached, not just allowed
   assert.deepEqual([...seen].sort(), [...readApis].sort());
   // and the pattern really is closed over the whole namespace, which the old two-namespace version
   // was not: a write API outside taobao/idle would have passed it. (Built by concatenation so that
@@ -92,10 +99,39 @@ test('only the seven read-only mtop APIs are named anywhere: a closed list, so a
   assert.deepEqual(write.match(/mtop\.[A-Za-z0-9_.]+/g), [write]);
 });
 
-test('exactly the eight read-only tools exist, and none of them can change state', () => {
-  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'recommendations', 'related_items', 'search_count', 'search_items', 'search_suggest']);
+test('exactly the ten read-only tools exist, and none of them can change state', () => {
+  assert.deepEqual(TOOLS.map((t) => t.name).sort(), ['browse_feed', 'capabilities', 'item_view', 'recommendations', 'related_items', 'search_count', 'search_items', 'search_suggest', 'seller_items', 'seller_profile']);
   for (const t of TOOLS) {
     assert.equal(/publish|delete|remove|message|send|upload|comment|order|buy|checkout|follow|favou?rite/i.test(t.name), false, `${t.name} looks like a write tool`);
+  }
+});
+
+test('the two seller tools take the shared lock only for the item-page hop, and never as a blanket', () => {
+  // The two-page session exists so a 70s search does not hold up a 1.5s feed call, and the promise is
+  // kept by wrapping the tools that read the one navigating page. `seller_profile` and `seller_items`
+  // are the awkward case and the reason the rule is "where a page is read" rather than a tool list:
+  // given a user_id they are one mtop call each, and given an item_id they must read the item page's
+  // own detail reply to learn who the seller is. Wrapping them whole would queue two cheap calls behind
+  // every search; not locking the hop at all would let them navigate the dom page under a search's feet.
+  const toolsSrc = read(join(ROOT, 'src', 'tools.ts'));
+  for (const name of ['sellerProfile', 'sellerItems']) {
+    assert.equal(new RegExp(`run: locked\\(${name}\\)`).test(toolsSrc), false, `${name} is wrapped in the blanket lock; that re-serialises a one-call mtop lookup behind every search`);
+    assert.equal(new RegExp(`run: ${name}\\b`).test(toolsSrc), true, `${name} must be registered unwrapped`);
+  }
+  // The scoped lock is inside `resolveSeller`, and it wraps the page read rather than the whole tool.
+  const resolver = toolsSrc.match(/const resolveSeller = [\s\S]*?\n};/)?.[0] ?? '';
+  assert.match(resolver, /exclusive\(\(\) => readListing\(/, 'the item-page hop must take the shared lock');
+  // ...and nothing else in either tool does, which is the half that is easy to lose to a later edit.
+  for (const name of ['sellerProfile', 'sellerItems']) {
+    const body = toolsSrc.match(new RegExp(`const ${name} = async[\\s\\S]*?\\n};`))?.[0] ?? '';
+    assert.equal(/exclusive\(/.test(body), false, `${name} takes a lock of its own; the only page read either makes is resolveSeller's, which takes the shared one`);
+  }
+  // Both still route every mtop call through the session, so nothing reaches the wire except through
+  // browser.ts -- the one place the allowlist and the "no new mandatory browser launch" budget live.
+  for (const name of ['sellerProfile', 'sellerItems']) {
+    const body = toolsSrc.match(new RegExp(`const ${name} = async[\\s\\S]*?\\n};`))?.[0] ?? '';
+    assert.match(body, /session\.call\(/, `${name} must go through the shared session rather than issuing its own request`);
+    assert.equal(/\bpage\.evaluate\(/.test(body), false, `${name} has no in-page script; its payload comes back from one mtop call`);
   }
 });
 
@@ -114,7 +150,7 @@ test('the entry point does not serialise the tools: the lock belongs to the thre
   // because the test that "proved" it called `t.run` directly and hand-wrapped the search itself.
   // Read the source, because the property is about the entry point, not about any one tool's runtime.
   const entry = readFileSync(join(ROOT, 'src', 'index.ts'), 'utf8');
-  assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all eight re-serialises the four fast tools behind every slow one.');
+  assert.equal(/exclusive/.test(entry), false, 'index.ts must not take the lock; tools.ts owns it. Re-wrapping all ten re-serialises the fast tools behind every slow one.');
   // ...and the lock really is on the three DOM tools, so the promise is kept rather than deleted.
   const toolsSrc = readFileSync(join(ROOT, 'src', 'tools.ts'), 'utf8');
   for (const name of ['searchItems', 'itemView', 'recommendations']) {
@@ -158,6 +194,11 @@ test('the published argument names and defaults are exactly these', () => {
     related_items: { item_id: '<optional>', limit: 30, page: 1 },
     item_view: { item_id: '<required>' },
     recommendations: { limit: 30, url: '<optional>' },
+    // Both seller tools take two alternatives and neither is required: which one is missing is the
+    // question, and a schema that forced one would push the "give exactly one of these" message into
+    // every caller's error handling instead of the envelope.
+    seller_profile: { user_id: '<optional>', item_id: '<optional>' },
+    seller_items: { user_id: '<optional>', item_id: '<optional>', limit: 20, page: 1 },
   };
   assert.deepEqual(Object.fromEntries(TOOLS.map((t) => [t.name, shape(t)])), published);
   // and bounded where the agent can see it. `related_items.page` was the one number in the contract

@@ -15,14 +15,14 @@ import { TOOLS } from './tools.ts';
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
 
 const mcp = new McpServer({ name: 'xianyu', version }, {
-  instructions: 'Read-only access to Xianyu/Goofish with NO Xianyu account required. All eight tools -- capabilities, browse_feed, search_count, search_suggest, search_items, related_items, item_view, recommendations -- work logged out. Search is a keystroke rather than a URL and is declined by goofish on some page loads, so search_items retries and refuses to return the recommendation rail as results; item_view and search_items read the calls the page makes for itself, which is the only way those two answer. The four mtop-only tools run on their own page and do not queue behind a search. Call capabilities for the current verified picture.',
+  instructions: 'Read-only access to Xianyu/Goofish with NO Xianyu account required. All ten tools -- capabilities, browse_feed, search_count, search_suggest, search_items, related_items, item_view, recommendations, seller_profile, seller_items -- work logged out. Search is a keystroke rather than a URL and is declined by goofish on some page loads, so search_items retries and refuses to return the recommendation rail as results; item_view and search_items read the calls the page makes for itself, which is the only way those two answer. The mtop-only tools run on their own page and do not queue behind a search. seller_profile and seller_items take either a seller id (one cheap mtop call) or a listing id, meaning the seller of that listing, which costs one page load and also yields their city, tenure and sales history. Call capabilities for the current verified picture.',
 });
 
 for (const t of TOOLS) {
   mcp.registerTool(t.name, { description: t.description, inputSchema: t.schema }, async (args: any) => {
     // Nothing is serialised here. The three DOM tools (`search_items`, `item_view`, `recommendations`)
     // take the shared-page lock themselves, in tools.ts, because only they read the one navigating
-    // page; the four mtop-only tools must stay free so a 70s search does not hold up a 1.5s feed call.
+    // page; the mtop-only tools must stay free so a 70s search does not hold up a 1.5s feed call.
     // Wrapping every tool here -- which this used to do -- re-imposed exactly that queue.
     // Anything unexpected is still reported under its own error type rather than being allowed to kill
     // the MCP call.

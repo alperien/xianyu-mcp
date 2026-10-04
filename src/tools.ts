@@ -1,17 +1,24 @@
-/** The eight tools. Capability split, all of it measured rather than assumed: browse_feed, search_count, search_suggest and related_items run on the api page and need nothing but goofish's mtop client; item_view and search_items drive the dom page and read what its own bundle fetches; capabilities never raises, even if the browser is gone. Nothing that touches a page goes through anything but browser.ts, so a Playwright failure arrives as a typed XianyuError rather than escaping a tool call.
+/** The ten tools. Capability split, all of it measured rather than assumed: browse_feed, search_count, search_suggest, related_items, seller_profile and seller_items run on the api page and need nothing but goofish's mtop client; item_view and search_items drive the dom page and read what its own bundle fetches; capabilities never raises, even if the browser is gone. Nothing that touches a page goes through anything but browser.ts, so a Playwright failure arrives as a typed XianyuError rather than escaping a tool call.
  *
- *  The four mtop-only tools do not queue behind the two that drive a browser, and that is the largest
+ *  The mtop-only tools do not queue behind the two that drive a browser, and that is the largest
  *  latency change in the server: they used to share one page, so a search that took 70s held up a feed
  *  call that does 1.5s of work. That promise is kept *here* rather than in the entry point: the lock is
  *  taken by the three tools that read the one navigating page (`search_items`, `item_view`,
  *  `recommendations`), and by nothing else. Wrapping every tool at the entry point instead -- which is
- *  what used to happen -- silently re-serialised the four fast ones behind every slow one, and the test
- *  that claimed to prove otherwise called `t.run` directly and so never exercised the shipped path. */
+ *  what used to happen -- silently re-serialised the fast ones behind every slow one, and the test
+ *  that claimed to prove otherwise called `t.run` directly and so never exercised the shipped path.
+ *
+ *  `seller_profile` and `seller_items` are the exception that proves it, and they are the reason the
+ *  rule is stated as "the lock is taken where a navigating page is read" rather than as a tool list.
+ *  Given a `user_id` they are two plain mtop calls and take nothing. Given an `item_id` they have to
+ *  find the seller behind that listing first, and the only route to that is the detail call the item
+ *  page makes for itself -- so they take the lock for exactly that hop and release it before the mtop
+ *  calls. See `resolveSeller`. */
 import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
-import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS } from './extract.ts';
+import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
 // The mtop endpoints this server is allowed to name. Recovered by extracting all 51 `mtop.*` names from goofish's own JS bundles (idle-pc/xy-site); reading the minified call sites gave the exact parameter shapes, which is what made these work first time. All answer anonymously, and a test fails the build if any other mtop name appears.
 //
@@ -21,6 +28,12 @@ type Data = Record<string, any>;
 // requests its own bundle originates with a per-call anti-bot blob, and a request we synthesise does
 // not carry it. Letting the page make the call and reading what comes back works, and returns strictly
 // more than scraping the DOM did.
+//
+// The two seller endpoints below are the other side of that rule, and they are here because it was
+// measured rather than assumed. goofish stamps only the calls its own bundle originates, so an endpoint
+// the *current* page never happens to use can be issued through the very same client and answers
+// normally: `page.head` was verified SUCCESS from an item page, which never calls it, with nothing but
+// `{userId}`. Response interception cannot make that call at all, which is why these two exist at all.
 const FEED_API = 'mtop.taobao.idlehome.home.webpc.feed';
 // The match counter. The search page calls it with the same payload shape as search and reads `data.hitnum`, so it answers "how many items match this keyword" for a logged-out visitor even on the page loads where search is declined. This is the endpoint that makes keyword work possible without the search page: about 28,800 for "x220" (it drifts, 28,791 / 28,804 / 28,810 observed), 0 for nonsense.
 const HITNUM_API = 'mtop.taobao.idle.filter.hitnum.pc.get';
@@ -29,12 +42,47 @@ const RECOMMEND_API = 'mtop.taobao.idle.item.web.recommend.list';
 const LOGINUSER_API = 'mtop.taobao.idlemessage.pc.loginuser.get';   // never used to act as a user: it exists only to *prove* the session is logged out
 const DETAIL_API = 'mtop.taobao.idle.pc.detail';
 const SEARCH_API = 'mtop.taobao.idlemtopsearch.pc.search';
+// The seller profile endpoint -- the one the /personal?userId= page calls for itself. `{userId}` alone
+// is enough: measured, a payload of `encryptedUserId` by itself is refused with
+// FAIL_BIZ_CLIENT_PARAM_INVALID, so the encrypted id a search card carries is not a way in, and adding
+// `self: false` or an empty `encryptedUserId` changes nothing. Returns `data.baseInfo` and
+// `data.module.{base,shop,social,tabs}`. A user that does not exist answers FAIL_BIZ_USER_NOT_FOUND
+// rather than an empty object, which is what makes it worth a tool.
+const SELLER_HEAD_API = 'mtop.idle.web.user.page.head';
+// One seller's own listings -- the endpoint the same /personal page calls for the tab it heads 宝贝.
+// `{userId, pageNumber, pageSize, needGroupInfo}`. `nextPage` is trustworthy; `totalCount` is always 0,
+// measured at two page sizes against a seller with six live listings, so it is never read.
+const SELLER_ITEMS_API = 'mtop.idle.web.xyh.item.list';
+// The keys this endpoint's payload carries whatever else it does, measured on both of its shapes: a
+// page with listings on it, and a page past the end (which omits `cardList` and keeps the rest). Used
+// to tell "this seller has nothing here" from "this is not the payload I asked for" -- the first is an
+// answer and the second is a `ParseError`, and a check on `cardList` alone cannot tell them apart.
+const payloadKeys = ['cardList', 'nextPage', 'totalCount', 'itemGroupList', 'itemTopicList', 'serverTime'];
 // pageSize is hardcoded to 30 in goofish's bundle and the endpoint rejects anything else with FAIL_BIZ_COMMON_PARAM_ILLEGAL, so `limit` is applied client-side after the call. A missing itemId is rejected outright, so the generic case uses goofish's own seed id -- what its bundle substitutes when there is no item context.
 const RECOMMEND_PAGE_SIZE = 30, RECOMMEND_SEED_ITEM_ID = '809806779491';
+// One seller's own listings, 20 a page. Verified at 20 and at 2: at 2 `nextPage` went true and a page 2
+// returned the two listings after the first two, so the pager is real and not just a field that exists.
+// 20 is also the ceiling goofish enforces, and it is what buys the page ceiling below: 50 pages of 20 is
+// 1000 listings, measured as the exact edge (page 50 SUCCESS, page 51 FAIL_BIZ_FORBIDDEN::||最大可查看
+// 页数或者每页最大可查看商品数超限; pageSize 30 refused at page 1).
+const SELLER_PAGE_SIZE = 20, MAX_SELLER_PAGE = 50;
 // goofish's own feed runs out of pages long before this; the bound only exists so a nonsense page_number cannot become a nonsense request.
 const MAX_PAGES = 25, MAX_LIMIT = 500, MAX_PAGE_NUMBER = 10_000;
 // Every field item_view reports, in one place so the honesty contract (fields_present / fields_missing) and the scraper cannot drift apart. Exported, and a test asserts every entry is a key the scraper actually returns.
 export const ITEM_FIELDS = ['title', 'price', 'want_count', 'browse_count', 'description', 'seller', 'seller_tenure_years', 'seller_items_sold', 'seller_positive_rate', 'image_urls'] as const;
+// The same contract for seller_profile, and it is split in two because the two halves come from
+// different places and cost different things. The profile endpoint answers the seller's *standing* --
+// credit tier, shop level and score, praise ratio, review count, followers, how many listings they have
+// up, which identity checks they have passed -- and says nothing at all about where they are or how
+// long they have been on goofish: those four live on the item page's `sellerDO`, and reading them costs
+// a page load. So a caller who passes `user_id` gets the standing fields, the other four come back null
+// and are named in `missing`, and the tool description says which argument buys which half. Exported for
+// the same reason ITEM_FIELDS is: a test asserts every entry is a key the tool actually returns, which
+// is what stops a field being renamed here and left stale there.
+export const SELLER_PROFILE_FIELDS = ['display_name', 'avatar_url', 'signature', 'seller_credit', 'buyer_credit', 'level', 'level_score', 'praise_ratio', 'review_count', 'listings_count', 'ratings_count', 'followers', 'following', 'verified_real_name', 'verified_real_person', 'verified_zhima', 'city', 'tenure_years', 'items_sold', 'items_listed', 'positive_rate', 'reply_rate_24h', 'last_active'] as const;
+// Which of those come from the item page rather than the profile endpoint. Named as data rather than
+// left implicit in an `if`, so the test that pins the honesty contract reads the same list the tool does.
+export const SELLER_ITEM_PAGE_FIELDS = ['city', 'tenure_years', 'items_sold', 'items_listed', 'positive_rate', 'reply_rate_24h', 'last_active'] as const;
 // goofish renders anonymous pages as a coin flip: the same URL comes back fully rendered or as an empty shell. Retry a few times before calling it a failure. Reloads are cache-busted with a nonce, since a cached empty shell is exactly the failure to escape.
 const RENDER_ATTEMPTS = 5, RENDER_SETTLE_MS = 3500;
 const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
@@ -73,6 +121,15 @@ const clamp = (value: unknown, low: number, high: number): number => { const n =
 const itemIdFromUrl = (url: unknown): string => String(url ?? '').match(/[?&]id=(\d+)/)?.[1] ?? '';
 /** Accept a bare item id or a goofish item URL and return the bare digits. */
 const normalizeItemId = (value: unknown): string => { const s = String(value ?? '').trim(); return itemIdFromUrl(s) || (/^\d+$/.test(s) ? s : ''); };
+/** Accept a bare seller id or a goofish /personal?userId= URL and return the bare digits.
+ *
+ *  Strictly digits, like `normalizeItemId`, and for a sharper reason: this is a value read out of
+ *  goofish's own payload rather than typed by a caller, so anything else is a mistake rather than a
+ *  formatting to forgive. Measured -- `kcUserId` in the profile payload and `sellerId` in a detail
+ *  reply's `sellerDO` are the same plain integer ("2214350705775"), which is also what the /personal
+ *  route takes. The *encrypted* id a search card carries (`clickParam.args.seller_id`,
+ *  "jRM3w0UnqSvHrFFMpqPdsQ==") is a different value, and `page.head` refuses it. */
+const normalizeUserId = (value: unknown): string => { const s = String(value ?? '').trim(); const url = s.match(/[?&]userId=(\d+)/)?.[1] ?? ''; return url || (/^\d+$/.test(s) ? s : ''); };
 const asText = (v: unknown): string => String(v ?? '').replace(/\s+/g, ' ').trim();
 /** A count for a human-readable line: "" when the payload had none, never a 0 standing in for one. */
 const asCount = (v: unknown): string => (v === '' || v === null || v === undefined ? '' : String(v));
@@ -190,6 +247,136 @@ const relatedItems = async ({ item_id, limit = 30, page = 1 }: RelatedArgs): Pro
   if (!items.length) throw new ParseError('recommendation cards had no item ids; the payload shape likely changed');
   const ranked = rankItems(items, clamp(limit, 1, MAX_LIMIT));
   return { item_id: iid || null, page: clamp(page, 1, MAX_PAGE_NUMBER), account_required: false, source: 'item_web_recommend', raw_cards: cards.length, unique_items: items.length, has_more: Boolean(payload.hasMore), count: ranked.length, items: ranked };
+};
+
+/** Which seller a call is about, and what it cost to find out.
+ *
+ *  The two arguments are alternatives, not a pair: `user_id` names the seller directly and costs nothing
+ *  beyond the mtop call that follows, while `item_id` means "whoever is selling this listing" and has to
+ *  be resolved first. Both are refused together rather than one quietly winning, because a caller who
+ *  passes both and gets the wrong one has no way to tell from the envelope that their `item_id` was
+ *  ignored -- which is the failure this server keeps making elsewhere and keeps paying for.
+ *
+ *  The resolution hop is the one part of a seller tool that is not mtop-only, and it is not mtop-only
+ *  because it cannot be. `mtop.taobao.idle.pc.detail` re-issued through the page's own client answers
+ *  `TIMEOUT::接口超时` -- verified again while building this, on the same page and the same client that
+ *  answer every other call here -- because goofish stamps the requests its own bundle originates. So the
+ *  item page is loaded and its own detail reply is read off the wire, which is the route `item_view`
+ *  takes, on the shared dom page, under the shared lock.
+ *
+ *  The lock is taken *around that hop only*, and the mtop calls that follow run outside it. Taking it
+ *  for the whole tool -- which is what wrapping these in `locked()` would do -- would put two tools
+ *  that are otherwise pure mtop calls in the queue behind every 70s search, undoing the one latency
+ *  property the two-page session exists to provide. */
+const resolveSeller = async ({ user_id, item_id }: SellerArgs): Promise<{ user_id: string; item_id: string; listing: any | null }> => {
+  const uid = normalizeUserId(user_id), item = item_id === undefined || item_id === null || item_id === '' ? '' : normalizeItemId(item_id);
+  if (user_id && !uid) throw new XianyuError(`user_id must be digits or a goofish /personal?userId= URL, got ${JSON.stringify(user_id)}`);
+  if (item_id && !item) throw new XianyuError(`item_id must be digits or a goofish item URL, got ${JSON.stringify(item_id)}`);
+  if (uid && item) throw new XianyuError('give user_id or item_id, not both: user_id names a seller outright and item_id means "the seller of this listing", and guessing which one you meant would answer a question you did not ask');
+  if (uid) return { user_id: uid, item_id: '', listing: null };
+  if (!item) throw new XianyuError('give user_id (the seller id seller_profile reports) or item_id (a listing, to find its seller)');
+  const session = getSession();
+  // The clock starts before the load, for the reason item_view's does: the page load is the slowest step
+  // in the hop and a budget that ignores it is not a budget. This one is overridable under its own name
+  // because it is a different call from item_view's -- a caller walking 20 listings wants 20 short
+  // budgets, not one long one -- and a direct user_id lookup runs no loop and so spends none of it.
+  const started = Date.now(), deadline = started + budget('SELLER_PROFILE', 90) * 1000;
+  const read = await exclusive(() => readListing(session, item, deadline));
+  const found = normalizeUserId(read.listing?.seller_id);
+  if (!found) {
+    throw new DetailUnavailableError(`item ${item} has no readable seller on it after ${read.tries} page load(s) in ${Math.round((Date.now() - started) / 1000)}s, so there is nothing to look up. The listing is usually sold or removed; pass user_id directly if you already have one.`);
+  }
+  return { user_id: found, item_id: item, listing: read.listing };
+};
+
+/** The four standing numbers a seller's city, tenure and sales history come from -- and the only ones
+ *  that cost a page load. Read out of a detail payload's `sellerDO` rather than through `detailListing`,
+ *  because this needs the raw payload and `detailListing` has already reduced it to a listing. */
+const sellerStanding = (listing: any | null): Data => {
+  const s = listing ?? {};
+  return { city: asText(s.seller_city), tenure_years: asText(s.seller_tenure_years), items_sold: asText(s.seller_items_sold), items_listed: asText(s.seller_items_listed), positive_rate: asText(s.seller_positive_rate), reply_rate_24h: asText(s.seller_reply_rate_24h), last_active: asText(s.seller_last_active) };
+};
+
+/** One seller's public profile, logged out: who they are and how they stand.
+ *
+ *  Two hops, and only one of them costs anything. Given a `user_id` this is a single call to the
+ *  endpoint the /personal page uses, issued through that page's own mtop client from a page that never
+ *  makes it -- which is the only way it can be reached, and which works because goofish stamps only the
+ *  calls its own bundle originates (see `SELLER_HEAD_API`). Given an `item_id` the seller is found
+ *  first, off the item page's own detail reply, and that hop also yields the four fields the profile
+ *  endpoint has no answer for at all: the seller's city, tenure, sales count and positive rate. The
+ *  profile's own `module.base.ipLocation` is deliberately not published as the city -- it is where
+ *  goofish thinks the *request* came from, and it measured 上海市 for a seller whose own record says
+ *  北京. See `sellerProfileOf`.
+ *
+ *  The honesty contract is the interesting part: the two halves are named in `SELLER_PROFILE_FIELDS`
+ *  and `SELLER_ITEM_PAGE_FIELDS`, so a caller that passed `user_id` sees the standing fields and the
+ *  rest explicitly null and listed in `missing`, rather than an empty-looking profile that reads as
+ *  "this seller has no history". `verified_*` are the exception: a tag that is absent and a tag that is
+ *  false both publish `false`, because both mean the same thing and neither means verified. */
+const sellerProfile = async (args: SellerArgs): Promise<Data> => {
+  const { user_id: uid, item_id: item, listing } = await resolveSeller(args);
+  const session = getSession();
+  await session.ensureReady();
+  const entry = (await session.call([['head', SELLER_HEAD_API, { userId: uid }]]))?.head || {};
+  if (!entry.ok) {
+    // A seller that does not exist is the one refusal here with a definite meaning, and it is the same
+    // shape as item_view's dead listing: the thing asked for is not there rather than the call having
+    // been declined. Anything else -- a throttle, a token, a timeout -- is a plain gate.
+    if (/USER_NOT_FOUND/.test(String(entry.ret))) throw new DetailUnavailableError(`goofish has no seller ${uid}: ${entry.ret}. The id is wrong, or the account has been closed. Pass item_id instead to ask about the seller of a live listing.`);
+    throw new GatedError(`goofish refused the seller profile for ${uid}: ${entry.ret}`);
+  }
+  const profile = sellerProfileOf(entry.data);
+  if (normalizeUserId(profile.user_id) !== uid) throw new ParseError(`asked goofish for seller ${uid} and its profile payload reports ${profile.user_id || '(no user id)'}; refusing to report one seller's standing as another's`);
+  const standing = sellerStanding(listing);
+  const data = { ...profile, ...standing, user_id: uid, profile_url: `${HOME}personal?userId=${uid}`, item_id: item || null, account_required: false };
+  return { ...data, source: item ? 'item_detail+idle_user_page_head' : 'idle_user_page_head',
+    // Spelled out rather than left for the reader to infer from nulls, because the difference is the
+    // cost of the call and an agent deciding whether to re-run it with an item_id needs to see it.
+    note: item ? 'the city, tenure, sales and rating below came from this listing\'s detail record; the standing came from the seller profile endpoint.' : 'pass item_id as well for this seller\'s city, tenure, sales count and positive rate -- those live on a listing\'s detail record, not on the profile, so they are missing rather than blank.',
+    fields_present: SELLER_PROFILE_FIELDS.filter((f) => present(data[f])), fields_missing: SELLER_PROFILE_FIELDS.filter((f) => !present(data[f])) };
+};
+
+/** The listings one seller currently has up, logged out. The 宝贝 tab of the same /personal page, from
+ *  the endpoint that tab calls for itself.
+ *
+ *  This is the gap that made the profile worth having: nothing else in this server can answer "what else
+ *  does this seller have", and on a site with no ratings and no feedback threads that question is the
+ *  whole of due diligence. The cards carry a price, a category, a photo and the label strip, and they go
+ *  through `sellerListings` rather than the feed normaliser because this endpoint's title field is not
+ *  the feed's title field and its `detailUrl` is an app deep link.
+ *
+ *  `has_more` comes from the payload's own `nextPage`, which was checked against a real second page
+ *  rather than assumed: at `pageSize: 2` against a seller with six listings it went true, and page 2
+ *  returned the next two ids. `totalCount` is in the payload, is always 0, and is not published.
+ *
+ *  Two things this endpoint does that the others do not, both found by a live run rather than by
+ *  reading its payload. It omits `cardList` entirely on a page past the end -- a `SUCCESS` with no
+ *  listings in it -- so a missing card list is `count: 0`, not a `ParseError`; and a page past 50 is
+ *  refused with `FAIL_BIZ_FORBIDDEN`, which is why `page` is bounded here rather than at the shared
+ *  10,000. It also answers `FAIL_BIZ_NOT_FOUND::||对方账号不存在` for a seller that is not there, which
+ *  is the same fact `page.head` reports as `FAIL_BIZ_USER_NOT_FOUND`, so both tools name it the same
+ *  way. */
+const sellerItems = async ({ user_id, item_id, limit = SELLER_PAGE_SIZE, page = 1 }: Args<typeof SELLER_ITEMS_ARGS>): Promise<Data> => {
+  const { user_id: uid, item_id: item } = await resolveSeller({ user_id, item_id });
+  const wanted = clamp(page, 1, MAX_SELLER_PAGE), cap = clamp(limit, 1, MAX_LIMIT);
+  const session = getSession();
+  await session.ensureReady();
+  const entry = (await session.call([['items', SELLER_ITEMS_API, { needGroupInfo: true, pageNumber: wanted, userId: uid, pageSize: SELLER_PAGE_SIZE }]]))?.items || {};
+  if (!entry.ok) {
+    if (/NOT_FOUND/.test(String(entry.ret))) throw new DetailUnavailableError(`goofish has no seller ${uid}: ${entry.ret}. The id is wrong, or the account has been closed. Pass item_id instead to ask about the seller of a live listing.`);
+    if (/FORBIDDEN/.test(String(entry.ret))) throw new GatedError(`goofish refused page ${wanted} of seller ${uid}: ${entry.ret}. The endpoint serves at most ${MAX_SELLER_PAGE} pages of ${SELLER_PAGE_SIZE}, and walks \`has_more\` rather than asking for a page number up front.`);
+    throw new GatedError(`goofish refused the listing list for seller ${uid}: ${entry.ret}`);
+  }
+  const payload = entry.data || {};
+  const cards = sellerListings(payload);
+  // No cards is an answer, not a failure: an empty cardList and an absent cardList both mean this
+  // seller has nothing on this page. What is NOT an answer is a payload that does not look like this
+  // endpoint's at all, which is why the check is for its always-present keys rather than for the one
+  // that can be missing.
+  if (!cards.length && !payloadKeys.some((k) => k in payload)) throw new ParseError(`the seller listing endpoint returned a payload for ${uid} carrying none of its own keys (${payloadKeys.join(', ')}): got ${Object.keys(payload).sort().slice(0, 10)}. The payload shape may have changed.`);
+  const items = dedupe(cards).slice(0, cap).map((it: any, i: number) => ({ ...it, rank: i + 1 }));
+  return { user_id: uid, profile_url: `${HOME}personal?userId=${uid}`, item_id: item || null, page: wanted, account_required: false, source: 'idle_xyh_item_list', raw_cards: cards.length, has_more: Boolean(payload.nextPage), count: items.length, items };
 };
 
 /** Scrape goofish's 猜你喜欢 / 为你推荐 rails for an anonymous visitor. Renders are flaky, so retry -- under a clock, like the other two best-effort tools, because five renders with a reload between each is up to five minutes of somebody's timeout at the 60s navigation timeout -- and if the DOM never cooperates fall back to the feed API and say so in `source` rather than returning an empty list. */
@@ -648,17 +835,21 @@ const capabilities = async (): Promise<Data> => {
       'related_items: more-like-this for an item, or goofish\'s generic set',
       'search_items: keyword search with real depth -- pages walks the result pager for 30 listings a page (up to 10 pages, measured 4 to 81-82 matches in 19-36s, and it tops up by two pages if the pool comes up short of limit), and detail reads the top N in full (one page load each at 7.5-10s; measured 50 full listings, 39 fields, ~246 photos, 0 failures, in 410-550s). Retried because goofish declines some page loads.',
       'item_view: title, price, want/browse counts, description, seller with city/tenure/sales/rating, brand, condition and every photo, from the detail call the item page makes for itself',
+      'seller_profile: one seller\'s standing -- credit tier, shop level and score, praise ratio, review count, followers, listing count, real-name/real-person/芝麻 status -- from the endpoint the /personal page uses, which answers anonymously and is unreachable by interception. Handed a listing instead of a seller id, it also returns their city, tenure, sales and positive rate.',
+      'seller_items: the listings one seller currently has up, 20 a page, with nextPage telling you whether to walk. Handed a listing instead of a seller id, it means that listing\'s seller, for the price of one item page load.',
     ],
     anonymous_flakiness: [
       'search_items works logged out, but goofish declines on some page loads: the search call is not even made and the page renders the 猜你喜欢 rail instead. It retries, and only accepts a reply or a page when a fraction of the listing titles really contain the query.',
-      'The three DOM tools (search_items, item_view, recommendations) can also be served goofish\'s risk-control page instead of the app, which renders zero cards and no rail. That is named as risk_control_page in the output, and it clears after a pause; the four API tools keep working throughout because they need only the mtop client.',
+      'The three DOM tools (search_items, item_view, recommendations) can also be served goofish\'s risk-control page instead of the app, which renders zero cards and no rail. That is named as risk_control_page in the output, and it clears after a pause; the mtop-only tools keep working throughout because they need only the mtop client.',
       'Anonymous page rendering is throttled per IP and degrades to an empty shell with no error; the DOM-scraping tools retry and then report what they got.',
     ],
     notes: [
       'goofish puts a dismissible login dialog over anonymous pages. It does not gate anything and it does not need closing: the listing cards are already in the DOM underneath its ant-modal-mask, and clicking its close controls was measured to stop the result list from rendering. This server never clicks it.',
-      'The feed is not keyword-filterable and ignores cCatId, so it samples inventory rather than answering queries.',
+      'The feed is not keyword-filterable and ignores cCatId, so it samples inventory rather than answering queries. Verified while building the seller tools: two identical `{pageNumber: 1}` calls return completely disjoint inventory, and adding cCatId does not narrow it -- so there is no category filter to expose, and one is not faked.',
+      'There is no location filter either. The match counter takes a `userPositionJson`, and five spellings of it (city only, city+lat/lon, ipLocation, a far-away city) all returned the identical hitnum. The keyword search endpoint does take a position, but it cannot be issued by this server at all -- see the next note.',
       'Item detail is read from the call the page makes for itself rather than one this server issues: the same API with the same payload, re-issued through the page\'s own mtop client, answers TIMEOUT::接口超时, because goofish attaches a per-call anti-bot blob to the requests its own bundle originates. Letting the page ask and reading the reply is both the only route that works and the richer one.',
-      'The four mtop-only tools run on a separate page from the three that drive a browsing page, so a slow search does not hold up a fast feed call.',
+      'The mtop-only tools run on a separate page from the three that drive a browsing page, so a slow search does not hold up a fast feed call. seller_profile and seller_items are on that page too, and take the shared lock only for the item-page hop when given an item_id instead of a user_id.',
+      'An mtop endpoint the current page never happens to use CAN be issued through that page\'s own client and answers normally -- goofish stamps only the calls its own bundle originates. That is the whole route to a seller profile, and it is why these two endpoints exist here at all: response interception can only report a call the page already decided to make.',
       'Chromium on a network with broken IPv6 can fail to connect at all (ERR_ADDRESS_UNREACHABLE) where curl succeeds, which looks like an empty page -- see the cause list below.',
     ],
     // The measurements that used to live inside the tool descriptions, where every agent paid for them on
@@ -671,10 +862,10 @@ const capabilities = async (): Promise<Data> => {
       'search pager walk': '30 listings a page at 5-9.5s each, against 13-25s for a fresh page load',
       'how many of a page match': 'varies a lot -- across three sessions `pages: 2` gave 25, 28 and 55 matches of 60 scanned, and `pages: 4` gave 81 of 90. Read `count`; do not assume 30 a page',
       'deep comparison, measured': '`pages: 2, limit: 50, detail: 50` returned 50 full listings, 39 fields and 247 photos, no failures, in 410s',
-      'the four mtop-only tools': 'browse_feed / search_count / search_suggest / related_items take no page load at all beyond the boot URL, and do not queue behind a search',
+      'the mtop-only tools': 'browse_feed / search_count / search_suggest / related_items / seller_profile / seller_items take no page load at all beyond the boot URL, and do not queue behind a search',
     },
     // The known causes, in the order they were actually observed; static, so it survives a dead browser.
-    note: 'goofish did not serve a usable page. Known causes, in the order actually observed: (1) the network resolves goofish to IPv6 but has no working IPv6 route, so Chromium gets ERR_ADDRESS_UNREACHABLE where curl over v4 returns 200; (2) resource exhaustion, ERR_INSUFFICIENT_RESOURCES, usually a small /tmp; (3) goofish answering with its risk-control page instead of the app -- a 200 whose whole body reads "非法访问 ... 请使用正常浏览器访问闲鱼" -- which is the state to check for first, because it is indistinguishable from "no results" unless it is named, and it is server-side so it lifts after a pause; (4) a footer-only shell as a successful 200. The four API tools need only the mtop client, which comes up even on (3) and (4), so they survive every one of these.',
+    note: 'goofish did not serve a usable page. Known causes, in the order actually observed: (1) the network resolves goofish to IPv6 but has no working IPv6 route, so Chromium gets ERR_ADDRESS_UNREACHABLE where curl over v4 returns 200; (2) resource exhaustion, ERR_INSUFFICIENT_RESOURCES, usually a small /tmp; (3) goofish answering with its risk-control page instead of the app -- a 200 whose whole body reads "非法访问 ... 请使用正常浏览器访问闲鱼" -- which is the state to check for first, because it is indistinguishable from "no results" unless it is named, and it is server-side so it lifts after a pause; (4) a footer-only shell as a successful 200. The mtop-only tools need only the mtop client, which comes up even on (3) and (4), so they survive every one of these.',
   };
   // Each probe is guarded on its own and reports under its own key: merged into one try, a throwing loginuser probe skipped the feed probe and its verdict, and both looked like a dead browser. The per-probe keys are the difference between "not logged in" and "not reachable".
   const probe = async (key: string, run: () => Promise<void>): Promise<void> => { try { await run(); } catch (e: unknown) { const d = describe(e); status[`${key}_error`] = `${d.error_type}: ${d.message}`; } };
@@ -712,13 +903,22 @@ const SEARCH_ARGS = {
 const RELATED_ARGS = { item_id: z.string().optional(), limit: z.number().int().min(1).max(MAX_LIMIT).default(30), page: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1) };
 const ITEM_ARGS = { item_id: z.string().min(1) };
 const RECO_ARGS = { limit: z.number().int().min(1).max(MAX_LIMIT).default(30), url: z.string().optional() };
+// Both seller tools take the same two alternatives, and neither is required in the schema: which one is
+// missing is the question, and a schema that made one of them required would push the "give exactly one
+// of these, and here is a message that says so" into every caller's error handling. `resolveSeller` asks.
+// `item_id` is the looser of the two validators on purpose -- an empty string is how a caller spells
+// "not this one", and turning that into a validation error would be a worse answer than the message
+// `resolveSeller` already writes.
+const SELLER_ARGS = { user_id: z.string().optional(), item_id: z.string().optional() };
+const SELLER_ITEMS_ARGS = { ...SELLER_ARGS, limit: z.number().int().min(1).max(MAX_LIMIT).default(SELLER_PAGE_SIZE), page: z.number().int().min(1).max(MAX_SELLER_PAGE).default(1) };
 type FeedArgs = Args<typeof FEED_ARGS>; type CountArgs = Args<typeof COUNT_ARGS>; type SuggestArgs = Args<typeof SUGGEST_ARGS>;
 type SearchArgs = Args<typeof SEARCH_ARGS>; type RelatedArgs = Args<typeof RELATED_ARGS>; type ItemArgs = Args<typeof ITEM_ARGS>; type RecoArgs = Args<typeof RECO_ARGS>;
+type SellerArgs = Args<typeof SELLER_ARGS>;
 
 type ToolDef = { name: string; description: string; schema: z.ZodRawShape; run: (args: any) => Promise<Data> };
 /** Wrap a tool so it takes the one lock that matters: the three DOM tools read and navigate the single
  *  shared `domPage`, so two of them at once would navigate it out from under each other and one would
- *  report the other's page as its own data. The four mtop-only tools and `capabilities` are deliberately
+ *  report the other's page as its own data. The mtop-only tools and `capabilities` are deliberately
  *  left out -- they never touch `domPage`, so making them queue behind a 70s search bought nothing but
  *  latency. The lock lives here, on the tools that need it, rather than in the entry point where it
  *  would apply to all eight. */
@@ -732,6 +932,8 @@ export const TOOLS: ToolDef[] = [
   tool({ name: 'search_suggest', description: 'goofish\'s own search-box autocomplete: keyword suggestions for a prefix, plus the total suggestion count. Args: query (str), limit (default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
   tool({ name: 'search_items', description: 'Search goofish listings by keyword, logged out. Depth is two arguments. `pages` (1-10, default 1) walks the result pager for 30 listings a page; it is a floor, not a ceiling -- if the pages walked leave fewer than `limit` matches, up to two more are walked. Read `count` rather than assuming 30 a page. `detail` (0-50, default 0) reads that many of the top-ranked results in full -- description, every photo, and the seller with their city, tenure, sales count, rating, reply rate and signature -- one page load each that does not parallelise, so budget roughly a minute per 8; `detail_report` names which answered and what goofish said about the ones that did not. Cards already carry price, want count, city, seller, avatar, photo and tags, so ask for `detail` only on a shortlist. `items` holds just the listings whose titles really carry the query -- as the phrase, or as every term in any order, which is what makes Chinese work (`机械硬盘4t` has 70,000+ listings; the titles read 西数4T机械硬盘). `matched_by` says which rule admitted the set. The recommendation rail is never returned as results; goofish declines some page loads outright, so this retries and may raise `SearchUnavailableError`. For measured costs, call capabilities. Args: query (str), limit (default 120, capped by XIANYU_SEARCH_MAX_ITEMS), attempts (1-10, default 4; the first 3 type into the search box, the last is a direct-URL fallback), pages (1-10, default 1), detail (0-50, default 0).' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
   tool({ name: 'related_items', description: 'Listings goofish recommends for a given item ("more like this"), or its generic recommendation set when item_id is omitted. Returns real listings with titles, prices and cities. Args: item_id (optional digits or item URL), limit (default 30), page (1-10000, default 1).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
+  tool({ name: 'seller_profile', description: 'One seller\'s public profile, logged out: display name, avatar, signature, credit tier (卖家信用极好), shop level and score, praise ratio, review count, follower and listing counts, and whether they have passed real-name, real-person and 芝麻 checks. Pass `user_id` (the id item_view and this tool report, or the one in a goofish /personal?userId= URL) for a direct mtop call, or `item_id` to mean "whoever is selling this listing" -- which first loads the listing\'s page -- one page load, and on the loads goofish declines item_view\'s own retry loop absorbs the cost -- and additionally returns their city, tenure, sales count and positive rate, the four facts the profile endpoint does not carry. Exactly one of the two; passing both is refused rather than guessed. Fields the call could not fill come back null and are named in `fields_missing` rather than blank. Args: user_id (optional digits), item_id (optional digits or item URL).' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
+  tool({ name: 'seller_items', description: 'The listings one seller currently has up, logged out -- the 宝贝 tab of their goofish profile, with title, price, category, photo, want count and the label strip. On a site with no ratings and no feedback threads this is the whole of due diligence, and nothing else here can answer it. Pass `user_id` for a direct mtop call, or `item_id` to mean that listing\'s seller (which costs one item page load). `has_more` comes from goofish\'s own `nextPage`; walk `page` rather than assuming 20 a page. Args: user_id (optional digits), item_id (optional digits or item URL), limit (default 20), page (1-50, default 1 -- goofish serves at most 50 pages of 20 here, so walk `has_more` rather than asking for a page number up front).' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),
   tool({ name: 'item_view', description: 'Read one listing, logged out -- title, price, want and browse counts, the description, the seller with their city, tenure, sales and rating, the brand and condition, and every photo. `source` says which route answered -- `item_detail_api` is the full listing, `item_page_dom` is the rendered page, `search_card_cache` is an earlier search result in this session and is missing the description and the seller statistics, which `fields_missing` names rather than guessing. Most often an id that cannot be read has been sold or removed; that raises `DetailUnavailableError`. Args: item_id (digits or item URL).' + NO_ACCOUNT, schema: ITEM_ARGS, run: locked(itemView) }),
   tool({ name: 'recommendations', description: 'Scrape goofish\'s recommendation rails (猜你喜欢 / 为你推荐) for an anonymous visitor from any goofish page. Falls back to live feed listings if the DOM will not cooperate, and says so in `source` and `fallback_reason`. Args: limit (default 30), url (optional goofish page to load, default the homepage).' + NO_ACCOUNT, schema: RECO_ARGS, run: locked(recommendations) }),
 ];
