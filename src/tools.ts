@@ -11,7 +11,7 @@ import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
-import { detailListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS } from './extract.ts';
+import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS } from './extract.ts';
 type Data = Record<string, any>;
 // The mtop endpoints this server is allowed to name. Recovered by extracting all 51 `mtop.*` names from goofish's own JS bundles (idle-pc/xy-site); reading the minified call sites gave the exact parameter shapes, which is what made these work first time. All answer anonymously, and a test fails the build if any other mtop name appears.
 //
@@ -99,6 +99,23 @@ export const budget = (name: string, defaultS: number): number => { const raw = 
 export const searchCap = (): number => { const raw = process.env.XIANYU_SEARCH_MAX_ITEMS; const n = Number(raw); return raw?.trim() && Number.isInteger(n) ? clamp(n, 30, MAX_SEARCH_ITEMS) : MAX_SEARCH_ITEMS; };
 /** The one way this file reads the DOM. `Session.open` checks the allowlist on the URL it landed on, but that is point-in-time: `search_items` then polls for up to 32s and `item_view` for up to 32s before it reads anything, and the page can be moved off goofish in that window. So the check is repeated on the URL that is live *now*, in the same statement as the read, and every scraper goes through here. `timeoutS` is for the cheap probes, which must not inherit the 90s an in-page read is allowed. */
 const scrape = (page: Page, fn: any, arg: any, what: string, timeoutS?: number): Promise<any> => { ensureGoofishUrl(page.url()); return evaluate(page, fn, arg, what, timeoutS); };
+/** Every listing this server publishes goes through here: the flat fields the normalisers produced,
+ *  plus `typed` (the same values as numbers, ISO timestamps and structured objects) and `missing` (the
+ *  paths inside `typed` the site did not render). One function rather than four because the shape a
+ *  caller reads must not depend on which route answered -- a feed card, a search card, a DOM-scraped
+ *  card and the detail API each fill a different subset of the same block, and all four publish the
+ *  same keys, so "which of these is absent" is a question about the answer rather than about the
+ *  plumbing.
+ *
+ *  It only ever *adds*. The flat fields keep the site's own strings -- `price` stays `"366"` next to
+ *  `typed.price_amount: 366` -- because a field that changes type under an existing caller is a
+ *  breaking change wearing a version number, and the block beside it is what removes the reason to
+ *  parse anything. See `enrichListing` in extract.ts for the values and the missing-field rule.
+ *
+ *  It runs here, in Node, rather than inside `FEED_NORMALIZE_JS`, for the same reason the rail markers
+ *  are passed into the scrapers: an in-page script is serialised alone with its one argument, so a
+ *  second copy of these rules inside it would be a second copy to drift. */
+const withTyped = <T extends Record<string, any>>(items: T[] | null | undefined): any[] => (items ?? []).map((i) => enrichListing(i));
 // -------------------------------------------------------------------- the tools
 /** Page through goofish's public homepage feed. The feed is personalised-by-anonymity rather than by keyword: each pageNumber returns a different slice of live inventory. Verified 8 pages / 157 unique listings, 0 duplicates, no rate limiting. */
 const browseFeed = async ({ page_number = 1, pages = 1, limit = 60 }: FeedArgs): Promise<Data> => {
@@ -122,7 +139,7 @@ const browseFeed = async ({ page_number = 1, pages = 1, limit = 60 }: FeedArgs):
     throw new ParseError(`feed returned no cards for pages [${wanted}]: ${JSON.stringify(pageReports)}. The card shape may have changed.`);
   }
   const normalized = await evaluate(page, FEED_NORMALIZE_JS, { rows: rows.map((r) => r?.cardData || r) }, 'feed normalization');
-  const items = dedupe((normalized || []).filter((i: any) => i.item_id));
+  const items = withTyped(dedupe((normalized || []).filter((i: any) => i.item_id)));
   if (!items.length) throw new ParseError(`feed returned cards but none had an item id -- the response shape likely changed. First card keys: ${Object.keys(rows[0] || {}).sort().slice(0, 12)}`);
   const ranked = rankItems(items, clamp(limit, 1, MAX_LIMIT));
   return { source: 'homepage_feed', account_required: false, requested_pages: wanted, page_reports: pageReports, raw_cards: rows.length, unique_items: items.length, count: ranked.length, items: ranked };
@@ -169,7 +186,7 @@ const relatedItems = async ({ item_id, limit = 30, page = 1 }: RelatedArgs): Pro
   const payload = entry.data || {}, cards = Array.isArray(payload.cardList) ? payload.cardList : [];
   if (!cards.length) throw new ParseError(`recommendation endpoint returned no cards for item ${iid || '(generic)'}: keys=${Object.keys(payload).sort().slice(0, 10)}`);
   const normalized = await evaluate(pg, FEED_NORMALIZE_JS, { rows: cards.map((c: any) => c?.cardData || c) }, 'recommendation normalizer');
-  const items = dedupe((normalized || []).filter((i: any) => i.item_id));
+  const items = withTyped(dedupe((normalized || []).filter((i: any) => i.item_id)));
   if (!items.length) throw new ParseError('recommendation cards had no item ids; the payload shape likely changed');
   const ranked = rankItems(items, clamp(limit, 1, MAX_LIMIT));
   return { item_id: iid || null, page: clamp(page, 1, MAX_PAGE_NUMBER), account_required: false, source: 'item_web_recommend', raw_cards: cards.length, unique_items: items.length, has_more: Boolean(payload.hasMore), count: ranked.length, items: ranked };
@@ -191,7 +208,7 @@ const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => 
     const feed = await browseFeed({ pages: 1, limit: cap });
     return { ...feed, source: 'homepage_feed', requested_url: target, fallback_reason: `the DOM at ${page.url()} rendered no cards after ${Math.min(attemptNo, RENDER_ATTEMPTS)} attempt(s) in ${Math.round((Date.now() - started) / 1000)}s (goofish serves anonymous visitors an empty shell part of the time); returned live feed listings instead` };
   }
-  const items = rankItems(dedupe(payload.items), cap);
+  const items = rankItems(withTyped(dedupe(payload.items)), cap);
   return { source: 'dom_recommendation', rail: payload.rail || '', page_url: page.url(), account_required: false, attempts: attemptNo, says_no_results_for_query: Boolean(payload.says_no_results), risk_control_page: Boolean(payload.blocked), count: items.length, items };
 };
 
@@ -372,7 +389,7 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
       log.push({ attempt: attemptNo, via, rendered: Boolean(payload.rendered), scraped_cards: cards, query_hits: hits, token_hits: tokenHits, accepted_hits: accepted, min_query_hits: minHits, rail: payload.rail || '', says_no_results: Boolean(payload.says_no_results), blocked: Boolean(payload.blocked) });
       if (!declined) {
         // Only the matches, so `count` and every item agree with each other and with the query.
-        const items = rankItems(dedupe(payload.items.filter((i: any) => i.matches_query)), cap);
+        const items = rankItems(withTyped(dedupe(payload.items.filter((i: any) => i.matches_query))), cap);
         for (const it of items) rememberCard(it);
         return { query: q, source: 'search_page_dom', via, account_required: false, attempts: attemptNo, attempt_log: log, query_hits: hits, token_hits: tokenHits, matched_by: hits === tokenHits ? 'phrase' : 'all_terms', min_query_hits: minHits, scraped_cards: cards, non_matching_count: Math.max(0, cards - tokenHits), count: items.length, items };
       }
@@ -418,7 +435,7 @@ const finishSearch = async (page: Page, payloads: any[], q: string, cap: number)
   if (!cards.length) return null;
   const normalized = await evaluate(page, FEED_NORMALIZE_JS, { rows: cards }, 'search normalization');
   const low = q.toLowerCase(), terms = queryTerms(q);
-  const all = dedupe((normalized || []).filter((i: any) => i.item_id));
+  const all = withTyped(dedupe((normalized || []).filter((i: any) => i.item_id)));
   if (!all.length) return null;
   const titleOf = (i: any) => String(i.title || '').toLowerCase();
   const phrases = all.filter((i: any) => low && titleOf(i).includes(low));
@@ -560,8 +577,11 @@ const readListing = async (session: any, item: string, deadline: number): Promis
     const reply = await session.domTap.take(DETAIL_API, Math.min(ITEM_READY_WAIT_MS, Math.max(0, deadline - Date.now())));
     if (reply) {
       if (reply.ok) {
+        // The richest route by a long way, and the only one that fills most of the typed block: the
+        // detail payload carries the seller's province and city, the transport fee, the create and
+        // modify epochs and the 成色 attribute, none of which a card has.
         const listing = detailListing(reply.data, item);
-        if (listing) return { listing: { ...listing, source: 'item_detail_api' }, payload, tries, page };
+        if (listing) return { listing: { ...enrichListing(listing), source: 'item_detail_api' }, payload, tries, page };
         // It answered with a different listing, or with no listing at all. That is a page that is not
         // the one that was asked for, and the id check below would refuse it -- but saying so now is
         // cheaper than waiting out a poll that cannot change it.
@@ -599,7 +619,7 @@ const readListing = async (session: any, item: string, deadline: number): Promis
       // only, and is exactly the set of fields a card cannot have.
       const blank = cached.detailed ? {} : { description: '', want_count: '', browse_count: '', seller: '', seller_tenure_years: '', seller_items_sold: '', seller_positive_rate: '' };
       const fields = { ...cached, ...blank, item_id: item, page_item_id: item };
-      return { listing: { ...fields, source: 'search_card_cache', attempts: tries, page_attempts: tries,
+      return { listing: { ...enrichListing(fields), source: 'search_card_cache', attempts: tries, page_attempts: tries,
         note: `the item page did not answer for this listing (${payload?.api_ret || payload?.site_error ? 'refused' : 'rendered no detail block'}), so this is the listing as an earlier ${cached.detailed ? 'detail read' : 'search'} in this session published it${cached.detailed ? '' : '. The description, the want and browse counts and the seller\'s statistics live on the item page and are reported missing rather than guessed'}.`,
         ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])) }, payload, tries, page };
     }
@@ -610,7 +630,11 @@ const readListing = async (session: any, item: string, deadline: number): Promis
   // off-site page's fields be reported as this item's.
   const served = String(payload.page_item_id ?? '');
   if (served !== item) throw new ParseError(`asked goofish for item ${item} but the page it served reports item ${served || '(no ?id= in its URL)'}; refusing to report one listing's fields as another's.`);
-  return { listing: { ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, payload[f] ?? (f === 'image_urls' ? [] : '')])), source: 'item_page_dom' }, payload, tries, page };
+  // The rendered page yields ten fields and no epoch, no province and no fee, so most of the typed block
+  // is null here and `missing` says so by name. That is the honest answer for this route rather than a
+  // thinner one: the keys are the same either way, and a caller can tell which route answered.
+  const rendered = Object.fromEntries(ITEM_FIELDS.map((f) => [f, payload[f] ?? (f === 'image_urls' ? [] : '')]));
+  return { listing: { ...enrichListing(rendered), source: 'item_page_dom' }, payload, tries, page };
 };
 
 /** What this server can and cannot do right now, verified against the live site. A diagnostic must never be the thing that crashes, so every probe is guarded and reported as status rather than raised -- including a browser that has gone away. */

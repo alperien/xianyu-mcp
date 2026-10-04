@@ -131,6 +131,130 @@ const firstText = (...vals: any[]): string => { for (const v of vals) { const s 
  *  read the same, so a count of 0 is published as a number and a missing key as an empty string. */
 const countOf = (v: any): string => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? String(Math.trunc(n)) : ''; };
 
+// ---- typed views of a listing. Everything above this line hands back the site's own strings, and
+// those strings are what the flat fields publish and what every existing consumer reads -- they are
+// not retyped here, because a field that changes type under a caller is a breaking change wearing a
+// version number. These read the same values as *types* and publish them beside the strings, under one
+// key with a shape that does not vary: `366` next to `"366"`, `2026-01-02T03:04:05.000Z` next to
+// `"1784640276000"`, `{province, city}` next to `"杭州"`.
+//
+// And they keep the rule this server has always kept: a value the site did not render is `null` and is
+// named in `missing`, never inferred from a sibling and never defaulted. A `0` the site sent is a
+// number; a key it never sent is a null in the block and an entry in the list.
+//
+// Node-side, like the normalisers above and unlike the in-page scripts: they read a response already
+// in hand and never the page, so they can close over each other and be shared by every listing tool.
+// Nothing in this section may be called from inside an in-page script.
+
+/** The typed block every listing publishes. Every key is always present; a value the site did not
+ *  render is a null in it and an entry in `missing`. It is written out rather than inferred from an
+ *  index signature so that adding a field is a compile error at the one place that fills it in. */
+export type ListingTyped = {
+  price_amount: number | null;
+  want_count: number | null;
+  view_count: number | null;
+  collect_count: number | null;
+  condition: string | null;
+  published_at: string | null;
+  updated_at: string | null;
+  location: { province: string | null; city: string | null } | null;
+  shipping: { fee: number | null; free_shipping: boolean | null } | null;
+  seller_stats: { tenure_years: number | null; items_sold: number | null; positive_rate: number | null; reply_rate_24h: number | null; zhima_verified: boolean | null } | null;
+};
+/** A flat listing, the typed view of it, and the leaves of that view the site left out. */
+export type TypedListing<T> = T & { typed: ListingTyped; missing: string[] };
+
+/** A number, or null. The site sends numbers as strings and decorates them -- `"1,299"`, `"¥9"`,
+ *  `"12.50"`, `"80%"` -- so the decoration is stripped rather than the value called unreadable. An
+ *  empty value is null and never 0: "the site said none" and "the site said nothing" are different
+ *  facts, and collapsing them is how a listing ends up looking free. Which is why the leftovers have
+ *  to look like a number rather than merely survive `Number`: `Number('')` is 0 and `Number('面议')`
+ *  is NaN, so a value that was *only* decoration -- a bare `¥`, an all-whitespace field -- would come
+ *  back as a price of zero. */
+export const numberOrNull = (v: unknown): number | null => {
+  if (v === null || v === undefined || v === '') return null;
+  const s = String(v).replace(/[,，\s¥￥%]/g, '');
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+};
+
+/** An ISO 8601 timestamp, or null. goofish stamps epochs in milliseconds (`"1784640276000"`), in
+ *  seconds on some payloads, and occasionally hands back a date already formatted; the digit count
+ *  picks the unit rather than the magnitude, and an already-ISO value passes through instead of being
+ *  run through `Date` twice. Anything else is null rather than a plausible-looking invention. */
+export const isoOrNull = (v: unknown): string | null => {
+  const s = asText(v);
+  if (!s) return null;
+  if (/^\d{4}-\d{2}-\d{2}T/.test(s)) return s;
+  const d = /^\d{1,13}$/.test(s) ? new Date(Number(s) * (s.length <= 10 ? 1000 : 1)) : new Date(s);
+  return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+};
+
+/** `{province, city}`, or null when the payload named no place at all. The province stays null unless
+ *  the payload carried one: it is deliberately *not* parsed out of the city string, because a province
+ *  inferred from a city name is an invented fact, and an invented fact inside a structured field is
+ *  worse than a missing one, because the structure says it was read. */
+const locationOf = (province: unknown, city: unknown): ListingTyped['location'] => {
+  const p = asText(province) || null, c = asText(city) || null;
+  return p || c ? { province: p, city: c } : null;
+};
+
+/** The seller's statistics as numbers, or null when the source had none of them -- a feed card names a
+ *  seller and says nothing about them. `zhima_verified` passes through only when the payload really
+ *  carried a boolean, so "not verified" is never manufactured out of an absent key. */
+const sellerStatsOf = (row: any): ListingTyped['seller_stats'] => {
+  const tenure_years = numberOrNull(row.seller_tenure_years), items_sold = numberOrNull(row.seller_items_sold);
+  const positive_rate = numberOrNull(row.seller_positive_rate), reply_rate_24h = numberOrNull(row.seller_reply_rate_24h);
+  const zhima_verified = typeof row.seller_zhima_verified === 'boolean' ? row.seller_zhima_verified : null;
+  return tenure_years === null && items_sold === null && positive_rate === null && reply_rate_24h === null && zhima_verified === null
+    ? null : { tenure_years, items_sold, positive_rate, reply_rate_24h, zhima_verified };
+};
+
+/** The shipping answer, or null. `free_shipping` is derived rather than scraped, and only ever from a
+ *  fee the payload carried: a transport fee of zero is free shipping on this site, and a fee that was
+ *  never rendered leaves both null rather than "free". */
+const shippingOf = (fee: unknown): ListingTyped['shipping'] => {
+  const f = numberOrNull(fee);
+  return f === null ? null : { fee: f, free_shipping: f === 0 };
+};
+
+/** Build the typed block from whatever flat fields a normaliser produced. Pure, total and idempotent,
+ *  which is what lets one function serve all four listing routes: the detail API, a feed card, a
+ *  search card and a DOM-scraped card each hand it a different subset of the same names. */
+export const listingTyped = (row: any): ListingTyped => ({
+  price_amount: numberOrNull(row.price),
+  want_count: numberOrNull(row.want_count),
+  view_count: numberOrNull(row.browse_count),
+  collect_count: numberOrNull(row.collect_count),
+  condition: asText(row.condition) || null,
+  published_at: isoOrNull(row.publish_time),
+  updated_at: isoOrNull(row.gmt_modified),
+  location: locationOf(row.province, firstText(row.city, row.seller_city)),
+  shipping: shippingOf(row.shipping_fee),
+  seller_stats: sellerStatsOf(row),
+});
+
+/** Every leaf of a typed block that came back null, as dotted paths (`"seller_stats.items_sold"`).
+ *  The convention in one list: a null in `typed` is a value the site did not render, and this names it,
+ *  so a caller never has to guess whether a null is an absence or an oversight. A leaf that is present
+ *  beside absent siblings is named on its own (`location.province` while `location.city` is there); a
+ *  null *object* is named once at its own path, because the source had none of it and enumerating its
+ *  keys would say a dozen times what the null already says. */
+export const missingPaths = (typed: any, prefix = ''): string[] => {
+  if (typed === null || typed === undefined) return prefix ? [prefix] : [];
+  if (typeof typed !== 'object' || Array.isArray(typed)) return [];
+  return Object.entries(typed).flatMap(([k, v]) => missingPaths(v, prefix ? `${prefix}.${k}` : k));
+};
+
+/** The row plus its typed view and the list of what the site did not render. Applied on this side of
+ *  the page boundary on purpose: the normalisers inside `FEED_NORMALIZE_JS` cannot close over these,
+ *  and typing the values there would mean a second copy of the rules to drift. */
+export const enrichListing = <T extends Record<string, any>>(row: T): TypedListing<T> => {
+  const typed = listingTyped(row);
+  return { ...row, typed, missing: missingPaths(typed) };
+};
+
 /** One listing out of the captured `mtop.taobao.idle.pc.detail` payload, or null when the payload is
  *  not a listing at all.
  *
@@ -173,6 +297,12 @@ export const detailListing = (data: any, wanted: string): any | null => {
     quantity: countOf(item.quantity),
     item_status: asText(item.itemStatusStr),
     shipping_fee: firstText(item.transportFee),
+    // The raw sources the typed block reads, kept here rather than typed here so there is exactly one
+    // place that turns a string into a number or a timestamp -- and so a route that cannot reach them
+    // (the DOM card) publishes the same keys as null rather than a differently-shaped answer.
+    publish_time: firstText(item.gmtCreate, item.publishTime),
+    gmt_modified: firstText(item.gmtModified),
+    province: firstText(seller.province, seller.provinceName),
     seller: asText(seller.nick),
     seller_city: firstText(seller.city, seller.publishCity),
     seller_tenure_years: Number.isFinite(tenure) && tenure > 0 ? String(Math.floor(tenure / 365)) : '',
@@ -236,6 +366,12 @@ export const searchListings = (data: any): any[] => {
         is_video: Boolean(ex.showVideoIcon || dp.isVideo === 'true' || ex.isVideo === true),
         is_auction: Boolean(ex.isAuction),
         publish_time: asText(args.publishTime),
+        // The last three are the raw sources the typed block reads, carried the same way the rest are:
+        // they are in the reply when the card has them, and the block publishes a null and names it in
+        // `missing` when it does not. Nothing here invents a province from a city or a fee from a tag.
+        province: asText(ex.province) || asText(args.province),
+        condition: asText(ex.condition) || asText(args.condition) || asText(dp.condition),
+        shipping_fee: asText(ex.transportFee) || asText(args.transportFee) || asText(dp.transportFee),
         // fishTags.r1..r4 is the strip under the title: free shipping, a price drop, seller credit.
         // Reading the `content` of each tag is the only way to get it, and it is genuinely useful for
         // triage -- "卖家信用极好" and "18天内降价" change how a listing reads.
@@ -341,6 +477,12 @@ export const FEED_NORMALIZE_JS = (spec: { rows: any[] }): any[] => {
       seller_avatar: pick(ex.seller_avatar),
       seller_shop: Boolean(ex.seller_shop),
       publish_time: pick(ex.publish_time),
+      // The three the typed block reads. Read through the same fallback chain as everything else, and
+      // empty when the card carries none of them -- which is the normal case for a homepage feed card
+      // and is published as a null in `typed` and an entry in `missing`, never guessed from the title.
+      province: pick(ex.province, dp.province, am.province, card.province),
+      condition: pick(ex.condition, dp.condition, am.condition, card.condition),
+      shipping_fee: pick(ex.shipping_fee, dp.transportFee, am.transportFee, card.transportFee),
       url: 'https://www.goofish.com/item?id=' + itemId,
     });
   }

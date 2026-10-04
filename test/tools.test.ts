@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { BOOT_URL, exclusive, HOME, reloadFresh, Session, setSession } from '../src/browser.ts';
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
 import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
-import { budget, resetCardCache, TOOLS } from '../src/tools.ts';
+import { budget, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
 
 const run = (name: string) => {
   const t = TOOLS.find((x) => x.name === name);
@@ -471,8 +471,47 @@ test('item_view answers from the page\'s own detail reply, with the fields the D
   assert.equal(out.seller_avatar, 'https://gtms03.alicdn.com/a.png');
   assert.equal(out.item_status, '在线');
   assert.deepEqual(Object.entries(out.attributes).map(([k, v]) => `${k}=${v}`), ['品牌=Toua/腾亚', '成色=明显使用痕迹', '已用年限=1年(含)-3年(不含)']);
+  // and the same listing as types, beside those strings rather than instead of them
+  assert.deepEqual(out.typed, {
+    price_amount: 366, want_count: 1, view_count: 34, collect_count: 2, condition: '明显使用痕迹',
+    published_at: null, updated_at: null, location: { province: null, city: '台州' },
+    shipping: { fee: 0, free_shipping: true },
+    seller_stats: { tenure_years: 6, items_sold: 369, positive_rate: 80, reply_rate_24h: 97, zhima_verified: true },
+  });
+  assert.deepEqual(out.missing, ['published_at', 'updated_at', 'location.province'],
+    'the three the payload genuinely has no value for, and nothing else');
+  assert.equal(out.price, '366', 'the flat field is still the string every existing caller reads');
   // the page was still loaded: that is where the call comes from
   assert.deepEqual(s.opened, ['https://www.goofish.com/item?id=42']);
+});
+
+test('every listing route publishes the same typed block, and names what its own source lacked', async () => {
+  // The point of the block being one function: a caller must not have to learn a different schema per
+  // tool. These are the thinnest and the richest routes in this file, and the keys are identical --
+  // only the values differ, which is the honest difference between what goofish told us.
+  const feed = use(makeSession({ cards: [listed(['1', '2'])] }, { p1: cards(['1', '2']) }));
+  const fromFeed = (await run('browse_feed')({ page_number: 1, pages: 1 })).items[0];
+  assert.deepEqual(Object.keys(fromFeed.typed), ['price_amount', 'want_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location', 'shipping', 'seller_stats']);
+  assert.deepEqual(fromFeed.typed, { price_amount: 5, want_count: 1, view_count: null, collect_count: null, condition: null,
+    published_at: null, updated_at: null, location: { province: null, city: '杭州' }, shipping: null, seller_stats: null });
+  // a homepage feed card names no province and quotes no fee; saying so by name is the answer, and
+  // guessing either from the city or from the tag strip would be a fact this server never read
+  assert.deepEqual(fromFeed.missing, ['view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
+  assert.equal(fromFeed.price, '5', 'and the string fields are exactly what they were before the block existed');
+
+  use(makeSession({ item: [RENDERED] }));
+  const fromDom = await run('item_view')({ item_id: '42' });
+  assert.deepEqual(Object.keys(fromDom.typed), Object.keys(fromFeed.typed), 'the block does not change shape with the route');
+  // The rendered item page prints a title, a price, the counts and the seller, and no epoch, no
+  // province and no fee. So most of the block is null here, and `missing` says which -- which is a
+  // more useful answer than the thinner listing this used to publish.
+  assert.deepEqual(fromDom.typed, { price_amount: 1999, want_count: 2, view_count: 110, collect_count: null, condition: null,
+    published_at: null, updated_at: null, location: null, shipping: null,
+    seller_stats: { tenure_years: 4, items_sold: 27, positive_rate: 100, reply_rate_24h: null, zhima_verified: null } });
+  assert.deepEqual(fromDom.missing, ['collect_count', 'condition', 'published_at', 'updated_at', 'location', 'shipping', 'seller_stats.reply_rate_24h', 'seller_stats.zhima_verified']);
+  // ... and the pre-existing honesty contract is untouched by any of it
+  assert.deepEqual(fromDom.fields_missing, []);
+  assert.deepEqual(fromDom.fields_present.length, ITEM_FIELDS.length);
 });
 
 test('item_view refuses a detail reply about a different listing, and reports a refusal as a refusal', async () => {
@@ -584,6 +623,15 @@ test('item_view reads the page for a listing a search already returned, and fall
   assert.ok(fallback.fields_missing.includes('description'));
   assert.ok(fallback.fields_missing.includes('browse_count'));
   assert.match(fallback.note, /earlier search in this session/);
+  // the fourth route, and the one most likely to look like a detail block because it is a whole
+  // listing object: the typed block is rebuilt from the card, so the fields the item page alone
+  // carries are null here and named. `want_count` is in the list even though the card held one --
+  // that route blanks the card fields it cannot vouch for, and `missing` is where that shows up
+  // rather than being quietly indistinguishable from "the site sent none".
+  assert.deepEqual(fallback.missing, ['want_count', 'view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
+  assert.equal(fallback.typed.want_count, null, 'blanked on this route, and named as such');
+  assert.equal(fallback.typed.price_amount, 329, 'but the price the card does carry is still typed');
+  assert.equal(fallback.typed.location?.city, '北京', 'and the city the search reply gave it');
 });
 
 test('search_items answers from the page\'s own search reply, and holds it to the same relevance guard', async () => {

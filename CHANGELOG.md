@@ -19,6 +19,19 @@ The Python implementation this is a port of is not in this history at all: it li
 
 ### Added
 
+- **A `typed` block and a `missing` list on every listing.** `browse_feed`, `search_items`,
+  `related_items`, `item_view` and `recommendations` each publish, beside the fields they already
+  returned, a `typed` object reading the same values as types — `price_amount` as a number, epochs as
+  ISO 8601, `location` as `{province, city}`, `shipping` as `{fee, free_shipping}`, the seller as
+  `seller_stats` — plus `missing`, naming every path inside `typed` that is `null`. Three rules make
+  it usable: every key is always present, so the block does not change shape with the route that
+  answered; a value the site did not render is `null` and named, never inferred from a sibling and
+  never defaulted; and a `0` the site sent is a `0`, not a gap — nobody wanting an item and nobody
+  viewing it are facts.
+- The extra listing fields those blocks read, which the page already loaded and the server dropped:
+  the detail reply's `gmtCreate` / `gmtModified` / seller province, and the province, condition and
+  transport fee on a search or feed card. The rendered item page exposes no epoch, province or fee,
+  so on that route those stay `null` and named — which is the honest answer rather than a thinner one.
 - `XIANYU_SEARCH_MAX_ITEMS`: a runtime ceiling on one `search_items` call, clamped to 30–300 and read
   per call like the budget overrides. It clamps both `limit` and how deep the pager walk goes (one
   page of 30 per 30 of the cap), so even `pages: 10, limit: 500` stops inside

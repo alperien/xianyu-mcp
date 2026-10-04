@@ -80,13 +80,66 @@ one browser, one page — so two tools in flight cannot navigate each other out 
 | Tool | Args | Key return fields |
 |---|---|---|
 | `capabilities` | — | `session_state` (`unexpectedly_logged_in` / `logged_out` / `unknown` — `logged_out` only from a ret that actually names the session or token, so a rate limit or a timeout reads `unknown` rather than proving anonymity), `feed_reachable`, `login_probe_ret`, `works_without_account`, `anonymous_flakiness`, `notes`, `note`, `browser_launches`, and a `browser_error` / `login_error` / `feed_error` per probe. Never raises, not even if the browser is gone. |
-| `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed` |
+| `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing` — see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error — but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
-| `search_items` | `query`, `limit` (d120, ≤300), `attempts` (1–10, d4), **`pages`** (1–10, d1), **`detail`** (0–50, d0) | `items[]` of matches only, each with price, want_count, city, seller, seller_avatar, tags, image_urls and rank — and, for the `detail` top N, the full listing: description, every photo, browse_count, collect_count, brand, condition, used_years, attributes, item_status, and the seller with city, tenure, sales, rating, reply rate, signature and 芝麻 status. `count` (matches), `pages_fetched`, `scraped_cards`, `query_hits` (whole query as a phrase), `token_hits` (every term, any order — the looser rule that makes Chinese work), `matched_by`, `min_query_hits`, `non_matching_count`, `detail_requested` / `detailed` / `detail_ms` / `detail_report` (per-listing: which answered, from where, and what goofish said when it did not), `attempt_log`, `source: search_api`. Raises `SearchUnavailableError` rather than returning the rail. |
-| `related_items` | `item_id` (optional), `limit` (d30), `page` (1–10000, d1) | `items[]` (feed card shape), `raw_cards`, `unique_items`, `has_more`, `source: item_web_recommend` |
-| `item_view` | `item_id` (digits or item URL) | `title, price, want_count, browse_count, description, seller, seller_tenure_years, seller_items_sold, seller_positive_rate, image_urls`, plus `seller_city, seller_signature, seller_reply_rate_24h, seller_items_listed, seller_avatar, seller_zhima_verified, brand, condition, used_years, attributes, collect_count, quantity, item_status, shipping_fee`, `fields_present` / `fields_missing`, `page_item_id`, and `source`: **`item_detail_api`** (the full listing), **`item_page_dom`** (the rendered page) or **`search_card_cache`** (an earlier search result in this session — see [item_view](#item_view-reads-the-calls-the-page-makes)) |
-| `recommendations` | `limit` (d30), `url` (optional) | `items[]`, `rail`, `page_url`, `attempts`, `risk_control_page`, `count`, `source: dom_recommendation` — or `source: homepage_feed` with `fallback_reason` when the DOM will not render |
+| `search_items` | `query`, `limit` (d120, ≤300), `attempts` (1–10, d4), **`pages`** (1–10, d1), **`detail`** (0–50, d0) | `items[]` of matches only, each with price, want_count, city, seller, seller_avatar, tags, image_urls and rank — and, for the `detail` top N, the full listing: description, every photo, browse_count, collect_count, brand, condition, used_years, attributes, item_status, and the seller with city, tenure, sales, rating, reply rate, signature and 芝麻 status. `count` (matches), `pages_fetched`, `scraped_cards`, `query_hits` (whole query as a phrase), `token_hits` (every term, any order — the looser rule that makes Chinese work), `matched_by`, `min_query_hits`, `non_matching_count`, `detail_requested` / `detailed` / `detail_ms` / `detail_report` (per-listing: which answered, from where, and what goofish said when it did not), `attempt_log`, `source: search_api`, and `typed` + `missing` on every item. Raises `SearchUnavailableError` rather than returning the rail. |
+| `related_items` | `item_id` (optional), `limit` (d30), `page` (1–10000, d1) | `items[]` (feed card shape, each with `typed` + `missing`), `raw_cards`, `unique_items`, `has_more`, `source: item_web_recommend` |
+| `item_view` | `item_id` (digits or item URL) | `title, price, want_count, browse_count, description, seller, seller_tenure_years, seller_items_sold, seller_positive_rate, image_urls`, plus `seller_city, seller_signature, seller_reply_rate_24h, seller_items_listed, seller_avatar, seller_zhima_verified, brand, condition, used_years, attributes, collect_count, quantity, item_status, shipping_fee`, `typed` / `missing`, `fields_present` / `fields_missing`, `page_item_id`, and `source`: **`item_detail_api`** (the full listing), **`item_page_dom`** (the rendered page) or **`search_card_cache`** (an earlier search result in this session — see [item_view](#item_view-reads-the-calls-the-page-makes)) |
+| `recommendations` | `limit` (d30), `url` (optional) | `items[]` (each with `typed` + `missing`), `rail`, `page_url`, `attempts`, `risk_control_page`, `count`, `source: dom_recommendation` — or `source: homepage_feed` with `fallback_reason` when the DOM will not render |
+
+Every listing those five tools publish — in `items[]` and, for `item_view`, at the top level — also
+carries **`typed`** and **`missing`**. See [the typed block](#the-typed-block-every-listing-carries).
+
+## The typed block every listing carries
+
+The flat fields above are the site's own strings, and they stay that way: `price` is `"366"`, not
+`366`. That is deliberate — a field that changes type under an existing caller is a breaking change
+wearing a version number — so rather than retype them in place, every listing gains one sibling key
+that reads the same values *as types*:
+
+```jsonc
+{
+  "price": "1,299",                    // unchanged: still the site's string
+  "browse_count": "110",
+  "typed": {
+    "price_amount": 1299,              // the same value, parsed
+    "want_count": 366,
+    "view_count": 110,
+    "collect_count": null,
+    "condition": "明显使用痕迹",
+    "published_at": "2026-07-21T13:24:36.000Z",   // goofish sends an epoch; sometimes ms, sometimes s
+    "updated_at": null,
+    "location": { "province": "浙江省", "city": "台州" },
+    "shipping": { "fee": 0, "free_shipping": true },
+    "seller_stats": {
+      "tenure_years": 6, "items_sold": 369, "positive_rate": 80,
+      "reply_rate_24h": 97, "zhima_verified": true
+    }
+  },
+  "missing": ["collect_count", "updated_at"]
+}
+```
+
+Three rules, and they are the whole contract:
+
+1. **Every key in `typed` is always present.** The block does not change shape with the route that
+   answered — a homepage feed card, a search card, a DOM-scraped card, the item page and the detail
+   API all publish the same ten keys. Only the values differ, so "which of these is absent" is a
+   question about the answer rather than about which tool you called.
+2. **A value the site did not render is `null`, and named in `missing`.** Never inferred from a
+   sibling and never defaulted. `missing` holds the paths inside `typed` that are null, dotted where
+   they are nested (`location.province` when the city was read and the province was not). It is *not*
+   the same list as `item_view`'s older `fields_missing`, which walks the flat `ITEM_FIELDS` instead;
+   both are published, and neither is derived from the other.
+3. **A `0` the site sent is a `0`, not a gap.** Nobody wanting an item, nobody viewing it, nobody
+   favouriting it and a `¥0` transport fee are all facts, and they publish as numbers.
+   `shipping.free_shipping` is the one derived value in the block, and it is only ever derived from a
+   fee the payload actually carried.
+
+Nothing here is scraped twice. The block is built once, in Node, from the same reply the flat fields
+came out of — which is why a listing whose page rendered no province reports `location.province:
+null` rather than a province guessed from the city string.
 
 ## The login dialog is left alone, on purpose
 

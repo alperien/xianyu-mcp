@@ -8,7 +8,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, MTOP_CALL_JS, MTOP_READY_JS, queryTerms, RAIL_MARKERS, SCRAPE_CARDS_JS } from '../src/extract.ts';
+import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, isoOrNull, ITEM_SCRAPE_JS, listingTyped, missingPaths, MTOP_CALL_JS, MTOP_READY_JS, numberOrNull, queryTerms, RAIL_MARKERS, SCRAPE_CARDS_JS } from '../src/extract.ts';
 import { ITEM_FIELDS } from '../src/tools.ts';
 
 const g = globalThis as any;
@@ -56,6 +56,90 @@ test('the feed normalizer reads both card shapes, and only the first one has att
   assert.equal(rows[0].url, 'https://www.goofish.com/item?id=111');
   // a card with no item id is skipped rather than reported as a blank listing
   assert.deepEqual(FEED_NORMALIZE_JS({ rows: [{}, { detailParams: {} }] }), []);
+});
+
+test('a number the site dressed up is a number, and one that is not is null rather than zero', () => {
+  assert.equal(numberOrNull('1,299'), 1299);
+  assert.equal(numberOrNull('¥9'), 9);
+  assert.equal(numberOrNull('80%'), 80);
+  assert.equal(numberOrNull('12.50'), 12.5);
+  assert.equal(numberOrNull(0), 0, 'the site saying zero is an answer, not an absence');
+  // `Number('')` is 0, so a leftover that only *looked* like a number has to be caught by shape:
+  // a bare currency mark or a run of whitespace otherwise reads as a price of zero, and a listing
+  // nobody is charging for is the one value in a feed that must never be invented.
+  assert.equal(numberOrNull('¥'), null);
+  assert.equal(numberOrNull('   '), null);
+  assert.equal(numberOrNull(''), null);
+  assert.equal(numberOrNull(null), null);
+  assert.equal(numberOrNull(undefined), null);
+  assert.equal(numberOrNull('面议'), null, 'a price nobody has agreed is not a number');
+  assert.equal(numberOrNull('1.2万'), null, 'a rounded approximation would be a fabricated price');
+  // the epoch is milliseconds on some payloads and seconds on others; the digit count decides
+  assert.equal(isoOrNull('1784640276000'), '2026-07-21T13:24:36.000Z');
+  assert.equal(isoOrNull('1784640276'), '2026-07-21T13:24:36.000Z');
+  assert.equal(isoOrNull(1784640276000), '2026-07-21T13:24:36.000Z');
+  // an already-ISO value passes through rather than through `Date` a second time
+  assert.equal(isoOrNull('2026-07-21T13:24:36.000Z'), '2026-07-21T13:24:36.000Z');
+  assert.equal(isoOrNull('2026-07-21'), '2026-07-21T00:00:00.000Z');
+  assert.equal(isoOrNull('刚刚'), null, 'no invented date');
+  assert.equal(isoOrNull(''), null);
+});
+
+test('the typed block reads a listing as types, and `missing` names every value the site left out', () => {
+  // The detail API reply, the richest of the four routes. Everything the block has keys for is here,
+  // which is the point: `missing` empty means the payload really did render all of it, not that the
+  // block is a shorter shape this time.
+  const full = detailListing({
+    itemDO: {
+      itemId: '42', title: '腾亚40C瓦斯钉抢', soldPrice: '366', desc: '刚保养清洗干净',
+      wantCnt: 1, browseCnt: 34, collectCnt: 0, quantity: 1, itemStatusStr: '在线',
+      transportFee: '0.00', gmtCreate: '1784640276000', gmtModified: '1784640999000',
+      cpvLabels: [{ propertyName: '成色', valueName: '明显使用痕迹' }],
+    },
+    sellerDO: { nick: '今生有缘xy', province: '浙江省', city: '台州', userRegDay: 2256, hasSoldNumInteger: 369, newGoodRatioRate: '80%', replyRatio24h: '97%', zhimaAuth: true },
+  }, '42');
+  assert.ok(full, 'the payload is a listing');
+  assert.deepEqual(listingTyped(full), {
+    price_amount: 366, want_count: 1, view_count: 34, collect_count: 0, condition: '明显使用痕迹',
+    published_at: '2026-07-21T13:24:36.000Z', updated_at: '2026-07-21T13:36:39.000Z',
+    location: { province: '浙江省', city: '台州' }, shipping: { fee: 0, free_shipping: true },
+    seller_stats: { tenure_years: 6, items_sold: 369, positive_rate: 80, reply_rate_24h: 97, zhima_verified: true },
+  });
+  assert.deepEqual(missingPaths(listingTyped(full)), [], 'the site rendered all of it');
+  // collect_count 0 above is the load-bearing case: nobody has favourited it, which is a fact the
+  // site stated, and rounding it to null would report a missing number instead of a real one.
+
+  // A homepage feed card, the thinnest route: a name, a price, a city and a want count. Everything
+  // else is a null in the block and a name in the list -- never inferred from a sibling, because the
+  // one thing this server will not do is publish a field it did not read.
+  const card = enrichListing(FEED_NORMALIZE_JS({ rows: [{ cardData: { detailParams: { itemId: '111', title: 'A', soldPrice: '12.5', userNick: 'sellerA' }, attributeMap: { wantNum: 0, city: '杭州' } } }] })[0]);
+  assert.deepEqual(card.typed, { price_amount: 12.5, want_count: 0, view_count: null, collect_count: null, condition: null,
+    published_at: null, updated_at: null, location: { province: null, city: '杭州' }, shipping: null, seller_stats: null });
+  assert.deepEqual(card.missing, ['view_count', 'collect_count', 'condition', 'published_at', 'updated_at', 'location.province', 'shipping', 'seller_stats']);
+  assert.ok(card.missing.includes('location.province') && !card.missing.includes('location.city'),
+    'the city was read, so only the province is absent -- the list is per-leaf, not per-object');
+
+  // A null leaf is named on its own path (`b.d` while `b.c` is there), because that is the precise
+  // answer. A null *object* is named once at its own path (`g`): `shipping: null` already says the
+  // source had no fee at all, and listing `shipping.fee` and `shipping.free_shipping` separately would
+  // say the same thing twice.
+  assert.deepEqual(missingPaths({ a: null, b: { c: 1, d: null }, e: { f: null }, g: null }), ['a', 'b.d', 'e.f', 'g']);
+  assert.deepEqual(missingPaths({ all: 'present' }), []);
+
+  // The strings are untouched. This is the whole reason the block sits beside them rather than
+  // replacing them: a field that changes type under an existing caller is a breaking change.
+  assert.equal(card.price, '12.5');
+  assert.equal(card.want_count, '0');
+  assert.equal(card.city, '杭州');
+  assert.deepEqual(Object.keys(card).filter((k) => k === 'typed' || k === 'missing'), ['typed', 'missing']);
+  // and the block never invents a province out of a city, which is the tempting one
+  assert.equal(enrichListing({ price: '1', city: '杭州' }).typed.location?.province, null);
+  // a fee of zero is free shipping on this site; a fee that was never rendered is not "free"
+  assert.deepEqual(listingTyped({ shipping_fee: '0' }).shipping, { fee: 0, free_shipping: true });
+  assert.deepEqual(listingTyped({ shipping_fee: '12' }).shipping, { fee: 12, free_shipping: false });
+  assert.equal(listingTyped({}).shipping, null);
+  // a boolean the payload never carried is not "not verified"
+  assert.equal(listingTyped({ seller_tenure_years: '3' }).seller_stats!.zhima_verified, null);
 });
 
 test('the item scraper reads the detail head and refuses the rail below it', () => {
