@@ -401,7 +401,7 @@ const searchItems = async ({ query, limit = 60, attempts = SEARCH_ATTEMPTS, page
       log.push({ attempt: attemptNo, via, rendered: Boolean(payload.rendered), scraped_cards: cards, query_hits: hits, token_hits: tokenHits, accepted_hits: accepted, min_query_hits: minHits, rail: payload.rail || '', says_no_results: Boolean(payload.says_no_results), blocked: Boolean(payload.blocked) });
       if (!declined) {
         // Only the matches, so `count` and every item agree with each other and with the query.
-        const items = rankItems(dedupe(payload.items.filter((i: any) => i.matches_query)), cap);
+        const items = rankItems(dedupe(payload.items.filter((i: any) => i.matches_query)), cap).map(normalizeItem);
         for (const it of items) rememberCard(it);
         return { query: q, source: 'search_page_dom', via, account_required: false, attempts: attemptNo, attempt_log: log, query_hits: hits, token_hits: tokenHits, matched_by: hits === tokenHits ? 'phrase' : 'all_terms', min_query_hits: minHits, scraped_cards: cards, non_matching_count: Math.max(0, cards - tokenHits), count: items.length, items };
       }
