@@ -891,10 +891,11 @@ const capabilities = async (): Promise<Data> => {
   // nine commits behind main, every tool answered plausibly, and nothing said so. A tool every agent
   // is told to call first is the one place that cannot be skipped.
   //
-  // `buildBlock` never throws -- it reads git and the filesystem, and a machine with neither still gets
-  // an answer -- but it is guarded anyway, under the same rule as the probes above: a throw here must
-  // not cost the caller the rest of the report, which is the failure mode the per-probe keys exist to
-  // prevent.
+  // `buildBlock` cannot raise: src/build-info.ts wraps every git call and every filesystem read and
+  // returns '' on failure, so a machine with no git, no dist/, or no checkout still gets an answer.
+  // That is a property of that module, not of this call site -- `readFileSync` inside it is the only
+  // way this could throw, and it is guarded there. The per-probe keys above exist for the same reason
+  // and do not cover this one, so the guarantee rests entirely on build-info.ts holding its line.
   return status;
 };
 
