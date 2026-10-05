@@ -61,6 +61,9 @@ See [Headless vs headed](#headless-vs-headed) for what `XIANYU_HEADLESS=1` costs
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
 | `XIANYU_SELLER_PROFILE_BUDGET_S` | 90 | wall-clock budget for the item-page hop `seller_profile` / `seller_items` make when given an `item_id` (5–600s). A lookup by `user_id` runs no loop and spends none of it |
 | `XIANYU_SEARCH_MAX_ITEMS` | 300 | ceiling for one `search_items` call, in listings — clamps both `limit` and how deep the pager walk goes (30–300), so a huge walk stays inside `XIANYU_SEARCH_BUDGET_S` |
+| `XIANYU_CACHE` | `1` | `0` turns the item-detail / search-page cache off entirely, no restart — see [the cache](#repeat-views-are-cached-and-the-cache-says-so) |
+| `XIANYU_CACHE_ITEM_TTL_S` | 45 | how long a listing read in full may be served again (1–600) |
+| `XIANYU_CACHE_SEARCH_TTL_S` | 120 | how long one page of search results may be served again (1–600) |
 
 The budget bounds the *loop*, not the call. It is checked between attempts, so a page load already in
 flight runs to completion: at the 90s default and a 10–25s load you get several attempts, and a call
@@ -80,7 +83,7 @@ one browser, one page — so two tools in flight cannot navigate each other out 
 
 | Tool | Args | Key return fields |
 |---|---|---|
-| `capabilities` | — | `session_state` (`unexpectedly_logged_in` / `logged_out` / `unknown` — `logged_out` only from a ret that actually names the session or token, so a rate limit or a timeout reads `unknown` rather than proving anonymity), `feed_reachable`, `login_probe_ret`, `works_without_account`, `anonymous_flakiness`, `notes`, `note`, `browser_launches`, and a `browser_error` / `login_error` / `feed_error` per probe. Never raises, not even if the browser is gone. |
+| `capabilities` | — | `session_state` (`unexpectedly_logged_in` / `logged_out` / `unknown` — `logged_out` only from a ret that actually names the session or token, so a rate limit or a timeout reads `unknown` rather than proving anonymity), `feed_reachable`, `login_probe_ret`, `cache` (`enabled`, the two TTLs, how many listings and search pages are held), `works_without_account`, `anonymous_flakiness`, `notes`, `note`, `browser_launches`, and a `browser_error` / `login_error` / `feed_error` per probe. Never raises, not even if the browser is gone. |
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing` — see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error — but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
@@ -279,6 +282,64 @@ the normal state for the first ten seconds and is polled, not treated as a verdi
 router needs ~12s, and the SPA destroys the execution context on the way — a lost context is waited out,
 because it is the navigation landing rather than a failure.
 
+## Repeat views are cached, and the cache says so
+
+Two answers here are expensive enough to be worth remembering: **one listing read in full** (an item
+page load, measured 4–10s) and **one page of search results** (a page load plus 5–9.5s for each pager
+step past the first). Both are cached in the process for a TTL, so the ordinary loop — search, open
+what looks interesting, open it again, page deeper — pays for the page load once.
+
+A search whose `(query, page)` set is already cached answers with **no page, no keystroke and no mtop
+call at all**: `via: "cache"`, `attempts: 0`. A deeper walk reuses the pages it already has and clicks
+only the new ones. `detail` is unaffected by where the cards came from — a cached search still reads
+its top N in full, from the listing cache where it can and from goofish where it cannot.
+
+**Nothing else is cached, and one thing deliberately is not.** `browse_feed` is not: two identical
+feed calls return completely disjoint inventory — goofish serves each visitor a randomised slice — so
+a repeat call there is a *different answer*, not a stale copy of the first, and caching it would swap
+"sampling live inventory" for "re-sampling the same inventory". The mtop-only tools cost 0.4–2.2s and
+have nothing to save.
+
+**The rule that shaped it: a cached answer may never be indistinguishable from a live one.** This
+server scrapes a marketplace where a listing can be sold, delisted or repriced between two calls, and
+a cache that serves a stale price is worse than a slow answer. So every answer that *can* come from the
+cache publishes where it came from — on `item_view`, per pager page on `search_items`, per listing in
+`detail_report`, and in `capabilities` before you have relied on any of it:
+
+```jsonc
+"cache": {
+  "hit": true,                 // false on a miss, with the same keys — the shape never changes with the route
+  "key": "item:809806779491",  // or "search:thinkpad x220#2" — what it was looked up under
+  "age_s": 12.4,               // whole seconds, as a float; "0" would read as "just now" when it may be 0.4s
+  "stored_at": "2026-10-05T18:04:11.204Z",
+  "ttl_s": 45,
+  "note": "this listing was served from this process's own cache, 12.4s old (TTL 45s): goofish was not asked, so this listing may have been sold, repriced or edited since. Re-read it with XIANYU_CACHE=0, or after the TTL."
+}
+```
+
+A search publishes one line per pager page (`cache.pages[]`, with `hits` / `misses`), because a walk
+whose pages were read at different moments is the normal case and one age for the whole set would be a
+claim about a set that does not exist.
+
+**The TTLs: 45s for a listing, 120s for a search page**, overridable per process with
+`XIANYU_CACHE_ITEM_TTL_S` and `XIANYU_CACHE_SEARCH_TTL_S`, and `XIANYU_CACHE=0` turns the whole thing
+off — no restart, no code change, for a caller who would rather pay the 8s than reason about a TTL.
+
+They are not numbers that looked reasonable. Nobody here has measured how fast an individual Xianyu
+listing sells, and this does not invent one. What the measurements do say is that the market turns over
+*inside a session* — goofish's own match counter for `x220` was read at 28,791 / 28,804 / 28,810 across
+one session, a live-inventory count drifting ~0.07% — which argues against a window of minutes; and
+that what the cache replaces is expensive (4–10s a listing, 4–12s a warm search, 5–9.5s a pager page),
+which argues against a window shorter than the read it replaces. The two are split because the risks are
+not the same: a stale *listing* is a price on something that may since have been sold, which is the
+harmful case; a stale *search page* is 30 listings being compared against each other, none of which is
+being transacted, and the liveness of any one of them is exactly what a detail read re-checks.
+
+Only real reads are stored. A refused answer leaves the cache exactly as it found it, and the
+`search_card_cache` fallback — the degraded answer for a listing whose page would not load — is never
+written to the cache, because pinning a five-field card for the TTL would turn one degraded read into a
+window of them.
+
 ## Headless vs headed
 
 Measured, same URL, one fresh context per run, sampling every 4s for 128–200s:
@@ -440,6 +501,14 @@ the path where the event loop has already stopped. Verified after every fix: 0 p
   serves a different listing than the one asked for — or a page with no listing id at all —
   `item_view` raises instead of reporting its fields. The recommendation rail is never returned as
   search results.
+- **A cached answer is never indistinguishable from a live one.** Item detail and search pages are
+  cached for a TTL (45s and 120s, overridable, `XIANYU_CACHE=0` disables). Every answer that can come
+  from the cache publishes `hit`, `age_s`, `stored_at`, `ttl_s` and the key it was looked up under —
+  on `item_view`, per pager page on `search_items`, per listing in `detail_report`, and in
+  `capabilities`. A miss publishes the same block with null ages, so the envelope's shape does not
+  change with the route. Only real reads are stored, a failed read leaves the cache untouched, and a
+  cached answer is judged by the same relevance guard and identity checks as a live one. See
+  [the cache](#repeat-views-are-cached-and-the-cache-says-so).
 - **The page is never clicked.** A structural test fails if a `.click(` call appears anywhere in
   `src/` or `test/`, and if the dismisser's selectors come back.
 - **One version, written once.** The version in the MCP handshake is read out of `package.json` at
@@ -450,7 +519,7 @@ the path where the event loop has already stopped. Verified after every fix: 0 p
 ## Development
 
 ```bash
-npm test                 # 71 tests, no network, no browser
+npm test                 # 113 tests, no network, no browser
 npm run typecheck        # tsc --noEmit over src and test
 npm run build            # src/*.ts -> dist/*.js, what the tarball ships
 node src/index.ts        # stdio, run from source; refuses to run interactively

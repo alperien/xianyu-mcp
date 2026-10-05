@@ -66,6 +66,33 @@ and a dated section for it would be claiming a release that did not happen.
   rail is still refused as results.
 - This file, and a test that the version the MCP handshake advertises is read from `package.json`
   rather than written down a second time.
+- **A TTL cache for the two answers worth remembering: one listing read in full, keyed by `item_id`,
+  and one page of search results, keyed by `(query, page)`.** A repeat view no longer pays for an item
+  page load (measured 4–10s), a re-paged search no longer re-clicks the pager (5–9.5s a page), and a
+  search whose pages are all cached answers with no page, no keystroke and no mtop call at all
+  (`via: "cache"`, `attempts: 0`). `capabilities` reports the cache before it is relied on.
+  - **Staleness is published, never silent.** Every answer that can come from the cache carries a
+    `cache` block — `hit`, `age_s`, `stored_at`, `ttl_s`, the `key` it was looked up under, and a
+    sentence saying whether goofish was asked — on `item_view`, per pager page on `search_items`, and
+    per listing in `detail_report`. A miss publishes the same block with null ages, so an envelope's
+    shape never depends on which route answered. This is the same rule the `typed`/`missing` block
+    already follows, applied to where the answer came from.
+  - **The TTLs are 45s for a listing and 120s for a search page**, overridable with
+    `XIANYU_CACHE_ITEM_TTL_S` / `XIANYU_CACHE_SEARCH_TTL_S`, with `XIANYU_CACHE=0` turning the whole
+    thing off. Chosen against what is actually measured rather than for feel: goofish's own match
+    counter for `x220` read 28,791 / 28,804 / 28,810 inside one session — live inventory drifting
+    ~0.07% — which argues against a window of minutes, while the read being replaced costs 4–12s,
+    which argues against a window shorter than the read. The two are split because the risks differ: a
+    stale listing is a price on something that may have sold, while a stale search page is 30 listings
+    being compared and the detail read is what re-checks liveness.
+  - **`browse_feed` is deliberately not cached.** Two identical feed calls return completely disjoint
+    inventory — goofish serves each visitor a randomised slice — so a repeat there is a different
+    answer, not a stale copy, and caching it would replace sampling live inventory with re-sampling
+    the same slice. The mtop-only tools cost 0.4–2.2s and have nothing to save either.
+  - Only real reads are stored: a refused answer leaves the cache untouched, and the
+    `search_card_cache` fallback is never written to it, because pinning a five-field card for the TTL
+    would turn one degraded read into a window of them. Cached pages are pooled and judged by the same
+    relevance guard as a live walk, so a cached answer cannot be a laxer one.
 
 ### Changed
 

@@ -19,7 +19,7 @@ import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
 import { buildBlock } from './build.ts';
 import { getItem, getSearchPage, itemKey, itemTtl, missed, notCached, pageReport, putItem, putSearchPage, searchTtl, stats as cacheStats } from './cache.ts';
-import type { CacheVerdict } from './cache.ts'; (WIP: TTL cache for item detail and search pages, staleness published (xi-byi))
+import type { CacheVerdict } from './cache.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
@@ -885,7 +885,8 @@ const readListing = async (session: any, item: string, deadline: number): Promis
     // card held for its TTL would turn one degraded read into a window of them, and the cache is only
     // ever worth having when what it holds is something goofish read in full.
     const cached = seenIds.get(item);
-    if (cached) {      // Unless this same process already read it in full. `search_items`'s `detail` argument merges
+    if (cached) {
+      // Unless this same process already read it in full. `search_items`'s `detail` argument merges
       // the detail fields into the very card object the cache holds, so a listing deepened earlier in
       // this session comes back with a description and a seller's statistics -- and blanking those
       // here would throw away data we were actually holding. The blanking is for the plain-card case
