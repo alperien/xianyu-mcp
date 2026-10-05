@@ -44,3 +44,32 @@ jobs:
             exit 1
           fi
           node --check dist/index.js
+
+      # The stamp is what lets a deployed dist name its own commit. Without this step the build
+      # succeeds and ships something that can only be dated by its mtime, which is how a deployment
+      # nine commits behind main kept answering plausibly with nothing to say so.
+      - name: the build is stamped with the commit it came from
+        run: |
+          if [ ! -f dist/build-info.json ]; then
+            echo "dist/build-info.json is missing -- npm run build must call scripts/stamp-build.mjs"
+            exit 1
+          fi
+          node -e '
+            const s = require("./dist/build-info.json");
+            const { execFileSync } = require("node:child_process");
+            const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+            if (s.commit !== head) { console.error(`stamp says ${s.commit}, HEAD is ${head}`); process.exit(1); }
+            if (s.version !== require("./package.json").version) { console.error(`stamp version ${s.version} != package.json`); process.exit(1); }
+            console.log(`stamped ${s.commit.slice(0, 7)} (${s.describe})`);
+          '
+
+      # A pull request is checked out detached with a synthetic merge commit, so origin/main is behind
+      # by construction and the staleness verdict would fail on the merge itself. What is worth
+      # asserting here is the part that must hold everywhere: the check runs, it names the commit it
+      # compared against, and a build that cannot be placed is a failure rather than a silent pass.
+      - name: the deploy check runs and refuses to pass an unplaceable build
+        run: |
+          node scripts/check-deploy.mjs --no-fetch --base HEAD || {
+            echo "check:deploy failed on a checkout at its own HEAD; a build that cannot be shown current must fail loudly"
+            exit 1
+          }

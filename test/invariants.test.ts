@@ -33,7 +33,10 @@ const flat = (line: string) => deAsserted(line).replace(/\s+/g, '');
 test('no credential access anywhere in the tree', () => {
   // The tree is pinned by name, not by a count: a scan that silently stops covering a file -- or one
   // that silently starts covering a sixth source file -- is the failure mode here, not a raw credential.
-  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/tools.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/tools.test.ts']);
+  // build.ts and build-info.ts are in the list deliberately: they read the filesystem and shell out to
+// git, which is the only place in src/ that touches anything outside the goofish session, so the
+// credential scan below has to be able to see them.
+assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/tools.ts', 'test/build-info.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/tools.test.ts']);
   // `.cookies(` rather than `context.cookies(`, and matched with the whitespace stripped: matching
   // the literal missed `page.context().cookies()` and any call split across lines.
   const forbidden = [
@@ -413,4 +416,58 @@ test('the browser launches windowed by default, because headless is served the r
   assert.match(src, /headless: process\.env\.XIANYU_HEADLESS !== '1'/);
   assert.match(src, /risk-control/, 'the reason for the default has to be written down next to it');
   assert.match(src, /mtop tools work either way|does not:\s*\n?\s*\*?\s*the page's own client boots on the risk-control page/);
+});
+
+test('a build says which commit it is, and the check that compares it is not a second copy', () => {
+  // The failure this guards against is not a crash but a silence. opencode.json pointed this server at
+  // a dist/ built from a checkout thirteen commits behind main; every tool answered plausibly, the MCP
+  // handshake advertised 0.2.0 from package.json so the version looked right, and nothing anywhere
+  // said the code was old. A build that cannot name its own commit cannot be shown to be current, and
+  // the version in the handshake demonstrably was not enough to notice.
+  const info = read(join(ROOT, 'src', 'build-info.ts'));
+  const cli = readFileSync(join(ROOT, 'scripts', 'check-deploy.mjs'), 'utf8');
+
+  // The stamp exists, is written by the build, and carries the commit.
+  assert.match(JSON.parse(read(join(ROOT, 'package.json'))).scripts.build, /scripts\/stamp-build\.mjs/, 'npm run build must stamp what it built');
+  assert.match(read(join(ROOT, 'scripts', 'stamp-build.mjs')), /build-info\.json/);
+  assert.match(info, /dist'?,?\s*'build-info\.json'|build-info\.json/, 'build-info.ts must read the stamp');
+  assert.match(info, /rev-parse/, 'a build with no stamp still names itself from the checkout');
+
+  // The stamp travels with the build rather than being read off the tree at serve time. That is the
+  // property that makes it worth having: the checkout moves, the bytes do not, and a tree-relative
+  // answer would change without the served code changing.
+  assert.match(info, /subject/, 'the comparison must be against the build\'s own commit, not HEAD');
+  assert.match(info, /this checkout has moved since the build/, 'and it must say when the two disagree');
+
+  // "Could not measure" is never "current". Reporting null as false is how the original drift stayed
+  // invisible: the one thing that could have spoken did not, because its fallback was reassurance.
+  assert.match(info, /stale: behind === null \? null/, 'an unmeasured staleness must stay null');
+  assert.match(info, /unverified rather than current/);
+
+  // The comparison has to fetch, or it counts against a cache. Measured on the real deployment: the
+  // same directory reported OK with the cached ref and 13 commits behind after a fetch, because the
+  // stale clone's own origin/main pointed at its stale commit. A check that reads the cached ref is a
+  // check that cannot see this failure.
+  assert.match(cli, /'fetch'/, 'the check must fetch before counting');
+  assert.match(cli, /--no-fetch/, 'and offer an explicit airgapped path');
+  assert.match(cli, /only as fresh as that/, 'which must admit its verdict is cached');
+
+  // One set of rules, two callers. A drift check with its own arithmetic would eventually disagree
+  // with the block `capabilities` publishes to every agent about what "stale" means.
+  assert.match(cli, /import \{ buildInfo, deployVerdict \} from '\.\.\/src\/build-info\.ts'/);
+  assert.equal(/rev-list/.test(cli), false, 'the CLI must not do its own commit arithmetic');
+
+  // An unstamped build must fail rather than pass quietly, since that is the state the drifted
+  // deployment was in and the check has no other way to notice it.
+  assert.match(info, /unstamped|records no commit|no build-info\.json/);
+
+  // CI asserts the stamp matches HEAD, so a build cannot ship carrying someone else's commit.
+  assert.match(read(join(ROOT, '.github', 'workflows', 'ci.yml')), /build-info\.json/);
+
+  // And the server publishes it, because the check only helps someone who runs it. `capabilities` is
+  // the call every agent is told to make first, so it is the one place a stale deploy announces itself
+  // without anyone asking.
+  const toolsSrc = read(join(ROOT, 'src', 'tools.ts'));
+  assert.match(toolsSrc, /build: \{/, 'capabilities must carry a build block');
+  assert.match(toolsSrc, /\.\.\.buildBlock\(\)/, 'built from buildInfo rather than assembled inline');
 });
