@@ -36,7 +36,8 @@
     "test": "node --test",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm run typecheck && npm test",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/stamp-build.mjs",
+    "check:deploy": "node scripts/check-deploy.mjs",
     "dev": "node src/index.ts"
   },
   "dependencies": {

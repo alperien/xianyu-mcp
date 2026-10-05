@@ -17,6 +17,7 @@
 import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
+import { buildBlock } from './build.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
@@ -829,6 +830,16 @@ const capabilities = async (): Promise<Data> => {
   const session = getSession();
   const status: any = {
     requires_xianyu_account: false, session_state: 'unknown', login_probe_ret: '', feed_reachable: false,
+    // The deployment's own address, up top and unmissable: which commit is answering, whether it is
+    // behind main, and why. `stale: null` means it could not be measured, which is not the same as
+    // `false` -- a build nobody can place is unverified, and reporting it as current is the exact
+    // mistake that let a nine-commit-old dist keep serving a town full of agents. `npm run check:deploy`
+    // runs the same rules from the command line, and it fetches first, because a cached remote-tracking
+    // ref is itself a thing that goes stale. See src/build-info.ts.
+    build: {
+      note: 'the commit below is what is answering your calls right now; `npm run check:deploy` is the same comparison run deliberately, and it fetches before counting',
+      ...buildBlock(),
+    },
     works_without_account: [
       'browse_feed: paged homepage feed, 20 listings/page, live inventory',
       'search_count / search_suggest: match counter and autocomplete, both undeclined',
@@ -875,6 +886,15 @@ const capabilities = async (): Promise<Data> => {
   await probe('feed', async () => { status.feed_reachable = Boolean((await session.call([['f', FEED_API, { pageNumber: 1 }]]))?.f?.ok); });
   // read after the probes, so a browser that had to be relaunched shows up
   status.browser_launches = session.launches;
+  // Which build is running, and whether it is current. This is here rather than in a separate check
+  // because the deployment that motivated it went stale silently: opencode.json pointed at a dist built
+  // nine commits behind main, every tool answered plausibly, and nothing said so. A tool every agent
+  // is told to call first is the one place that cannot be skipped.
+  //
+  // `buildBlock` never throws -- it reads git and the filesystem, and a machine with neither still gets
+  // an answer -- but it is guarded anyway, under the same rule as the probes above: a throw here must
+  // not cost the caller the rest of the report, which is the failure mode the per-probe keys exist to
+  // prevent.
   return status;
 };
 
@@ -926,7 +946,7 @@ const locked = (run: (args: any) => Promise<Data>): ((args: any) => Promise<Data
 const tool = <S extends z.ZodRawShape>(def: { name: string; description: string; schema: S; run: (args: Args<S>) => Promise<Data> }): ToolDef => def as ToolDef;
 const NO_ACCOUNT = ' No Xianyu account, cookie or login is required or used. Read-only: this server cannot publish, message, or change anything.';
 export const TOOLS: ToolDef[] = [
-  tool({ name: 'capabilities', description: 'Report what this server can do without a Xianyu account right now, probing the live site: session_state, feed_reachable, the split between what works and what is flaky, the measured cost of each call, and the known failure causes. Start here if you are unsure whether a call will work, what it will cost, or what a refusal means. Never raises, not even if the browser is gone. Args: none.' + NO_ACCOUNT, schema: {}, run: capabilities }),
+  tool({ name: 'capabilities', description: 'Report what this server can do without a Xianyu account right now, probing the live site: session_state, feed_reachable, the split between what works and what is flaky, the measured cost of each call, the known failure causes, and `build` -- which commit is answering your calls and whether it is behind main. Read `build` first if you are measuring performance or trusting a result against the documentation: a deployment can be many commits and a whole release behind and still answer every call plausibly. Start here if you are unsure whether a call will work, what it will cost, or what a refusal means. Never raises, not even if the browser is gone. Args: none.' + NO_ACCOUNT, schema: {}, run: capabilities }),
   tool({ name: 'browse_feed', description: 'Page through goofish\'s public homepage feed: live listings with item_id, title, price, city, seller, want_count and image_urls. Not keyword-filterable, so use it to sample inventory, not to answer a query. Args: page_number (1-10000, default 1), pages (1-25, default 1), limit (max items, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'How many goofish listings match a keyword, and whether there are any. Unlike search_items this is not subject to goofish\'s per-page-load declines -- verified returning about 28,800 for "x220" and 0 for a nonsense string anonymously. Args: query (str).' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'goofish\'s own search-box autocomplete: keyword suggestions for a prefix, plus the total suggestion count. Args: query (str), limit (default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
