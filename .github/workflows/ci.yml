@@ -76,3 +76,24 @@ jobs:
             echo "check:deploy failed on a checkout at its own HEAD; a build that cannot be shown current must fail loudly"
             exit 1
           }
+
+      # The gate in front of every spawn is only worth having if it is quiet when there is nothing to
+      # do. A launcher that rebuilt on every start would be a build loop wearing a safety badge, and
+      # the cost of that is paid by every session forever -- so the thing worth asserting is that a
+      # dist CI has just built is served, not rebuilt. stdin at EOF so the server starts and exits
+      # instead of waiting on a client that is not there.
+      - name: the launcher starts the current build instead of rebuilding it
+        run: |
+          out=$(node scripts/serve.mjs < /dev/null 2>&1) || {
+            echo "$out"
+            echo "the launcher refused a dist that npm run build had just made in this same job"
+            exit 1
+          }
+          case "$out" in
+            *"not the build of the tree"*)
+              echo "$out"
+              echo "the launcher rebuilt a dist that was already current"
+              exit 1
+              ;;
+          esac
+          echo "served without rebuilding"

@@ -52,6 +52,39 @@ See [Headless vs headed](#headless-vs-headed) for what `XIANYU_HEADLESS=1` costs
 }
 ```
 
+Pointing a client straight at `dist/index.js` means nothing checks that this `dist/` is the build of
+the checkout it sits in. `scripts/serve.mjs` does, at every spawn:
+
+```json
+{
+  "mcpServers": {
+    "xianyu": { "command": "node", "args": ["/path/to/xianyu-mcp/scripts/serve.mjs"] }
+  }
+}
+```
+
+It compares the build's stamp against the checkout's HEAD. If they disagree — a `git pull` that
+fast-forwarded without rebuilding, which is the case that ran unnoticed for nine commits and then again
+for thirteen minutes after being fixed — it runs `npm ci && npm run build` and starts the rebuilt
+server. If that cannot produce a `dist/` matching the tree, it **refuses to start** rather than
+serving one it cannot vouch for: a loud failure costs one session, while a silently stale dist costs
+every session in the drift window and none of them can tell which ones those were. There is no flag to
+skip the check and no env var to bypass it, on purpose. A spawn where the build is already current
+costs about 40ms and no network; everything it prints goes to stderr, because stdout is the
+JSON-RPC channel.
+
+The gate is the spawn because it is the only point that sees both facts at once: there is no
+long-lived process here, so a pull into the checkout is never noticed by anything. `git post-merge` is
+not the alternative — it does not fire on a fast-forward, which is exactly the pull this is for.
+
+For a clone only. The published tarball ships `dist/` and no `src/`, has no checkout to be stale
+against, and does not include `scripts/`, so `dist/index.js` is the right thing to point at there.
+
+`npm run check:deploy` asks the same question on demand and prints the whole comparison — which commit
+is answering, which base it was compared against, how far behind it is. The launcher asks the narrower
+half of it (is this `dist/` the build of *this tree*) because that is the half a rebuild can fix; the
+full answer, base ref and fetch included, is what it runs when it has to rebuild.
+
 | Env var | Default | Purpose |
 |---|---|---|
 | `XIANYU_BROWSER_PATH` | Playwright's Chromium | use a specific Chrome/Chromium binary |
@@ -523,9 +556,11 @@ the path where the event loop has already stopped. Verified after every fix: 0 p
 ## Development
 
 ```bash
-npm test                 # 113 tests, no network, no browser
+npm test                 # __COUNT__ tests, no network, no browser
 npm run typecheck        # tsc --noEmit over src and test
 npm run build            # src/*.ts -> dist/*.js, what the tarball ships
+npm run serve            # dist/index.js, rebuilt first if it is not the build of this checkout
+npm run check:deploy     # is this checkout's dist current, and what is it behind
 node src/index.ts        # stdio, run from source; refuses to run interactively
 ```
 

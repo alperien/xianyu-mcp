@@ -161,6 +161,11 @@ const fromGit = (root: string): BuildStamp => ({
  * `scripts/check-deploy.mjs` fetches before calling this. A caller that wants a trustworthy `behind`
  * must fetch; a caller that wants a cheap answer gets one that is explicitly labelled as resting on
  * a cached ref.
+ *
+ * `base` may also be `''`, which asks for no comparison at all. That is for `scripts/serve.mjs`,
+ * which sits in front of every server start and needs only the local facts -- `behind` is then `null`
+ * and a note says it was not asked for, because the module's standing rule is that an unmeasured
+ * thing is not a verified thing, and silently leaving `behind: 0` would break it.
  */
 export const buildInfo = (root: string = packageRoot(import.meta.dirname), base = 'origin/main'): BuildInfo => {
   const notes: string[] = [];
@@ -176,8 +181,9 @@ export const buildInfo = (root: string = packageRoot(import.meta.dirname), base 
   else if (source === 'git') notes.push('this build carries no build-info.json, so the commit below is read from the checkout it sits in rather than recorded by the build -- a `npm run build` in this repository stamps it');
   if (facts.dirty === true) notes.push('the checkout had uncommitted changes when this was recorded, so the commit below may not be what actually ran');
 
-  const baseCommit = root ? git(root, ['rev-parse', base]) : '';
-  if (!baseCommit) notes.push(`${base} does not resolve here, so how far behind it is could not be measured`);
+  const baseCommit = root && base ? git(root, ['rev-parse', base]) : '';
+  if (!base && root) notes.push('no base ref was asked for, so how far behind one this build is was not measured');
+  else if (!baseCommit) notes.push(`${base} does not resolve here, so how far behind it is could not be measured`);
   // The subject of the comparison is the BUILD's commit, not the checkout's HEAD, and the difference is
   // the point of the whole module. They diverge the moment anyone pulls, switches branches, or commits
   // into the directory a deployed dist sits in -- which is ordinary, because that is what a checkout is
@@ -236,6 +242,58 @@ export const deployVerdict = (info: BuildInfo): { ok: boolean; reasons: string[]
   if (!info.built_at) reasons.push('there is no dist/ here to serve');
   else if (info.newest_source_at && info.newest_source_at > info.built_at) {
     reasons.push(`a source file is newer than dist/index.js (${info.newest_source_at} against ${info.built_at}), so the build predates the code beside it`);
+  }
+  return { ok: reasons.length === 0, reasons };
+};
+
+/**
+ * Whether the `dist/` in this checkout is the build of the tree sitting beside it -- the question a
+ * process start can actually answer, and a different one from `deployVerdict`.
+ *
+ * `deployVerdict` asks whether the build is current with a base ref, which needs the network: it is
+ * the right question before trusting a deployment, and the wrong one to put in front of every server
+ * start, because "how far behind main are we" is fixed by a pull and no amount of rebuilding can fix
+ * it. This asks the question a rebuild *can* fix: do the bytes in `dist/` correspond to the sources
+ * next to them. It is local -- one `git rev-parse`, a stat, a walk of `src/` -- so it costs a few
+ * milliseconds rather than a round trip, which is what lets `scripts/serve.mjs` run it on every
+ * spawn.
+ *
+ * `head` is the checkout's HEAD, passed in rather than read here, so this stays a pure function of
+ * stated facts exactly as `deployVerdict` is. `''` means this is not a git checkout at all -- an
+ * installed tarball -- and there is nothing to compare, so the commit rules are skipped rather than
+ * failed. Failing them would make the launcher refuse to serve the one case where it has no work to do.
+ *
+ * `info.dirty` is deliberately not a rule, and that is the part worth arguing about. Uncommitted
+ * sources do not make a `dist/` stale: once it has been built, the build *is* the tree, dirt and all,
+ * and `deployVerdict` reads dirtiness off the stamp, which a rebuild of a dirty tree sets again --
+ * keying freshness on it would rebuild on every single start, forever, and each rebuild would stamp
+ * itself dirty and trigger the next one. Freshness and provenance are different questions. What dirt
+ * costs is the ability to name the build as a clean commit, and that is `capabilities`' business, not
+ * this one's. A dirty tree whose sources are newer than its `dist/` is still caught below, by mtime.
+ *
+ * `now` exists so the mtime comparison has a ceiling, and so this stays a function of stated facts
+ * rather than of a clock nobody controls.
+ */
+export const serveVerdict = (info: BuildInfo, head: string, now = new Date().toISOString()): { ok: boolean; reasons: string[] } => {
+  const reasons: string[] = [];
+  // `now` bounds the mtime comparison, and it is a deliberate decision not to act, so it is worth
+  // stating. A source whose mtime is later than the moment this check ran is a clock disagreeing with
+  // ours, not an edit made after the build -- and believing it would rebuild on every spawn forever,
+  // because each rebuild lands at "now", which is still older than the file. Skew is real (a mounted
+  // checkout, a machine whose clock is minutes out) and the cost of getting this wrong is an `npm ci`
+  // per session for as long as the skew lasts. Nothing is hidden by ignoring it: `npm run check:deploy`
+  // prints the mtimes verbatim, so the absurd date is right there for whoever looks.
+  const predates = Boolean(info.newest_source_at) && info.newest_source_at! > info.built_at && info.newest_source_at! <= now;
+  if (!info.built_at) reasons.push('there is no dist/index.js here to serve');
+  else if (predates) {
+    reasons.push(`a source file is newer than dist/index.js (${info.newest_source_at} against ${info.built_at}), so the build predates the code beside it`);
+  }
+  if (head) {
+    // The order of these two matters only for which sentence a person reads first, but the second
+    // cannot be stated without the first: without a stamp there is no commit to compare to HEAD, and
+    // naming that as "unstamped" is the honest version of what is otherwise a confusing "built from ".
+    if (info.source !== 'stamp') reasons.push('this dist/ carries no build-info.json, so it cannot be shown to be the build of this checkout');
+    else if (info.commit !== head) reasons.push(`this dist/ was built from ${info.commit.slice(0, 7)} and this checkout is at ${head.slice(0, 7)}`);
   }
   return { ok: reasons.length === 0, reasons };
 };

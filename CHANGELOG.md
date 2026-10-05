@@ -23,6 +23,33 @@ and a dated section for it would be claiming a release that did not happen.
 
 ### Added
 
+- **`scripts/serve.mjs`, a launcher that will not start a server on a `dist/` it cannot vouch for.**
+  Point an MCP client at it instead of at `node dist/index.js` and a stale deployment stops being
+  possible rather than merely detectable. It compares the build's stamp against the checkout's HEAD at
+  every spawn; if they disagree it rebuilds and starts the rebuilt server, and if the rebuild cannot
+  produce a `dist/` matching the tree it exits nonzero and says which fact did not add up. There is no
+  flag to skip it and no env var to bypass it.
+  - *Why the spawn and not the pull.* The obvious chokepoint is a `post-merge` hook, and it is the
+    wrong one: `git post-merge` does not fire on a fast-forward, and a deployed checkout is
+    fast-forwarded. It would have missed precisely the case it was meant to cover while looking
+    correct under test with a real merge. This server is a local stdio process spawned per session, so
+    there is no restart event to hang a rebuild on and nothing anywhere notices a pull — which makes
+    the spawn the only point that ever sees both facts at once, the tree at commit X and the dist
+    claiming commit Y.
+  - *Why the pull is not made to fail.* It should not be. A pull has to be allowed to succeed, and the
+    rebuild belongs where a stale `dist/` can be caught rather than where it has to be prevented. The
+    loud failure is a failed start: one session lost, against every session in the drift window
+    answering plausibly with nothing in their answers saying otherwise.
+  - *What it costs when the build is already current.* About 40ms and no network, measured: one
+    `git rev-parse`, a stat, a walk of `src/`, and no base ref — so no `rev-list`, no fetch. The
+    staleness rules are not restated here; `serveVerdict` lives beside `deployVerdict` in
+    `src/build-info.ts`, and the full comparison — base ref, fetch, how far behind main — is
+    `npm run check:deploy`, which the launcher runs only when it is about to rebuild.
+  - *Three things it declines to do.* It does not treat an uncommitted tree as a stale `dist/` (that
+    would rebuild on every spawn forever, since a rebuild of a dirty tree is itself stamped dirty), it
+    does not treat a source file dated in the future as an edit made after the build (that would loop
+    for as long as the clock skew lasted), and it writes nothing at all to stdout, which is the
+    JSON-RPC channel.
 - **A `typed` block and a `missing` list on every listing.** `browse_feed`, `search_items`,
   `related_items`, `item_view` and `recommendations` each publish, beside the fields they already
   returned, a `typed` object reading the same values as types — `price_amount` as a number, epochs as

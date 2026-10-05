@@ -33,6 +33,7 @@
   },
   "scripts": {
     "start": "node dist/index.js",
+    "serve": "node scripts/serve.mjs",
     "test": "node --test",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build && npm run typecheck && npm test",
