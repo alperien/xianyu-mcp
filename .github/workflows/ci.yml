@@ -54,7 +54,10 @@ jobs:
             echo "dist/build-info.json is missing -- npm run build must call scripts/stamp-build.mjs"
             exit 1
           fi
-          node -e '
+          # --input-type=commonjs is not decoration: this package.json says "type": "module", and the
+          # runner is free to hand `node -e` to the ESM loader, where a bare `require` is a
+          # ReferenceError rather than a stamp check.
+          node --input-type=commonjs -e '
             const s = require("./dist/build-info.json");
             const { execFileSync } = require("node:child_process");
             const head = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
