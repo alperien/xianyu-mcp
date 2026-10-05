@@ -104,6 +104,25 @@ and a dated section for it would be claiming a release that did not happen.
   lives — *the lock is taken where a navigating page is read* — rather than as a list of tools, because
   `seller_profile` and `seller_items` are the case that breaks the list: mtop-only given a `user_id`,
   and one shared-lock item-page hop given an `item_id`, released before their mtop calls.
+- **The session's first load is paid at boot, in the background.** The first item page of a session
+  cost 12–21s and the first search 15–41s, all of it paid by whoever happened to ask first. A
+  warm-up at startup now pays it on a page of its own, which shares the browser context's HTTP cache
+  with the real pages and holds no lock, so nothing queues behind it. Measured across two runs of
+  alternating fresh sessions (n=8 per arm, 15 of 16 calls answered): the first `item_view` fell from a
+  median of 22.7s to 13.9s. It is fire-and-forget, every failure is caught and recorded rather than
+  raised, each tool that needs a page still loads one for itself, and `XIANYU_NO_WARMUP=1` skips it.
+  `capabilities` publishes the outcome under `cold_start_warm` — `pending` for a session's first few
+  seconds, `failed` if the warm-up lost, neither of which changes what any tool does.
+- **A load goofish declines is now named in seconds instead of after a minute and a half.** Its
+  risk-control page and its own error notice are 35 bytes of text with no mtop client and no detail
+  call behind them, so the page is read for them at load time: the wait for an mtop client that can
+  never arrive is skipped, and `item_view` stops after one load with the cause named instead of
+  spending five. A page that is merely slow says nothing here, and the marker alone is not trusted
+  without the emptiness — 10 healthy loads were checked and none was mistaken for a refusal.
+- The retry path was measured rather than assumed, and left alone: a plain reload of the document
+  this session already has is not cheaper than the cache-busted load (6.3s against 3.9s to
+  `domcontentloaded`, n=7 a side), so the nonce stays. The cold load a retry really pays is the
+  session's first one, and that is now paid at boot.
 
 ### Measured boundaries of the two seller endpoints
 

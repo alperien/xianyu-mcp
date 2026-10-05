@@ -223,10 +223,14 @@ a thin market at about 14s extra rather than letting a degraded page silently un
 
 `detail: N` reads the top N of the ranked results in full — description, every photo, and the seller
 with their city, tenure, sales count, rating, reply rate, signature and 芝麻 status. It is **one page
-load per listing — measured **7.5s and 10.1s** on the same box at different loads — and it does not
-parallelise**: four browser tabs loading four item pages at once measured 8.2s per listing against
-~9s serially, because goofish throttles per IP. Concurrency buys nothing and only risks more
-declines, so it is walked serially. Budget for 6–9 minutes on 50.
+load per listing — measured at a median of 13.4s warm** (n=8, 8/8 answered: 4.5s to `domcontentloaded`,
+then goofish's own detail call lands 9–17s after that) — and it is walked serially. That serial walk is
+deliberate, and the reason was re-measured rather than assumed: `item_view` cannot be an SPA route
+change (0/8 answered in 32s — the item page is a micro-frontend with no reachable router and no item
+links to click), while four pages loading four listings at once does cut the batch's wall clock when
+the site is healthy (27.1s for 4 against 66.3s serially, 2.4×) but loses answers outright when it is
+not (0/4 answered against 2/4 serially) and doubles each listing's own latency. So it buys throughput
+by risking the answers, which is not a trade this server makes silently. Budget for 6–11 minutes on 50.
 
 **`search_items("thinkpad x220", pages: 2, limit: 50, detail: 50)`, measured:**
 

@@ -979,7 +979,7 @@ const capabilities = async (): Promise<Data> => {
       'item page load': 'a full page load per listing, warm: median 13.4s (n=8, 8/8 answered) -- 4.5s to domcontentloaded, then goofish\'s own detail call lands 9-17s after that. item_view cannot skip the load: an SPA route change answered 0/8 in 32s, because the item page is a micro-frontend with no reachable router and no item links (measured, xi-x8x). 20 listings is about 4.5 minutes, 50 is about 11',
       'four listings at once': '27.1s of wall clock for 4 against 66.3s serially -- 2.4x, not 4x, and each listing\'s own latency roughly doubles (11.4s -> 20.5s). Measured but not built: it needs four DOM pages, which is the invariant the shared navigating page exists to keep, and the fan-out loop is search_items\' own',
       'cold start': 'the session\'s first load is paid in the background at boot rather than on your first call; see cold_start_warm for whether it got there',
-      'search, warm page': '4-12s (an SPA route change); the first search of a session pays 15-41s for a cold load',
+      'search, warm page': '4-12s (an SPA route change -- search does route, unlike the item page); the first search of a session used to pay 15-41s for a cold load, which the boot warm-up now pays instead',
       'search pager walk': '30 listings a page at 5-9.5s each, against 13-25s for a fresh page load',
       'how many of a page match': 'varies a lot -- across three sessions `pages: 2` gave 25, 28 and 55 matches of 60 scanned, and `pages: 4` gave 81 of 90. Read `count`; do not assume 30 a page',
       'deep comparison, measured': '`pages: 2, limit: 50, detail: 50` returned 50 full listings, 39 fields and 247 photos, no failures, in 410s',
