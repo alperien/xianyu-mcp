@@ -34,9 +34,11 @@ test('no credential access anywhere in the tree', () => {
   // The tree is pinned by name, not by a count: a scan that silently stops covering a file -- or one
   // that silently starts covering a sixth source file -- is the failure mode here, not a raw credential.
   // build.ts and build-info.ts are in the list deliberately: they read the filesystem and shell out to
-// git, which is the only place in src/ that touches anything outside the goofish session, so the
-// credential scan below has to be able to see them.
-assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/tools.ts', 'test/build-info.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/tools.test.ts']);
+  // git, which is the only place in src/ that touches anything outside the goofish session, so the
+  // credential scan below has to be able to see them. `src/cache.ts` is in it for the same reason one
+  // layer down: a module that holds what this server has read off goofish is exactly the module the
+  // scans must cover, and a scan that quietly does not cover it is worse than no scan.
+  assert.deepEqual(sources.map((p) => p.replace(`${ROOT}/`, '')).sort(), ['src/browser.ts', 'src/build-info.ts', 'src/build.ts', 'src/cache.ts', 'src/errors.ts', 'src/extract.ts', 'src/index.ts', 'src/tools.ts', 'test/build-info.test.ts', 'test/cache.test.ts', 'test/check-deploy.test.ts', 'test/extract.test.ts', 'test/invariants.test.ts', 'test/tools.test.ts']);
   // `.cookies(` rather than `context.cookies(`, and matched with the whitespace stripped: matching
   // the literal missed `page.context().cookies()` and any call split across lines.
   const forbidden = [

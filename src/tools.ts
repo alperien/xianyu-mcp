@@ -18,6 +18,8 @@ import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
 import { buildBlock } from './build.ts';
+import { getItem, getSearchPage, itemKey, itemTtl, missed, notCached, pageReport, putItem, putSearchPage, searchTtl, stats as cacheStats } from './cache.ts';
+import type { CacheVerdict } from './cache.ts'; (WIP: TTL cache for item detail and search pages, staleness published (xi-byi))
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
@@ -90,6 +92,10 @@ const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
 // The pager only ever renders boxes 1..10 (`1 2 ... 10 ... 50`), so 10 pages is as deep as this
 // route goes without clicking the ellipsis: 300 listings, against the 50 a comparison needs.
 const MAX_SEARCH_PAGES = 10, MAX_SEARCH_DETAIL = 50;
+// How many extra pages a walk may take when the ones it was asked for leave fewer than `limit`
+// matches. It is named here rather than inside the walk because the cache fast path has to know the
+// deepest page a call could reach before it decides whether it can answer without a browser at all.
+const SEARCH_TOPUP_PAGES = 2;
 // The whole pager: ten numbered boxes at 30 listings a page. That is the most a walk can collect,
 // and it is also the bound a huge walk has to respect alongside the wall clock.
 const MAX_SEARCH_ITEMS = MAX_SEARCH_PAGES * 30, DEFAULT_SEARCH_ITEMS = 120;
@@ -492,6 +498,32 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
   // `detail: 50` needs minutes and the flat 90s default would have silently refused most of
   // them -- the 8-deep case measured 0/8 answered before this.
   const started = Date.now(), deadline = started + budget('SEARCH', detail > 0 ? Math.min(600, 60 + detail * 10) : 90) * 1000;
+  // The deepest page this call could reach, needed before the walk starts: it is the last page the
+  // cache fast path has to find before it can answer with no page in the process at all.
+  const deepLimit = Math.min(MAX_SEARCH_PAGES, pagesWanted + SEARCH_TOPUP_PAGES);
+  // The whole call can end here. If every page this search asked for is already in the cache there is
+  // nothing to ask goofish: no page load, no keystroke, no mtop call, and therefore no chance of being
+  // declined by a site that declines some loads. The pooled pages go through the same relevance guard
+  // a live walk is held to (`finishSearch`), and normalising them needs no page -- FEED_NORMALIZE_JS
+  // is a pure function over cards we already hold, which is the very reason it is the one in-page
+  // script allowed to run without the URL re-check.
+  const cachedLines: { page: number; hit: boolean; age_s: number | null }[] = [], pooled: any[] = [];
+  for (let pn = 1; pn <= pagesWanted; pn++) {
+    const warm = getSearchPage(q, pn);
+    if (!warm) { pooled.length = 0; break; }
+    pooled.push(warm.value);
+    cachedLines.push({ page: pn, hit: true, age_s: warm.verdict.age_s });
+  }
+  if (pooled.length === pagesWanted) {
+    const found = await finishSearch(pooled, q, cap, (rows) => FEED_NORMALIZE_JS({ rows }));
+    // A cached pool that no longer passes the guard is not an answer, and neither is a short one: a
+    // caller who asked for three pages does not get two and a note. Either way, fall through to the
+    // live search rather than publish a set this code would have refused a moment ago.
+    if (found) {
+      log.push({ via: 'cache', pages: pooled.length, results: found.scanned, note: `every page this search asked for was already cached, so goofish was not asked at all; ages are in the cache block below` });
+      return publishSearch(session, q, found, detail, deadline, { query: q, source: 'search_api', via: 'cache', account_required: false, attempts: 0, attempt_log: log, cache: pageReport(cachedLines), ...found });
+    }
+  }
   for (let attemptNo = 1; attemptNo <= maxAttempts; attemptNo++) {
     // A failed page load is a declined attempt, not a fatal error: this network throws ERR_INSUFFICIENT_RESOURCES / ERR_ADDRESS_UNREACHABLE often enough that aborting the whole call would make search useless. The clock is checked at the foot of the loop either way, so ten failed loads cannot outrun the budget.
     payload = {};
@@ -524,17 +556,26 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
         // Walk the pager for the rest. One reply is 30 listings and the search API cannot be
         // re-issued (replaying the page's own payload through the same client answers TIMEOUT), so the
         // page's own pager is the only way deeper -- and it is much cheaper than a fresh load.
-        const replies = [reply.data];
+        const replies = [reply.data], pageLines: { page: number; hit: boolean; age_s: number | null }[] = [{ page: 1, hit: false, age_s: null }];
+        // The page was just asked, so page 1 is live whatever was cached under it -- and it refreshes
+        // the entry. A fresh answer is never discarded in favour of one this process already had.
+        putSearchPage(q, 1, reply.data);
         // Walking the pager is not deterministic: page 3 sometimes returns items already seen on
         // pages 1-2, and a degraded page can match far fewer than its 30. Measured across three
         // sessions, `pages: 2` yielded 25, 28 and 55 matches out of 60 scanned. For a caller who asked
         // for `limit` listings that is a silent shortfall, so the walk tops up -- bounded, so a
         // genuinely thin market cannot turn a cheap call into an expensive one.
         const seen = () => new Set(replies.flatMap((d) => searchListings(d).map((c) => c?.detailParams?.itemId).filter(Boolean))).size;
-        const TOPUP_PAGES = 2;
-        for (let want = 2; want <= Math.min(MAX_SEARCH_PAGES, pagesWanted + TOPUP_PAGES); want++) {
+        for (let want = 2; want <= deepLimit; want++) {
           if (want > pagesWanted && seen() >= cap) break;
           if (Date.now() >= deadline) { log.push({ stopped: `time budget reached at page ${want}` }); break; }
+          // A page this process already walked costs nothing to re-read, and the pager click it would
+          // otherwise take is 5-9.5s. It is pooled with the live pages and judged by the same guard;
+          // its age is published per page in the `cache` block, because a walk whose pages were read
+          // at different moments is the normal case here and one age for the whole set would be a
+          // claim about a set that does not exist.
+          const warm = getSearchPage(q, want);
+          if (warm) { replies.push(warm.value); pageLines.push({ page: want, hit: true, age_s: warm.verdict.age_s }); log.push({ pager: want, cache: 'hit', age_s: warm.verdict.age_s, items: searchListings(warm.value).length }); continue; }
           // The reply arrives a moment before the pager finishes rebuilding itself, and clicking in
           // that window finds no page box at all -- measured as `pages: 3` walking one page and then
           // giving up with "no such page box" on a pager that plainly had one. So wait until the pager
@@ -547,18 +588,15 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
           if (!next?.ok) { log.push({ pager: want, ok: false, why: next ? `mtop said ${next.ret}` : 'no reply' }); break; }
           const n = searchListings(next.data).length;
           replies.push(next.data);
+          pageLines.push({ page: want, hit: false, age_s: null });
+          putSearchPage(q, want, next.data);
           log.push({ pager: want, ok: true, items: n });
         }
-        const found = await finishSearch(page, replies, q, cap);
+        const found = await finishSearch(replies, q, cap, (rows) => evaluate(page, FEED_NORMALIZE_JS, { rows }, 'search normalization'));
         if (found) {
           log.push({ attempt: attemptNo, via, source: 'search_api', pages: replies.length, results: found.scanned });
-          const out = { query: q, source: 'search_api', via, account_required: false, attempts: attemptNo, attempt_log: log, ...found };
-          if (detail < 1) return out;
-          const deep = await enrichDetails(session, found.items, detail, deadline, out.items);
-          return { ...out, items: deep.items, detail_requested: deep.report.requested, detailed: deep.report.ok, detail_ms: deep.report.ms_total,
-            // Per-listing outcomes, so a caller knows exactly which of the fifty it got in full and
-            // which are still cards -- rather than having to infer it from a missing field.
-            detail_report: deep.report.per_listing };
+          const out = { query: q, source: 'search_api', via, account_required: false, attempts: attemptNo, attempt_log: log, cache: pageReport(pageLines), ...found };
+          return publishSearch(session, q, found, detail, deadline, out);
         }
       }
       if (reply && !reply.ok) log.push({ attempt: attemptNo, via, search_api_ret: reply.ret });
@@ -579,7 +617,7 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
         // Only the matches, so `count` and every item agree with each other and with the query.
         const items = rankItems(withTyped(dedupe(payload.items.filter((i: any) => i.matches_query))), cap);
         for (const it of items) rememberCard(it);
-        return { query: q, source: 'search_page_dom', via, account_required: false, attempts: attemptNo, attempt_log: log, query_hits: hits, token_hits: tokenHits, matched_by: hits === tokenHits ? 'phrase' : 'all_terms', min_query_hits: minHits, scraped_cards: cards, non_matching_count: Math.max(0, cards - tokenHits), count: items.length, items };
+        return { query: q, source: 'search_page_dom', via, account_required: false, attempts: attemptNo, attempt_log: log, cache: notCached('this page of results', searchTtl()), query_hits: hits, token_hits: tokenHits, matched_by: hits === tokenHits ? 'phrase' : 'all_terms', min_query_hits: minHits, scraped_cards: cards, non_matching_count: Math.max(0, cards - tokenHits), count: items.length, items };
       }
     }
     if (Date.now() >= deadline) { log.push({ attempt: attemptNo, stopped: 'time budget reached' }); break; }
@@ -594,6 +632,23 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
   throw new SearchUnavailableError(`goofish never served a usable result set for ${JSON.stringify(q)} in ${Math.round((Date.now() - started) / 1000)}s, over ${attemptsMade} attempt(s) of which ${typed} typed the query into the search box. `
     + 'Search here is a keystroke, not a URL: navigating to /search?q= is measured to serve the 猜你喜欢 rail instead of results (20 cards, zero query hits), so the query is typed into the header input and submitted. Typed attempts fail in four ways, all retried, and the counts say which: `no-search-input-on-homepage` means the page came back as a footer-only shell with no input at all, `incomplete-keystrokes` means the SPA re-rendered the input mid-typing and swallowed part of the query (`typed` is what actually landed, `wanted` the full query; the input is refocused and the tail re-sent before this is reported), `enter-did-not-submit` means the keys landed (`typed`) but the router never moved off `/`, and a `blocked: true` attempt is goofish serving its "非法访问 / 请使用正常浏览器" page instead of the app, which is server-side and lifts after a pause. A `search_api_ret` is goofish\'s own refusal of the search call itself, most often RGV587 ("被挤爆啦") when the anonymous IP is being throttled. A `token_hits` above `query_hits` means the page held matches that contain every word of the query but not the query as one substring.\n  stopped on: '
     + `${log.find((e) => e.stopped)?.stopped || 'the attempt count'}\n  last attempt: ${JSON.stringify(last)}\n  page text: ${JSON.stringify(String(payload.text_preview || '').slice(0, 140))}\n  the wall-clock budget XIANYU_SEARCH_BUDGET_S (90s default) is what bounds the retries, and one attempt is a page load only when the page is cold -- a warm page re-searches in seconds. browse_feed, search_count and search_suggest are unaffected, do not drive a browser page, and always work.`);
+};
+
+/** Publish a pooled search answer, deepening it when the caller asked for `detail`.
+ *
+ *  One function for both routes into a pooled answer -- off the wire, and out of the cache -- because
+ *  the two must not be able to differ in what they honour. The cache fast path was written first and
+ *  returned the pool as it stood, which meant a `detail: 1` call answered from the cache with plain
+ *  cards and no `detail_report` at all: a silent downgrade wearing the same envelope, and the worst
+ *  shape this server can take an answer in. The depth still costs what it costs -- a listing this
+ *  process has not read in full is read now, and `detail_report` says which ones came from the cache. */
+const publishSearch = async (session: any, q: string, found: any, detail: number, deadline: number, out: any): Promise<Data> => {
+  if (detail < 1) return out;
+  const deep = await enrichDetails(session, found.items, detail, deadline, out.items);
+  return { ...out, items: deep.items, detail_requested: deep.report.requested, detailed: deep.report.ok, detail_ms: deep.report.ms_total,
+    // Per-listing outcomes, so a caller knows exactly which of the fifty it got in full and
+    // which are still cards -- rather than having to infer it from a missing field.
+    detail_report: deep.report.per_listing };
 };
 
 /** Is the dom page already sitting somewhere with a usable search input, so a search can be typed
@@ -613,15 +668,21 @@ const warmInputUsable = async (session: any): Promise<boolean> => {
  *  believable result set for this query. The same relevance guard as the DOM path: a *fraction* of
  *  the results have to really carry the query, so a rail can never be presented as results. A result
  *  carries it by containing the phrase, or by containing every term of it in any order -- see
- *  `queryTerms`, which is the difference between this working on this site and returning nothing. */
-const finishSearch = async (page: Page, payloads: any[], q: string, cap: number): Promise<any | null> => {
+ *  `queryTerms`, which is the difference between this working on this site and returning nothing.
+ *
+ *  The normaliser is passed in rather than reached for through a page, because the same pooled
+ *  payloads are judged twice: once when they arrive off the wire, and once when every page of them
+ *  came from the cache and there is no page in the process at all. Passing the function rather than
+ *  duplicating the call keeps one guard and one normaliser, which is the property that stops a cached
+ *  answer from being a laxer one. */
+const finishSearch = async (payloads: any[], q: string, cap: number, normalize: (rows: any[]) => any[] | Promise<any[]>): Promise<any | null> => {
   // Every page walked contributes its 30 listings, and they are pooled before the guard runs: the
   // fraction has to be over the whole result set, or page 2 could be judged on 30 cards while the
   // answer claims a hundred.
   const cards: any[] = [];
   for (const d of payloads) cards.push(...searchListings(d));
   if (!cards.length) return null;
-  const normalized = await evaluate(page, FEED_NORMALIZE_JS, { rows: cards }, 'search normalization');
+  const normalized = await normalize(cards);
   const low = q.toLowerCase(), terms = queryTerms(q);
   const all = withTyped(dedupe((normalized || []).filter((i: any) => i.item_id)));
   if (!all.length) return null;
@@ -676,7 +737,9 @@ const enrichDetails = async (session: any, ranked: any[], want: number, deadline
     try {
       const read = await readListing(session, String(t.item_id), deadline);
       const card = byId.get(String(t.item_id));
-      if (read.listing) { Object.assign(card, read.listing, { detail_source: read.listing.source, detailed: true }); report.push({ item_id: t.item_id, ok: true, ms: Date.now() - t0, source: read.listing.source }); }
+      // Per-listing cache state, so a `detail: 50` run that answered half of them from the cache says
+      // which half and how old it is, rather than looking like 50 equally fresh page loads.
+      if (read.listing) { Object.assign(card, read.listing, { detail_source: read.listing.source, detailed: true, cached: read.cache.hit, cache_age_s: read.cache.age_s }); report.push({ item_id: t.item_id, ok: true, ms: Date.now() - t0, source: read.listing.source, cached: read.cache.hit, cache_age_s: read.cache.age_s }); }
       else { card.detailed = false; report.push({ item_id: t.item_id, ok: false, why: read.payload?.api_ret || read.payload?.site_error ? `goofish said: ${read.payload.api_ret || 'its own error page'}` : 'the page would not answer' }); }
     } catch (e: any) { report.push({ item_id: t.item_id, ok: false, why: `${e?.error_type ?? 'Error'}: ${String(e?.message ?? e).slice(0, 80)}` }); }
   }
@@ -732,6 +795,10 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
     return { ...l, item_id: item, page_item_id: item, url: `${HOME}item?id=${item}`, account_required: false,
       attempts: read.tries, wants: asCount(l.want_count), browses: asCount(l.browse_count),
       reco_anchors: 0, image_candidates: (l.image_urls || []).length,
+      // The cache decision travels with the answer, always. `attempts: 0` beside `cache.hit: true`
+      // means no page was loaded and goofish was never asked -- which is a ~0s repeat view, and is
+      // only safe to publish as such if it is also impossible to mistake for a live read.
+      cache: read.cache,
       fields_present: ITEM_FIELDS.filter((f) => present(l[f])), fields_missing: ITEM_FIELDS.filter((f) => !present(l[f])) };
   }
   // Nothing to report. Name the cause rather than the symptom.
@@ -754,8 +821,21 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
  *  has loaded: the first version of the `detail` argument reused this function without the load and
  *  quietly produced zero details for every listing, since a page sitting on a search results page
  *  never issues a detail call. That failure is invisible in the envelope unless you ask, which is
- *  exactly why `search_items` publishes `detail_report`. */
-const readListing = async (session: any, item: string, deadline: number): Promise<{ listing: any | null; payload: any; tries: number; page: Page }> => {
+ *  exactly why `search_items` publishes `detail_report`.
+ *
+ *  It is also the one seam the listing cache sits on, which is why it is here rather than in
+ *  `item_view`: `item_view`, the `detail` argument and `resolveSeller`'s hop all come through this
+ *  function, so one check covers all three and none of them can grow a private one. The check runs
+ *  *before* the navigation, because that is the entire saving -- an item page load is 4-10s measured
+ *  -- and every return carries the `cache` verdict, which is what keeps a repeat view from reading as
+ *  a live one. A hit returns `page: null` because it opened nothing; no caller of this function
+ *  reads `page` (they read `listing`, `tries` and `payload`), which is why that is safe. */
+const readListing = async (session: any, item: string, deadline: number): Promise<{ listing: any | null; payload: any; tries: number; page: Page | null; cache: CacheVerdict }> => {
+  const warm = getItem(item);
+  if (warm) return { listing: warm.value, payload: {}, tries: 0, page: null, cache: warm.verdict };
+  // Published on every miss as well as every hit, so the envelope's shape does not depend on where
+  // the answer came from -- the same rule the typed/missing block follows per listing route.
+  const live = (): CacheVerdict => missed(itemKey(item), itemTtl(), 'this listing');
   const page = await session.open(`${HOME}item?id=${item}`);
   let payload: any = {}, tries = 0;
   for (tries = 1; tries <= RENDER_ATTEMPTS; tries++) {
@@ -769,7 +849,11 @@ const readListing = async (session: any, item: string, deadline: number): Promis
         // detail payload carries the seller's province and city, the transport fee, the create and
         // modify epochs and the 成色 attribute, none of which a card has.
         const listing = detailListing(reply.data, item);
-        if (listing) return { listing: { ...enrichListing(listing), source: 'item_detail_api' }, payload, tries, page };
+        if (listing) {
+          const full = { ...enrichListing(listing), source: 'item_detail_api' };
+          putItem(item, full);
+          return { listing: full, payload, tries, page, cache: live() };
+        }
         // It answered with a different listing, or with no listing at all. That is a page that is not
         // the one that was asked for, and the id check below would refuse it -- but saying so now is
         // cheaper than waiting out a poll that cannot change it.
@@ -797,10 +881,11 @@ const readListing = async (session: any, item: string, deadline: number): Promis
     // Last resort before giving up: a listing this process already returned from a search. That is
     // the ordinary "search, then open a result" sequence, and a card is a real listing -- but it is a
     // card, so `source` says so and the fields only the detail page has are named as missing rather
-    // than left looking read.
+    // than left looking read. This route is deliberately NOT stored in the TTL cache: a five-field
+    // card held for its TTL would turn one degraded read into a window of them, and the cache is only
+    // ever worth having when what it holds is something goofish read in full.
     const cached = seenIds.get(item);
-    if (cached) {
-      // Unless this same process already read it in full. `search_items`'s `detail` argument merges
+    if (cached) {      // Unless this same process already read it in full. `search_items`'s `detail` argument merges
       // the detail fields into the very card object the cache holds, so a listing deepened earlier in
       // this session comes back with a description and a seller's statistics -- and blanking those
       // here would throw away data we were actually holding. The blanking is for the plain-card case
@@ -809,9 +894,9 @@ const readListing = async (session: any, item: string, deadline: number): Promis
       const fields = { ...cached, ...blank, item_id: item, page_item_id: item };
       return { listing: { ...enrichListing(fields), source: 'search_card_cache', attempts: tries, page_attempts: tries,
         note: `the item page did not answer for this listing (${payload?.api_ret || payload?.site_error ? 'refused' : 'rendered no detail block'}), so this is the listing as an earlier ${cached.detailed ? 'detail read' : 'search'} in this session published it${cached.detailed ? '' : '. The description, the want and browse counts and the seller\'s statistics live on the item page and are reported missing rather than guessed'}.`,
-        ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])) }, payload, tries, page };
+        ...Object.fromEntries(ITEM_FIELDS.map((f) => [f, fields[f] ?? (f === 'image_urls' ? [] : '')])) }, payload, tries, page, cache: live() };
     }
-    return { listing: null, payload, tries, page };
+    return { listing: null, payload, tries, page, cache: live() };
   }
   // Unconditional: a page that renders the detail block but has no `?id=` in its URL is a redirect or
   // a challenge page, not the listing, and skipping the check when `served` is empty is what let an
@@ -822,7 +907,9 @@ const readListing = async (session: any, item: string, deadline: number): Promis
   // is null here and `missing` says so by name. That is the honest answer for this route rather than a
   // thinner one: the keys are the same either way, and a caller can tell which route answered.
   const rendered = Object.fromEntries(ITEM_FIELDS.map((f) => [f, payload[f] ?? (f === 'image_urls' ? [] : '')]));
-  return { listing: { ...enrichListing(rendered), source: 'item_page_dom' }, payload, tries, page };
+  const listing = { ...enrichListing(rendered), source: 'item_page_dom' };
+  putItem(item, listing);
+  return { listing, payload, tries, page, cache: live() };
 };
 
 /** What this server can and cannot do right now, verified against the live site. A diagnostic must never be the thing that crashes, so every probe is guarded and reported as status rather than raised -- including a browser that has gone away. */
@@ -840,6 +927,10 @@ const capabilities = async (): Promise<Data> => {
       note: 'the commit below is what is answering your calls right now; `npm run check:deploy` is the same comparison run deliberately, and it fetches before counting',
       ...buildBlock(),
     },
+    // The cache is reported here rather than only inside a `cache` block on an answer, so an agent can
+    // find out it exists before it has relied on one -- and so "this listing may be up to 45s old" is
+    // something a caller chose rather than something that happened to it.
+    cache: cacheStats(),
     works_without_account: [
       'browse_feed: paged homepage feed, 20 listings/page, live inventory',
       'search_count / search_suggest: match counter and autocomplete, both undeclined',
@@ -951,10 +1042,10 @@ export const TOOLS: ToolDef[] = [
   tool({ name: 'browse_feed', description: 'Page through goofish\'s public homepage feed: live listings with item_id, title, price, city, seller, want_count and image_urls. Not keyword-filterable, so use it to sample inventory, not to answer a query. Args: page_number (1-10000, default 1), pages (1-25, default 1), limit (max items, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'How many goofish listings match a keyword, and whether there are any. Unlike search_items this is not subject to goofish\'s per-page-load declines -- verified returning about 28,800 for "x220" and 0 for a nonsense string anonymously. Args: query (str).' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'goofish\'s own search-box autocomplete: keyword suggestions for a prefix, plus the total suggestion count. Args: query (str), limit (default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
-  tool({ name: 'search_items', description: 'Search goofish listings by keyword, logged out. Depth is two arguments. `pages` (1-10, default 1) walks the result pager for 30 listings a page; it is a floor, not a ceiling -- if the pages walked leave fewer than `limit` matches, up to two more are walked. Read `count` rather than assuming 30 a page. `detail` (0-50, default 0) reads that many of the top-ranked results in full -- description, every photo, and the seller with their city, tenure, sales count, rating, reply rate and signature -- one page load each that does not parallelise, so budget roughly a minute per 8; `detail_report` names which answered and what goofish said about the ones that did not. Cards already carry price, want count, city, seller, avatar, photo and tags, so ask for `detail` only on a shortlist. `items` holds just the listings whose titles really carry the query -- as the phrase, or as every term in any order, which is what makes Chinese work (`机械硬盘4t` has 70,000+ listings; the titles read 西数4T机械硬盘). `matched_by` says which rule admitted the set. The recommendation rail is never returned as results; goofish declines some page loads outright, so this retries and may raise `SearchUnavailableError`. For measured costs, call capabilities. Args: query (str), limit (default 120, capped by XIANYU_SEARCH_MAX_ITEMS), attempts (1-10, default 4; the first 3 type into the search box, the last is a direct-URL fallback), pages (1-10, default 1), detail (0-50, default 0).' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
+  tool({ name: 'search_items', description: 'Search goofish listings by keyword, logged out. Depth is two arguments. `pages` (1-10, default 1) walks the result pager for 30 listings a page; it is a floor, not a ceiling -- if the pages walked leave fewer than `limit` matches, up to two more are walked. Read `count` rather than assuming 30 a page. `detail` (0-50, default 0) reads that many of the top-ranked results in full -- description, every photo, and the seller with their city, tenure, sales count, rating, reply rate and signature -- one page load each that does not parallelise, so budget roughly a minute per 8; `detail_report` names which answered and what goofish said about the ones that did not. Cards already carry price, want count, city, seller, avatar, photo and tags, so ask for `detail` only on a shortlist. `items` holds just the listings whose titles really carry the query -- as the phrase, or as every term in any order, which is what makes Chinese work (`机械硬盘4t` has 70,000+ listings; the titles read 西数4T机械硬盘). `matched_by` says which rule admitted the set. The recommendation rail is never returned as results; goofish declines some page loads outright, so this retries and may raise `SearchUnavailableError`. A search whose (query, page) set this process has already walked answers from the cache with no page load at all -- `via: \'cache\'`, `attempts: 0` -- and a deeper walk reuses the pages it already has instead of clicking the pager again (5-9.5s a page); `cache` reports every page, whether it was a hit and how old it is, and read a listing before relying on its price. For measured costs, call capabilities. Args: query (str), limit (default 120, capped by XIANYU_SEARCH_MAX_ITEMS), attempts (1-10, default 4; the first 3 type into the search box, the last is a direct-URL fallback), pages (1-10, default 1), detail (0-50, default 0).' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
   tool({ name: 'related_items', description: 'Listings goofish recommends for a given item ("more like this"), or its generic recommendation set when item_id is omitted. Returns real listings with titles, prices and cities. Args: item_id (optional digits or item URL), limit (default 30), page (1-10000, default 1).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
   tool({ name: 'seller_profile', description: 'One seller\'s public profile, logged out: display name, avatar, signature, credit tier (卖家信用极好), shop level and score, praise ratio, review count, follower and listing counts, and whether they have passed real-name, real-person and 芝麻 checks. Pass `user_id` (the id item_view and this tool report, or the one in a goofish /personal?userId= URL) for a direct mtop call, or `item_id` to mean "whoever is selling this listing" -- which first loads the listing\'s page -- one page load, and on the loads goofish declines item_view\'s own retry loop absorbs the cost -- and additionally returns their city, tenure, sales count and positive rate, the four facts the profile endpoint does not carry. Exactly one of the two; passing both is refused rather than guessed. Fields the call could not fill come back null and are named in `fields_missing` rather than blank. Args: user_id (optional digits), item_id (optional digits or item URL).' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
   tool({ name: 'seller_items', description: 'The listings one seller currently has up, logged out -- the 宝贝 tab of their goofish profile, with title, price, category, photo, want count and the label strip. On a site with no ratings and no feedback threads this is the whole of due diligence, and nothing else here can answer it. Pass `user_id` for a direct mtop call, or `item_id` to mean that listing\'s seller (which costs one item page load). `has_more` comes from goofish\'s own `nextPage`; walk `page` rather than assuming 20 a page. Args: user_id (optional digits), item_id (optional digits or item URL), limit (default 20), page (1-50, default 1 -- goofish serves at most 50 pages of 20 here, so walk `has_more` rather than asking for a page number up front).' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),
-  tool({ name: 'item_view', description: 'Read one listing, logged out -- title, price, want and browse counts, the description, the seller with their city, tenure, sales and rating, the brand and condition, and every photo. `source` says which route answered -- `item_detail_api` is the full listing, `item_page_dom` is the rendered page, `search_card_cache` is an earlier search result in this session and is missing the description and the seller statistics, which `fields_missing` names rather than guessing. Most often an id that cannot be read has been sold or removed; that raises `DetailUnavailableError`. Args: item_id (digits or item URL).' + NO_ACCOUNT, schema: ITEM_ARGS, run: locked(itemView) }),
+  tool({ name: 'item_view', description: 'Read one listing, logged out -- title, price, want and browse counts, the description, the seller with their city, tenure, sales and rating, the brand and condition, and every photo. `source` says which route answered -- `item_detail_api` is the full listing, `item_page_dom` is the rendered page, `search_card_cache` is an earlier search result in this session and is missing the description and the seller statistics, which `fields_missing` names rather than guessing. Most often an id that cannot be read has been sold or removed; that raises `DetailUnavailableError`. A listing this process has already read in full is served again from its own cache in ~0s instead of 4-10s, and says so: `cache.hit`, `cache.age_s` and `cache.ttl_s` are on every answer, hit or not, because a listing read 40s ago may since have been sold or repriced -- `XIANYU_CACHE=0` turns the cache off for a live read. Args: item_id (digits or item URL).' + NO_ACCOUNT, schema: ITEM_ARGS, run: locked(itemView) }),
   tool({ name: 'recommendations', description: 'Scrape goofish\'s recommendation rails (猜你喜欢 / 为你推荐) for an anonymous visitor from any goofish page. Falls back to live feed listings if the DOM will not cooperate, and says so in `source` and `fallback_reason`. Args: limit (default 30), url (optional goofish page to load, default the homepage).' + NO_ACCOUNT, schema: RECO_ARGS, run: locked(recommendations) }),
 ];

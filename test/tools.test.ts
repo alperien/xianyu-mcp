@@ -15,6 +15,7 @@ import { BOOT_URL, exclusive, HOME, reloadFresh, Session, setSession } from '../
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
 import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
 import { budget, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
+import { reset as resetCaches } from '../src/cache.ts';
 import { z } from 'zod';
 
 const run = (name: string) => {
@@ -176,9 +177,11 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
   use(s);
   return { s, page };
 };
-// The search-card cache is module state that outlives a call, so it is cleared between tests the same
-// way the env budget is: a test that seeds it would otherwise have the next item_view answered from it.
-test.afterEach(() => { setSession(null); resetCardCache(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; });
+// The search-card cache and the TTL cache are both module state that outlives a call, so they are
+// cleared between tests the same way the env budget is: a test that seeded one would otherwise have
+// the next item_view or search_items answered from it -- and, worse, would stop exercising the
+// refusal paths, since a cached listing never reaches them.
+test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -614,7 +617,11 @@ test('item_view reads the page for a listing a search already returned, and fall
   assert.equal(out.seller, '卖家');
   assert.equal(out.browse_count, '900');
 
-  // the page will not answer: then, and only then, the card this process already holds answers
+  // the page will not answer: then, and only then, the card this process already holds answers.
+  // The TTL cache is cleared first, because a listing already read *in full* above is a better answer
+  // than the card and is served without consulting the page at all -- so this half is about what a
+  // process that has never read this listing in full does, which is what a cold one always does.
+  resetCaches();
   use(makeSession({ item: [UNRENDERED, UNRENDERED, UNRENDERED] }));
   const fallback = await run('item_view')({ item_id: '856961429564' });
   assert.equal(fallback.source, 'search_card_cache');
@@ -771,6 +778,10 @@ test('search_items walks the pager for more pages, and the guard runs over the w
   assert.ok(deep.count > 0);
 
   // And the other half: a pool that already satisfies `limit` does not walk past what was asked for.
+  // Cleared first, and that is the point: the walk above left pages 1-3 of this exact query in the
+  // cache, so without a clear this second call would be answered from it -- correctly, and without
+  // walking anything, which is the behaviour the previous line proves rather than this one.
+  resetCaches();
   const s2 = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [page(1, t1), page(2, t2), page(3, t3)] } }));
   s2.runRealNormalizer = true;
   const exact = await run('search_items')({ query: 'x220', pages: 2, limit: 10, attempts: 1 });
@@ -1263,7 +1274,10 @@ test('seller_items given an item_id resolves the seller first, off the listing\'
   assert.equal(out.item_id, '42');
   assert.equal(out.profile_url, 'https://www.goofish.com/personal?userId=2214350705775');
   // A listing whose detail reply carries no seller id has no seller to look up, and the message says
-  // what to do instead rather than leaving the caller with a dead id.
+  // what to do instead rather than leaving the caller with a dead id. Cleared first: the lookup above
+  // read this very listing in full and cached it, and a cache hit -- which asks goofish nothing -- would
+  // find the seller the cached reply carried and never meet the no-seller reply at all.
+  resetCaches();
   use(makeSession({ item: [UNRENDERED, UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({ itemDO: { itemId: '42', title: 't' }, sellerDO: { nick: '无名氏' } })] } }));
   await assert.rejects(run('seller_items')({ item_id: '42' }), (e: any) => e instanceof DetailUnavailableError && /no readable seller/.test(e.message) && /user_id directly/.test(e.message));
 });
@@ -1305,6 +1319,139 @@ test('capabilities never throws, not even when the browser is gone, and a failed
     use(makeSession({}, { me: { ok: ret.startsWith('SUCCESS'), ret }, f: { ok: true } }));
     assert.equal((await run('capabilities')({})).session_state, want, ret || '(empty ret)');
   }
+});
+
+test('a repeat item_view is answered from the cache, with no page load, and publishes the age', async () => {
+  // The sequence this exists for: search, open a result, open it again. The second read costs a page
+  // load (4-10s measured) to produce the same listing, so it is served from what this process already
+  // read -- and the session it would have asked is one that cannot answer, so a hit that quietly went
+  // to the wire would fail here rather than merely being slower.
+  const reply = ok({ itemDO: { itemId: '42', title: '男士羊毛呢大衣', soldPrice: '1999', desc: '专柜入手', wantCnt: 1, browseCnt: 34 }, sellerDO: { nick: '汴梁', city: '北京', userRegDay: 2256 } });
+  use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [reply] } }));
+  const first = await run('item_view')({ item_id: '42' });
+  assert.equal(first.source, 'item_detail_api');
+  // The miss publishes the same block as the hit, so the envelope does not change shape with the route
+  assert.deepEqual([first.cache.hit, first.cache.key, first.cache.age_s, first.cache.stored_at], [false, 'item:42', null, null]);
+  assert.match(first.cache.note, /goofish answered it live just now/);
+  assert.equal(first.attempts, 1, 'one page load did the work');
+
+  const blind = use(makeSession({ item: [UNRENDERED] }));   // no detail reply on offer: a live read cannot answer
+  const second = await run('item_view')({ item_id: '42' });
+  assert.equal(blind.opened.length, 0, 'no page was loaded at all');
+  assert.equal(second.source, 'item_detail_api');
+  assert.equal(second.title, '男士羊毛呢大衣', 'the same listing, not a card and not nothing');
+  assert.equal(second.attempts, 0, 'and it says so rather than implying a load happened');
+  assert.equal(second.cache.hit, true);
+  assert.equal(typeof second.cache.age_s, 'number');
+  assert.equal(second.cache.ttl_s, 45, 'the window this listing may be served for');
+  assert.match(second.cache.note, /goofish was not asked/);
+  assert.match(second.cache.note, /sold, repriced or edited since/);
+  // A different listing is not served from this one's entry, and a listing nobody has read still asks.
+  const other = use(makeSession({ item: [UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({ itemDO: { itemId: '43', title: '别人的东西', soldPrice: '9' }, sellerDO: {} })] } }));
+  assert.equal((await run('item_view')({ item_id: '43' })).cache.hit, false);
+  assert.equal(other.opened.length, 1);
+  // XIANYU_CACHE=0 is the escape hatch: the same call now goes to the wire, and the blind session is
+  // the proof that it does.
+  process.env.XIANYU_CACHE = '0';
+  const live = use(makeSession({ item: [UNRENDERED] }));
+  await assert.rejects(run('item_view')({ item_id: '42' }), DetailUnavailableError);
+  assert.equal(live.opened.length, 1, 'the page was loaded for a live read');
+  delete process.env.XIANYU_CACHE;
+});
+
+test('a repeat search is answered from the cached pages, with no page, no keystroke and no mtop call', async () => {
+  // The expensive half of search is the page load and the pager walk: 15-41s cold, 4-12s warm, and
+  // 5-9.5s a page on top. A search whose (query, page) set this process already walked has none of
+  // that to pay, and the session below cannot serve a search at all -- so a hit that went to the wire
+  // would raise SearchUnavailableError rather than merely taking longer.
+  const c = searchCase('x220', [['联想Thinkpad X220 笔记本电脑', '856961429564', '329', '北京', '5'], ['X220 屏幕总成', '856961429565', '199', '上海', '2']]);
+  use(makeSession({ cards: [c.rows], mtop: c.mtop }));
+  const first = await run('search_items')({ query: 'x220', limit: 5, attempts: 1 });
+  assert.equal(first.source, 'search_api');
+  assert.equal(first.cache.hits, 0, 'nothing was cached before the first call');
+  assert.deepEqual(first.cache.pages, [{ page: 1, hit: false, age_s: null }]);
+
+  const blind = use(makeSession());
+  const second = await run('search_items')({ query: 'x220', limit: 5, attempts: 1 });
+  assert.equal(blind.opened.length, 0, 'no page was loaded and no query was typed');
+  assert.equal(blind.specs.length, 0, 'and no mtop call was made');
+  assert.equal(second.via, 'cache', 'the envelope says the answer did not come from goofish');
+  assert.equal(second.attempts, 0);
+  assert.equal(second.count, first.count, 'the same matches, through the same relevance guard');
+  assert.deepEqual(second.items.map((i: any) => i.item_id), first.items.map((i: any) => i.item_id));
+  assert.equal(second.cache.hits, 1);
+  assert.equal(second.cache.pages[0].hit, true);
+  assert.equal(typeof second.cache.pages[0].age_s, 'number');
+  assert.match(second.attempt_log[0].note, /already cached/);
+  // ...and the same query in a different case is the *same* search, served from the same entry: the
+  // key is lowercased precisely because the guard it is pooled through matches titles
+  // case-insensitively, so keying on the raw string would store one page twice and serve half of it
+  // never. (That this is a hit is the point; `searchKey` has its own test.)
+  const cased = use(makeSession());
+  const third = await run('search_items')({ query: 'X220', limit: 5, attempts: 1 });
+  assert.equal(third.via, 'cache');
+  assert.equal(cased.opened.length, 0);
+  assert.deepEqual(third.items.map((i: any) => i.item_id), first.items.map((i: any) => i.item_id));
+  // ...while a query nobody asked is a different question, and is asked
+  const rows2 = [['X220 屏幕总成', '856961429565', '199', '上海', '2']];
+  const other = use(makeSession({ cards: [searchCase('x220 屏幕', rows2).rows], mtop: searchCase('x220 屏幕', rows2).mtop }));
+  const fourth = await run('search_items')({ query: 'x220 屏幕', limit: 5, attempts: 1 });
+  assert.equal(fourth.cache.hits, 0);
+  assert.equal(fourth.via, 'searchbox');
+  assert.equal(other.opened.length, 1, 'a query that was never asked is asked');
+});
+
+test('a deeper search reuses the pages it has and only walks the new ones', async () => {
+  // The pool is 10 a page here so the guard and the walk are both visible. A second call for one page
+  // deeper has page 1 and page 2 in hand and must not click the pager for them again -- each click is
+  // 5-9.5s, so this is where the cache pays rather than the whole-call fast path above.
+  const page = (n: number) => ok(searchReply('x220', Array.from({ length: 10 }, (_, i) => [`联想 X220 ${n}-${i}`, String(n * 100 + i), '50', '北京', '1'])));
+  const s = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [page(1), page(2), page(3)] } }));
+  s.runRealNormalizer = true;
+  const first = await run('search_items')({ query: 'x220', pages: 2, limit: 20, attempts: 1 });
+  assert.equal(first.pages_fetched, 2);
+  assert.deepEqual(s.pagers, ['2']);
+
+  // Only two replies are on offer here, and that is the fixture doing the asserting: this call asks
+  // goofish for page 1 and page 3 and takes page 2 from the cache, so if it were also fetching page 2
+  // the second reply would land on page 3's slot and the pool would be 30 cards of 20 distinct ids.
+  const s2 = use(makeSession({ mtop: { 'mtop.taobao.idlemtopsearch.pc.search': [page(1), page(3)] } }));
+  s2.runRealNormalizer = true;
+  const deeper = await run('search_items')({ query: 'x220', pages: 3, limit: 20, attempts: 1 });
+  // Page 1 was asked for again -- it is the keystroke that gets the process to the pager at all -- and
+  // then only page 3 was clicked, because page 2 was already in hand.
+  assert.deepEqual(s2.pagers, ['3'], 'the cached page was not walked again');
+  assert.equal(deeper.cache.hits, 1);
+  assert.deepEqual(deeper.cache.pages.map((p: any) => [p.page, p.hit]), [[1, false], [2, true], [3, false]]);
+  assert.match(deeper.cache.note, /1 of 3 page\(s\)/);
+  const reused = deeper.attempt_log.find((e: any) => e.cache === 'hit');
+  assert.equal(reused.pager, 2, 'and the log names the page that came from the cache');
+  // The pooled set is judged as one set, cached and live pages alike, so a cached page cannot smuggle
+  // a weak result past the fraction the live pages have to pass.
+  assert.equal(deeper.scraped_cards, 30);
+  assert.equal(deeper.count > 0, true);
+});
+
+test('`detail` reports which of its listings came from the cache rather than a page load', async () => {
+  const rows = Array.from({ length: 4 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), '100', '北京', '2']);
+  const c = searchCase('x220', rows);
+  const detail = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', desc: '成色好' }, sellerDO: { nick: '卖家', city: '北京' } });
+  const one = { cards: [c.rows], mtop: { 'mtop.taobao.idlemtopsearch.pc.search': c.mtop['mtop.taobao.idlemtopsearch.pc.search'], 'mtop.taobao.idle.pc.detail': [detail('300')] } };
+  use(makeSession(one));
+  const cold = await run('search_items')({ query: 'x220', detail: 1, limit: 4, attempts: 1 });
+  assert.equal(cold.detail_report[0].cached, false, 'the first read of a listing is never a cache hit');
+  assert.equal(cold.detail_report[0].cache_age_s, null);
+  // The search pages are cached, so the second call answers without typing; the listing was read in
+  // full a moment ago, so its detail read is served too -- and both facts are published.
+  const blind = use(makeSession());
+  const warm = await run('search_items')({ query: 'x220', detail: 1, limit: 4, attempts: 1 });
+  assert.equal(blind.opened.length, 0);
+  assert.equal(warm.detail_report[0].ok, true);
+  assert.equal(warm.detail_report[0].cached, true, 'and the report says which of the listings were read live');
+  assert.equal(typeof warm.detail_report[0].cache_age_s, 'number');
+  const first = warm.items.find((i: any) => i.item_id === '300');
+  assert.equal(first.cached, true, 'the listing itself carries it, not only the report');
+  assert.equal(first.description, '成色好', 'and the detail fields are the ones read from goofish, not from the card');
 });
 
 test('tool calls are serialised, so two in flight cannot navigate one page out from under the other', async () => {
