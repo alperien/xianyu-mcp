@@ -1,13 +1,16 @@
 /**
  * The browser session. One throwaway Chromium, launched lazily and reused across tool calls (a cold launch costs ~5s, and these calls are cheap once the page is up). The context is brand new every time: no profile directory, no stored state, no account, and this package never reads cookies -- goofish sets its own anonymous ones when the page loads and we never look at them. Only https://goofish.com is ever loaded, and every navigation goes through `load` after `ensureGoofishUrl` has checked host *and* scheme.
  *
- * Two pages, not one. `apiPage` is parked on `BOOT_URL` and never navigates again: it exists only to
+ * Two pages that matter, not one. `apiPage` is parked on `BOOT_URL` and never navigates again: it exists only to
  * give the mtop tools a live client, and a tool call that needs nothing but mtop must not queue
  * behind a 70s search. `domPage` is the one that navigates, so the DOM-scraping tools still serialise
  * against each other and still cannot be read out from under one another. Measured: with a single page
  * a `search_items` call that takes 70s blocks `browse_feed`, which does 1.5s of real work.
  *
- * Both pages have an mtop response tap on them. The page's own calls succeed where ours time out --
+ * A third page exists only while the boot warm-up runs, on purpose, and is closed before it returns --
+ * see `warmUp`. It is the only navigation this server makes before a tool has asked for one.
+ *
+ * Both of the pages that matter have an mtop response tap on them. The page's own calls succeed where ours time out --
  * goofish attaches a per-request anti-bot blob the mtop client adds for calls it originates -- so the
  * honest way to read item detail or search results is to let the page make the call and read what
  * comes back, rather than to re-issue it and get a TIMEOUT. See `observe`.
@@ -24,6 +27,15 @@ export const HOME = 'https://www.goofish.com/';
 export const BOOT_URL = 'https://www.goofish.com/item?id=1045171414271';
 
 const NAV_TIMEOUT_MS = 60_000;
+// The one navigation budget that is not a caller's. The boot warm-up pays the session's first load,
+// and it is the only reason this server touches goofish before anybody asks: measured, that first load
+// is 12.4s for an item page and the mayor measured 15-41s for the first search, while every call after
+// it is warm. Bounded, because a warm-up nobody asked for must not outlive its usefulness.
+const WARM_NAV_TIMEOUT_MS = 45_000;
+// A page with less than this much text on it is a refusal or an error notice, not an app: the
+// risk-control page measured 35 bytes. The bound is what keeps the marker test honest -- a real
+// listing mentions none of these strings, but a real listing also has thousands of characters.
+const DECLINE_LIMIT_CHARS = 800;
 // Playwright's page.evaluate has NO timeout: an in-page promise that never settles (an mtop request that hangs, a page that stops responding) would hang the tool call forever, and that actually happened. Every evaluate goes through a bounded race.
 const EVALUATE_TIMEOUT_S = 90;
 // A batched mtop call carries its own ~20s server-side timeout per API, so a multi-page feed legitimately needs longer.
@@ -131,11 +143,53 @@ export async function settle(page: Page, ms: number): Promise<void> {
   try { await page.waitForTimeout(ms); } catch (e) { throw new BrowserError(`the browser went away while waiting: ${e}`); }
 }
 /** The only place a URL we chose is loaded from. */
-async function load(page: Page, url: string): Promise<void> {
-  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS }); }
+async function load(page: Page, url: string, timeoutMs = NAV_TIMEOUT_MS): Promise<void> {
+  try { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs }); }
   catch (e) { throw new BrowserError(`could not load ${url}: ${e}`); }
 }
-/** Cache-busted reload, so a cached empty shell does not stick. The second of the two navigation sites, and like `open` it re-checks the allowlist -- on the URL that actually landed, which is not something we chose. That NavigationError is deliberately not swallowed: `search_items`, `item_view` and `recommendations` all scrape whatever is here next, so a bounce off-site must stop them. Load failures still fall through to a plain reload, and a dead browser is retyped by the next evaluate. */
+
+/** Has goofish served its whole-page refusal instead of the app? `'risk_control'`, `'site_error'`, or
+ *  `''` for a page that may still be booting.
+ *
+ *  Both are 200s that render nothing, and both used to be discovered by running out the clock: the
+ *  risk-control page never grows an mtop client, so `waitForMtop` sat on it for its full 15s, and the
+ *  detail call the item page makes for itself is never made on it either, so the caller's own poll ran
+ *  to the end as well. Measured on the item page: a declined load issues no `mtop.taobao.idle.pc.detail`
+ *  request at all, so the page text is the only evidence there is -- and it is there from the first
+ *  paint.
+ *
+ *  The marker test alone would be wrong in the other direction: `非法访问` can appear in a healthy page's
+ *  payload. So the marker has to come with the emptiness, which is the part goofish actually
+ *  guarantees. `textContent` rather than `innerText`, because this runs on every load and `innerText`
+ *  forces a layout the answer does not need. */
+const DECLINE_JS = () => {
+  const { document } = globalThis as any;
+  const text = String(document?.body?.textContent ?? '');
+  return {
+    chars: text.length,
+    risk_control: /非法访问|使用正常浏览器访问闲鱼/.test(text),
+    site_error: /网络不见了|服务异常|页面不存在|网络异常/.test(text),
+  };
+};
+/** One bounded, non-throwing read of `DECLINE_JS`. A probe that errors is "not a refusal", because a
+ *  page still booting is a reason to keep waiting, never a reason to name a decline. */
+async function probeDecline(page: Page): Promise<string> {
+  try {
+    const v = await evaluate<{ chars: number; risk_control: boolean; site_error: boolean }>(page, DECLINE_JS, undefined, 'decline check', PROBE_TIMEOUT_S);
+    if (!v || v.chars >= DECLINE_LIMIT_CHARS) return '';
+    return v.risk_control ? 'risk_control' : v.site_error ? 'site_error' : '';
+  } catch { return ''; }
+}
+/** Cache-busted reload, so a cached empty shell does not stick. The second of the two navigation sites, and like `open` it re-checks the allowlist -- on the URL that actually landed, which is not something we chose. That NavigationError is deliberately not swallowed: `search_items`, `item_view` and `recommendations` all scrape whatever is here next, so a bounce off-site must stop them. Load failures still fall through to a plain reload, and a dead browser is retyped by the next evaluate.
+ *
+ *  The nonce looked like the wrong way round and was measured to be the right way round (probe10, n=7
+ *  a side, alternating, same URL): a plain `page.reload()` of a document this session already has
+ *  measured a median of 6.3s to `domcontentloaded` (3.4-12.9, 6 of 7 answered), where the
+ *  cache-busted load measured 3.9s (3.0-12.0, 7 of 7). The spread overlaps, so the honest reading is
+ *  "the cache bust is not the cold load it looks like" rather than "reload is slower" -- Chromium
+ *  revalidates the document either way, and what a nonce actually buys is escaping a *cached* empty
+ *  shell, which is the failure this exists for. The retry that genuinely re-pays a cold load is the
+ *  session's first one, and that is paid at boot now; see `warmUp`. */
 export async function reloadFresh(page: Page): Promise<void> {
   let base = HOME;
   try { base = ensureGoofishUrl(page.url().split('#')[0].replace(/[?&]_r\d+/, '')); } catch { /* off-site: use HOME */ }
@@ -184,6 +238,15 @@ export class Session {
   private apiPage: Page | null = null;
   private domPage: Page | null = null;
   launches = 0;
+  /** What the last `open` load actually got: where it ended, whether goofish served its refusal
+   *  instead of the app, and how long it took. Read by `item_view`'s attempt loop so a decline is named
+   *  after one load rather than five, and published by `capabilities`. A page that is merely slow says
+   *  nothing here, so a caller cannot read a refusal into a slow site. */
+  lastLoad: { url: string; declined: string; ms: number } = { url: '', declined: '', ms: 0 };
+  /** The boot warm-up's outcome, published by `capabilities` so a caller can tell a session that has
+   *  already paid its first load from one that is about to make them pay it. `pending` is the normal
+   *  answer for the first few seconds of a session, and `failed` costs nothing but the memory it used. */
+  readonly warm: { status: 'pending' | 'ready' | 'failed' | 'skipped'; ms: number; detail: string } = { status: 'pending', ms: 0, detail: '' };
   /** The mtop replies each page's own bundle produced, since the page last navigated. */
   readonly apiTap = new MtopTap();
   readonly domTap = new MtopTap();
@@ -340,22 +403,76 @@ export class Session {
     });
   }
 
+  /** Pay the session's first load in the background, at boot, on a page of its own.
+   *
+   *  Measured against this site: the first item page of a session costs 12.4s (probe9/probe7) and the
+   *  mayor measured 15-41s for the first search, while every call after that is warm. None of that is
+   *  unavoidable -- it is a cold browser, a cold connection and a cold document cache -- so it is paid
+   *  before anyone asks rather than by whoever asks first.
+   *
+   *  Three properties make it safe to run unasked, and each is load-bearing:
+   *  • its own page, never `apiPage` or `domPage`. Warming a shared page means navigating it, and the
+   *    only thing that makes those navigations safe is the `move` lock -- so taking that lock for a
+   *    background load would queue the user's first call behind a load nobody asked for, which is the
+   *    one thing a warm-up must never do. Nothing else can see this page, so nothing can collide.
+   *  • the shared context cache is the whole point of it. A `BrowserContext` shares its HTTP cache, so
+   *    the document and bundle loaded here are the ones the real pages find warm. `BOOT_URL` is an
+   *    item page, so it warms the DOM tools' document as well as the client the mtop tools need.
+   *  • it may fail. Every throw is caught and recorded under `warm`; nothing rethrows, nothing retries,
+   *    and the next real call behaves exactly as it did before. `XIANYU_NO_WARMUP=1` skips it
+   *    entirely, for a session that will only ever ask `capabilities`.
+   */
+  warmUp(): Promise<void> {
+    if (process.env.XIANYU_NO_WARMUP === '1') { this.warm.status = 'skipped'; this.warm.detail = 'XIANYU_NO_WARMUP=1'; return Promise.resolve(); }
+    this.warming ??= this.warmNow().finally(() => { this.warming = null; });
+    return this.warming;
+  }
+  private warming: Promise<void> | null = null;
+  private async warmNow(): Promise<void> {
+    const began = Date.now();
+    let page: Page | null = null;
+    try {
+      // A session that is already warm gets nothing from this and would pay for it twice.
+      if (this.parkedOnGoofish(this.apiPage)) { this.warm.status = 'skipped'; this.warm.detail = 'the session was already warm'; return; }
+      await this.ensureLaunched();
+      page = await this.context!.newPage();
+      await load(page, BOOT_URL, WARM_NAV_TIMEOUT_MS);
+      this.warm.status = 'ready'; this.warm.detail = '';
+    } catch (e: unknown) {
+      // Recorded, never raised: a warm-up that throws into the boot path is a server that starts broken.
+      this.warm.status = 'failed'; this.warm.detail = String((e as Error)?.message ?? e).slice(0, 200);
+    } finally {
+      this.warm.ms = Date.now() - began;
+      // Closed either way. It has warmed what it shares with the other pages by now; a third page
+      // holding a rendered listing is a renderer process this server does not need to keep.
+      await page?.close().catch(() => {});
+    }
+  }
+
   /** Load a goofish URL into the DOM page and wait for mtop. The allowlist is checked before
    *  navigating and again afterwards, and once more on the way out: goto follows redirects, so goofish
    *  itself (a risk-control bounce, say) could otherwise land us somewhere we would then scrape as if
    *  it were a listing -- and the settle and mtop wait below are tens of seconds of following the page
    *  around, so the last check is the one that is actually current when the caller scrapes. Nothing here
    *  clicks the login dialog: it is an overlay over content that is already in the DOM, and closing it
-   *  measurably *stopped* the result list from rendering. */
+   *  measurably *stopped* the result list from rendering.
+   *
+   *  The decline check between the settle and the mtop wait is worth its own line: a page goofish has
+   *  refused never grows an mtop client, so waiting for one there buys exactly the clock -- up to 15s,
+   *  per load, on the loads that are already lost. `lastLoad` carries the verdict out, because the
+   *  caller is the only one that can act on it: its attempt loop is what has to stop early. */
   async open(url: string): Promise<Page> {
     const target = ensureGoofishUrl(url);
     const page = await this.domReady();
     this.domTap.clear();   // replies from the page we are leaving are not answers about the new one
+    const began = Date.now();
     await load(page, target);
     ensureGoofishUrl(page.url());
     // 800ms so the page has begun painting; callers then poll for the content they actually need, which beats a longer fixed sleep.
     await settle(page, 800);
-    await waitForMtop(page);
+    const declined = await probeDecline(page);
+    this.lastLoad = { url: page.url(), declined, ms: Date.now() - began };
+    if (!declined) await waitForMtop(page);
     ensureGoofishUrl(page.url());
     return page;
   }

@@ -718,11 +718,20 @@ const waitForPager = async (page: Page, want: string, budgetMs: number): Promise
 
 /** Read the top `want` of a ranked result set in full, in place, and say what each one cost.
  *
- *  This is the expensive half, and it is worth being blunt about the cost: the detail route is one
- *  page load per listing at ~8s, and it does not parallelise. Four browser tabs loading four item
- *  pages at once measured 8.2s per listing against ~9s serially -- goofish throttles per IP, so
- *  concurrency buys nothing and only risks getting more of them declined. 20 listings is about 2.5
- *  minutes; the 50 a side-by-side comparison wants is about 7.
+ *  This is the expensive half, and the cost is the thing to be blunt about: the detail route is one
+ *  full page load per listing, measured warm at a median of 13.4s (n=8, 8/8 answered) -- the document
+ *  itself is 4.5s to `domcontentloaded` and goofish's own detail call lands 9-17s after that. 20
+ *  listings is about 4.5 minutes; the 50 a side-by-side comparison wants is about 11.
+ *
+ *  Two things were measured about doing better than that, and neither is what this loop wanted:
+ *  an SPA route change is not available at all (0/8 answered in 32s -- goofish's item page is an ICE
+ *  micro-frontend with no reachable router and no item links to click, probe8), so the load cannot be
+ *  skipped; and four pages loading four listings at once does cut the batch's wall clock, 27.1s for
+ *  4 against 66.3s serially, at the price of each listing's own latency roughly doubling (11.4s ->
+ *  20.5s) and a 32s serial stall that the parallel run did not pay. That is 2.4x on the wall clock
+ *  rather than 4x, and it is not free: it is four DOM pages instead of one, which is precisely the
+ *  invariant the shared navigating page exists to keep. Re-measured, not assumed -- but not built
+ *  either, because the fan-out is this loop and the loops are not where a second page belongs.
  *
  *  A listing that will not answer is reported as such and left as a card, never dropped: a partial
  *  answer is what a caller can reason about, a silently shorter list is not. */
@@ -804,6 +813,7 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
   // Nothing to report. Name the cause rather than the symptom.
   const payload = read.payload;
   const why = payload?.api_ret ? `goofish's own detail API refused it: ${payload.api_ret}`
+    : payload?.declined ? `goofish served its ${payload.declined === 'site_error' ? 'own "网络不见了" error page' : '"非法访问" risk-control page'} instead of the app`
     : payload?.api_item_id ? `the page answered about item ${payload.api_item_id} instead of ${item}`
     : payload?.site_error ? 'goofish served its own "网络不见了" error page on every attempt'
     : payload?.rail_only ? 'every load mounted the app and held only recommendation cards, with no listing in it'
@@ -871,6 +881,12 @@ const readListing = async (session: any, item: string, deadline: number): Promis
     // failing outright. Both are terminal for this URL, and spending five reloads and ~2 minutes
     // proving it to a caller who is waiting on an answer is the defect.
     if (payload?.site_error || payload?.rail_only) break;
+    // A third kind of "answered", and the only one this loop could not see for itself: goofish declined
+    // the load outright and served its risk-control page or its own error notice instead of the app.
+    // That is in the page text from the first paint and in no mtop call at all, so browser.ts reads it
+    // at the load (`Session.lastLoad`) and this is where it is acted on -- one load instead of five, and
+    // a named cause instead of "the page stayed an empty shell" after a minute and a half.
+    if (session.lastLoad?.declined) { payload = { ...payload, declined: session.lastLoad.declined }; break; }
     await evaluate(page, SCROLL_TO_JS, 400, 'gallery nudge');
     await settle(page, 400);
     await evaluate(page, SCROLL_TO_JS, 0, 'gallery nudge');
@@ -960,7 +976,9 @@ const capabilities = async (): Promise<Data> => {
     // agent that is about to pay the latency and actually needs to know what it costs.
     measured_latency: {
       'cold browser launch': '~5s, once per session; the session is then reused',
-      'item page load': '4-10s; ~8s per listing for `detail`, and it does NOT parallelise -- 4 tabs at once measured 8.2s/listing against ~9s serial, because goofish throttles per IP. 20 listings is about 2.5 minutes, 50 is about 7',
+      'item page load': 'a full page load per listing, warm: median 13.4s (n=8, 8/8 answered) -- 4.5s to domcontentloaded, then goofish\'s own detail call lands 9-17s after that. item_view cannot skip the load: an SPA route change answered 0/8 in 32s, because the item page is a micro-frontend with no reachable router and no item links (measured, xi-x8x). 20 listings is about 4.5 minutes, 50 is about 11',
+      'four listings at once': '27.1s of wall clock for 4 against 66.3s serially -- 2.4x, not 4x, and each listing\'s own latency roughly doubles (11.4s -> 20.5s). Measured but not built: it needs four DOM pages, which is the invariant the shared navigating page exists to keep, and the fan-out loop is search_items\' own',
+      'cold start': 'the session\'s first load is paid in the background at boot rather than on your first call; see cold_start_warm for whether it got there',
       'search, warm page': '4-12s (an SPA route change); the first search of a session pays 15-41s for a cold load',
       'search pager walk': '30 listings a page at 5-9.5s each, against 13-25s for a fresh page load',
       'how many of a page match': 'varies a lot -- across three sessions `pages: 2` gave 25, 28 and 55 matches of 60 scanned, and `pages: 4` gave 81 of 90. Read `count`; do not assume 30 a page',
@@ -988,6 +1006,11 @@ const capabilities = async (): Promise<Data> => {
   // That is a property of that module, not of this call site -- `readFileSync` inside it is the only
   // way this could throw, and it is guarded there. The per-probe keys above exist for the same reason
   // and do not cover this one, so the guarantee rests entirely on build-info.ts holding its line.
+  //
+  // What the boot warm-up managed, so a caller can tell a session that has already paid its first load
+  // from one that is about to make them pay it. `pending` is normal for a session's first few seconds
+  // and `failed` costs nothing: every tool that needs a page still loads one for itself, exactly as before.
+  status.cold_start_warm = { ...session.warm };
   return status;
 };
 

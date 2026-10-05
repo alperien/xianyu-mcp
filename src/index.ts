@@ -36,6 +36,15 @@ for (const t of TOOLS) {
   });
 }
 
+// The one thing this server does before it has been asked for anything: pay the session's first load.
+// Measured, that first load is 12.4s for an item page and 15-41s for the first search, against a warm
+// price of ~1.6s for everything after it -- and it lands on whoever happens to ask first, which for an
+// MCP client is the user's first question. So it is started here, in the background, on a page of its
+// own that no tool will ever see (see `Session.warmUp`). Fire-and-forget and never awaited: this must
+// not be able to delay the handshake, and a warm-up that throws is recorded under `capabilities`
+// rather than taken out on the server's start. `XIANYU_NO_WARMUP=1` skips it.
+void getSession().warmUp().catch(() => {});
+
 if (process.stdin.isTTY) {
   process.stderr.write('xianyu-mcp is an MCP stdio server and cannot be used interactively.\nConfigure it in an MCP client instead (see README.md).\n');
   process.exit(2);
