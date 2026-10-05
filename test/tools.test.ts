@@ -1282,6 +1282,62 @@ test('seller_items given an item_id resolves the seller first, off the listing\'
   await assert.rejects(run('seller_items')({ item_id: '42' }), (e: any) => e instanceof DetailUnavailableError && /no readable seller/.test(e.message) && /user_id directly/.test(e.message));
 });
 
+test('the freshness answer does not wait for a browser, and never fakes a probe it did not run', async () => {
+  // The defect (xi-cln): `build` -- which commit is answering, and is it behind main -- was returned
+  // only AFTER the browser/mtop probes, so a caller asking "is this deploy current?" paid a measured
+  // 60-90s cold Chromium launch for an answer that is a pure function of the build stamp, the base
+  // ref and the checkout. Nobody can make a stale dist fresh by launching a browser, and a cold or
+  // wedged Chromium is the slowest thing on the box.
+  //
+  // Proof is behavioural, not structural: a session that throws from every method cannot answer a
+  // call that touched it, so a fast-path answer that came back at all is a fast path that launched
+  // nothing. And the honesty half runs against the same fake -- a payload claiming a probe succeeded
+  // when the fake would have thrown is the failure this split could have introduced.
+  const s = use(makeSession({}, {}, 0));
+  s.ensureReady = async () => { throw new BrowserError('chromium would have taken 90s to launch here'); };
+  s.call = async () => { throw new BrowserError('mtop is not up'); };
+  const fast = await run('capabilities')({ probe: false });
+  // The question the gate actually asked, answered, with no browser in the process at all.
+  assert.ok(fast.build, 'the build block is on the fast path -- that is the whole point');
+  assert.equal(typeof fast.build.stale === 'boolean' || fast.build.stale === null, true);
+  assert.equal(typeof fast.build.commit, 'string');
+  assert.equal(typeof fast.build.behind === 'number' || fast.build.behind === null, true);
+  // ...and the rest of the payload is still whole. Splitting the response is not dropping half of it.
+  assert.ok(Array.isArray(fast.works_without_account) && fast.works_without_account.length > 0);
+  assert.ok(Array.isArray(fast.notes) && fast.notes.length > 0 && fast.note);
+  assert.equal(fast.requires_xianyu_account, false);
+  assert.ok(fast.cache, 'the cache block is on the fast path too');
+  assert.equal(fast.probes.ran, false);
+  // The honesty half. `feed_reachable: false` here would assert the feed did not answer, when the
+  // truth is nobody asked -- and a freshness gate that trusted it would report a live server as
+  // unreachable. Null, and named.
+  assert.deepEqual([fast.session_state, fast.login_probe_ret, fast.feed_reachable, fast.browser_launches], [null, null, null, null]);
+  assert.deepEqual(fast.probes.not_measured, ['session_state', 'login_probe_ret', 'feed_reachable', 'browser_launches']);
+  assert.deepEqual(fast.probes.measured, [], 'nothing was measured, so nothing is claimed');
+  assert.match(fast.probes.note, /nobody looked, NOT because a probe failed/);
+  // no per-probe error keys either: a probe that did not run has not errored
+  assert.deepEqual([fast.browser_error, fast.login_error, fast.feed_error], [undefined, undefined, undefined]);
+  // Same build answer either way -- the split is about WHEN, and two paths that could disagree about
+  // staleness would be a worse bug than the latency this fixes.
+  const deep = use(makeSession({}, { me: { ok: false, ret: 'FAIL_SYS_SESSION_EXPIRED::x' }, f: { ok: true } }));
+  const probed = await run('capabilities')({});
+  assert.deepEqual(fast.build, probed.build, 'the freshness answer does not depend on the probes at all');
+  assert.deepEqual(fast.cache, probed.cache);
+  // and the default still probes: existing callers lose nothing
+  assert.equal(probed.probes.ran, true);
+  assert.deepEqual(probed.probes.measured, ['session_state', 'login_probe_ret', 'feed_reachable', 'browser_launches']);
+  assert.deepEqual(probed.probes.not_measured, []);
+  assert.equal(probed.session_state, 'logged_out');
+  assert.equal(probed.feed_reachable, true);
+  assert.equal(typeof probed.browser_launches, 'number');
+  // even against a dead browser, which is the case the bead says once looked like a hang
+  deep.ensureReady = async () => { throw new BrowserError('chromium is gone'); };
+  const deadFast = await run('capabilities')({ probe: false });
+  assert.equal(deadFast.probes.ran, false, 'a dead browser cannot deny the freshness answer');
+  assert.equal(typeof deadFast.build.commit, 'string');
+  assert.equal(deadFast.session_state, null);
+});
+
 test('capabilities never throws, not even when the browser is gone, and a failed probe does not hide the others', async () => {
   const s = use(makeSession({}, { me: { ok: false, ret: 'FAIL_SYS_SESSION_EXPIRED::x' }, f: { ok: true } }));
   const ok = await run('capabilities')({});
