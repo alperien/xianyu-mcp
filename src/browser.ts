@@ -182,7 +182,7 @@ async function probeDecline(page: Page): Promise<string> {
 }
 /** Cache-busted reload, so a cached empty shell does not stick. The second of the two navigation sites, and like `open` it re-checks the allowlist -- on the URL that actually landed, which is not something we chose. That NavigationError is deliberately not swallowed: `search_items`, `item_view` and `recommendations` all scrape whatever is here next, so a bounce off-site must stop them. Load failures still fall through to a plain reload, and a dead browser is retyped by the next evaluate.
  *
- *  The nonce looked like the wrong way round and was measured to be the right way round (probe10, n=7
+ *  The nonce looked like the wrong way round and was measured to be the right way round (n=7
  *  a side, alternating, same URL): a plain `page.reload()` of a document this session already has
  *  measured a median of 6.3s to `domcontentloaded` (3.4-12.9, 6 of 7 answered), where the
  *  cache-busted load measured 3.9s (3.0-12.0, 7 of 7). The spread overlaps, so the honest reading is
@@ -405,7 +405,7 @@ export class Session {
 
   /** Pay the session's first load in the background, at boot, on a page of its own.
    *
-   *  Measured against this site: the first item page of a session costs 12.4s (probe9/probe7) and the
+   *  Measured against this site: the first item page of a session costs 12.4s and the
    *  mayor measured 15-41s for the first search, while every call after that is warm. None of that is
    *  unavoidable -- it is a cold browser, a cold connection and a cold document cache -- so it is paid
    *  before anyone asks rather than by whoever asks first.

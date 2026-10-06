@@ -196,6 +196,24 @@ against the live site and would have had to invent data, so they are recorded he
 `seller_items` is what shipped instead of a category filter: it fills the same agent gap ("show me more
 from this source") off an endpoint that was verified answering anonymously.
 
+### Removed
+
+- **Eleven throwaway probe scripts, from the repo root.** `probe.mjs` and `probe2.mjs`–`probe11.mjs` were
+  scratch scripts — each one drives Chromium against the live site to answer a single question, and
+  several import `./src/*.ts` directly rather than the built `dist/`. They were working notes that got
+  committed, and a root full of `probe*.mjs` reads like tooling: the next person edits one, runs it
+  against the live site from a checkout they did not intend to touch, and lands it again.
+  - *The measurements are not lost with them, which is the only reason this is safe.* Every number a
+    probe produced is written down in this file — the cold-start medians, the reload-versus-cache-bust
+    comparison, the detail-route latencies, the seller-endpoint boundaries above — because that is where
+    a later change can read it and notice it broke something. The scripts themselves stay in git history
+    for anyone who wants to re-run a measurement; what leaves the tree is the copy on `main`.
+  - *The three comments that cited them by filename now cite the measurement instead.* `reloadFresh` and
+    the boot warm-up still carry their sample sizes and medians (`n=7 a side`, `12.4s`), and the SPA
+    route note still carries `0/8 answered in 32s` — a comment that points at a file the reader cannot
+    open is a worse version of the same sentence.
+  - `.gitignore` now ignores `/probe*.mjs` at the root, so a probe stays where a probe belongs.
+
 ### Fixed
 
 - The MCP handshake advertised a hardcoded `0.1.0` while `package.json` carried its own copy of the

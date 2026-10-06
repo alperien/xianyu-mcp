@@ -725,7 +725,7 @@ const waitForPager = async (page: Page, want: string, budgetMs: number): Promise
  *
  *  Two things were measured about doing better than that, and neither is what this loop wanted:
  *  an SPA route change is not available at all (0/8 answered in 32s -- goofish's item page is an ICE
- *  micro-frontend with no reachable router and no item links to click, probe8), so the load cannot be
+ *  micro-frontend with no reachable router and no item links to click), so the load cannot be
  *  skipped; and four pages loading four listings at once does cut the batch's wall clock, 27.1s for
  *  4 against 66.3s serially, at the price of each listing's own latency roughly doubling (11.4s ->
  *  20.5s) and a 32s serial stall that the parallel run did not pay. That is 2.4x on the wall clock
