@@ -50,7 +50,10 @@ const EVALUATE_TIMEOUT_S = 90;
 // Each mtop API carries its own ~20s server-side timeout, so a batched call over several feed pages
 // legitimately needs longer than one API does.
 const MTOP_TIMEOUT_S = 240;
-const MTOP_READY_MS = 6000, PROBE_TIMEOUT_S = 5;   // how long `call` gives the mtop client to come up, and the ceiling on one readiness probe -- an evaluate runs 90s by default, so the probe needs its own bound or the wait is not the one it claims to be
+// How long `call` gives the mtop client to come up, and the ceiling on one readiness probe. An
+// evaluate runs 90s by default, so the probe needs its own bound or the wait is not the one it
+// claims to be.
+const MTOP_READY_MS = 6000, PROBE_TIMEOUT_S = 5;
 // Failures that race the page's own navigation rather than being real failures, so they get one more
 // try. A dead target is not on this list: that needs a relaunch, not a retry.
 const TRANSIENT = ['execution context', 'cannot find context', 'while navigating'];
