@@ -83,7 +83,7 @@ one browser, one page — so two tools in flight cannot navigate each other out 
 
 | Tool | Args | Key return fields |
 |---|---|---|
-| `capabilities` | — | `session_state` (`unexpectedly_logged_in` / `logged_out` / `unknown` — `logged_out` only from a ret that actually names the session or token, so a rate limit or a timeout reads `unknown` rather than proving anonymity), `feed_reachable`, `login_probe_ret`, `cache` (`enabled`, the two TTLs, how many listings and search pages are held), `works_without_account`, `anonymous_flakiness`, `notes`, `note`, `browser_launches`, and a `browser_error` / `login_error` / `feed_error` per probe. Never raises, not even if the browser is gone. |
+| `capabilities` | `probe` (bool, dtrue) | with `probe: true` (the default): `session_state` (`unexpectedly_logged_in` / `logged_out` / `unknown` — `logged_out` only from a ret that actually names the session or token, so a rate limit or a timeout reads `unknown` rather than proving anonymity), `login_probe_ret`, `feed_reachable`, `probes` (`ran`, `measured`, `not_measured`), `cache` (`enabled`, the two TTLs, how many listings and search pages are held), `works_without_account`, `anonymous_flakiness`, `notes`, `note`, `browser_launches`, and a `browser_error` / `login_error` / `feed_error` per probe. Never raises, not even if the browser is gone. **With `probe: false`** the same static payload and `build` / `cache` come back immediately, no browser launched, and the four live-probe keys are `null` — see [which build is answering](#which-build-is-answering-and-is-it-current). |
 | `browse_feed` | `page_number` (1–10000, d1), `pages` (1–25, d1), `limit` (≤500, d60) | `items[]` of `rank, item_id, title, price, original_price, city, seller, want_count, image_count, image_urls, is_video, category_id, url`; `page_reports`, `raw_cards`, `unique_items`, `count`, `source: homepage_feed`. Every item also carries `typed` + `missing` — see [the typed block](#the-typed-block-every-listing-carries) |
 | `search_count` | `query` | `match_count`, `has_matches`, `source: filter_hitnum`. Zero is an answer, not an error — but only when the site said zero: a `hitnum` that is missing, null, a string or carries a thousands separator is a `ParseError`, never `match_count: 0`. |
 | `search_suggest` | `query`, `limit` (d20) | `suggestions[]` of `text, bucket_num`, `total_count`, `count`, `source: search_suggest` |
@@ -340,6 +340,48 @@ Only real reads are stored. A refused answer leaves the cache exactly as it foun
 written to the cache, because pinning a five-field card for the TTL would turn one degraded read into a
 window of them.
 
+## Which build is answering, and is it current?
+
+`capabilities` publishes a `build` block: the commit answering your calls, how far it is behind
+`origin/main`, when it was built, and whether that could be measured at all. It is there because a
+deployment can be many commits and a whole release behind and still answer every call plausibly —
+an opencode.json pointing at a nine-commit-old dist looked entirely healthy for weeks.
+
+Freshness is a pure function of the build stamp, the base ref and the checkout. It needs no browser,
+no page and no network. It used to be returned anyway *after* a cold Chromium launch and the mtop
+probes, because it was assembled inside the same payload as the live probes. So the caller who
+wanted only "is this deploy current?" — a spawn-time freshness gate, a latency measurement, a
+trust check before spending 400s on a 50-listing comparison — paid a measured 60-90s for an answer
+no browser could have influenced, and on a wedged Chromium paid longer. One caller filed a bug that
+the server was hung; it was answering, just slowly.
+
+So `capabilities` takes `probe`, default `true`. Nothing about the default contract changed: every
+existing caller still gets the live picture. With `probe: false` the tool returns `build`, `cache`
+and the whole static payload immediately and never touches the browser.
+
+**The fast path cannot pretend it probed.** The four conclusions that need a live site —
+`session_state`, `login_probe_ret`, `feed_reachable`, `browser_launches` — come back **`null`**, not
+`false`, and a `probes` block names them under `not_measured`. This is the same distinction
+`build.stale: null` already draws: null means *could not be measured*, false means *measured, and it
+said no*. `feed_reachable: false` on an unprobed path would assert goofish did not answer when the
+truth is that nobody asked — and a freshness gate trusting it would report a healthy server as
+unreachable. The two states stay distinct even under failure: `unknown` means a probe ran and could
+not tell, `null` means no probe ran.
+
+```jsonc
+"probes": {
+  "ran": false,
+  "measured": [],
+  "not_measured": ["session_state", "login_probe_ret", "feed_reachable", "browser_launches"],
+  "note": "probe: false -- nothing was asked of goofish and no browser was launched, so the four keys above are null because nobody looked, NOT because a probe failed."
+}
+```
+
+Both paths call the same `buildBlock()`, which is the same `src/build-info.ts` logic
+`npm run check:deploy` runs from the command line. There is one staleness rule, tested once — so the
+two paths cannot disagree about whether a deployment is current, which is the failure worth worrying
+about here; a slow answer is merely annoying.
+
 ## Headless vs headed
 
 Measured, same URL, one fresh context per run, sampling every 4s for 128–200s:
@@ -366,7 +408,7 @@ other figure is that same warm session. Treat these as order of magnitude, not a
 | tool | warm | result |
 |---|---|---|
 | cold start (launch + first feed) | 24.7s | — |
-| `capabilities` | 1.9s | `logged_out`, `feed_reachable: true` |
+| `capabilities` | 1.9s | `logged_out`, `feed_reachable: true` (probed; `probe: false` is milliseconds — see [which build is answering](#which-build-is-answering-and-is-it-current)) |
 | `search_count` | 0.5s | 28,8xx for `thinkpad x220` |
 | `search_suggest` | 0.4s | 10 suggestions |
 | `related_items` | 2.2s | 20 listings, `item_web_recommend` |
@@ -509,6 +551,12 @@ the path where the event loop has already stopped. Verified after every fix: 0 p
   change with the route. Only real reads are stored, a failed read leaves the cache untouched, and a
   cached answer is judged by the same relevance guard and identity checks as a live one. See
   [the cache](#repeat-views-are-cached-and-the-cache-says-so).
+- **The freshness answer never waits for a browser, and never fakes a probe.** `capabilities`
+  (`probe: false`) returns `build` without launching Chromium — staleness is a pure function of the
+  stamp, the base ref and the checkout, and a browser cannot change it. The four keys that do need
+  the live site are then `null` under `probes.not_measured`, never `false`: "nobody looked" is not
+  "looked, and it failed", and `capabilities` must not report a probe it did not run. See
+  [which build is answering](#which-build-is-answering-and-is-it-current).
 - **The page is never clicked.** A structural test fails if a `.click(` call appears anywhere in
   `src/` or `test/`, and if the dismisser's selectors come back.
 - **One version, written once.** The version in the MCP handshake is read out of `package.json` at
