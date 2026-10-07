@@ -15,11 +15,10 @@ From here on, each release gets a commit behind it and this file grows normally.
 The Python implementation this is a port of is not in this history at all: it lives on the
 `python-original` branch as a single commit (`cfe401d`, 2026-09-27).
 
-## [0.2.0] — unreleased
+## [0.2.0] — 2026-10-08
 
-No tag yet: `v0.2.0` is not cut, so everything below is still in `main` rather than published. The
-seller tools went in here rather than opening a 0.3.0 section, because 0.2.0 has never been released
-and a dated section for it would be claiming a release that did not happen.
+Released. The seller tools went in here rather than opening a 0.3.0 section, because 0.2.0 had never
+been released and a dated section for it would have been claiming a release that did not happen.
 
 ### Added
 
