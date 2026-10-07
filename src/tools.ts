@@ -780,6 +780,15 @@ const waitForPager = async (page: Page, want: string, budgetMs: number): Promise
  *  is not free: four DOM pages instead of one, which is exactly the invariant the shared navigating
  *  page exists to keep. Measured, not assumed -- and not built, because the fan-out is this loop
  *  and a second page does not belong in it.
+ *  Two things were measured about doing better than that, and neither is what this loop wanted:
+ *  an SPA route change is not available at all (0/8 answered in 32s -- goofish's item page is an ICE
+ *  micro-frontend with no reachable router and no item links to click), so the load cannot be
+ *  skipped; and four pages loading four listings at once does cut the batch's wall clock, 27.1s for
+ *  4 against 66.3s serially, at the price of each listing's own latency roughly doubling (11.4s ->
+ *  20.5s) and a 32s serial stall that the parallel run did not pay. That is 2.4x on the wall clock
+ *  rather than 4x, and it is not free: it is four DOM pages instead of one, which is precisely the
+ *  invariant the shared navigating page exists to keep. Re-measured, not assumed -- but not built
+ *  either, because the fan-out is this loop and the loops are not where a second page belongs.
  *
  *  A listing that will not answer is reported as such and left as a card, never dropped. A partial
  *  answer is what a caller can reason about; a silently shorter list is not. */

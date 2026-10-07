@@ -1,6 +1,15 @@
 node_modules/
 dist/
 
+# Throwaway live-site probes (`probe.mjs`, `probe2.mjs`, ... at the repo root).
+# One of these is a scratch script that drives Chromium against goofish to answer a
+# single question, and it is not an artefact of the package -- the answer it produced is
+# written down in CHANGELOG.md, where a later change can read it, and the script itself
+# stays in git history for anyone who wants to re-run the measurement. Committing them
+# put eleven of them on main, where a root full of `probe*.mjs` reads like tooling and
+# invites the next one to be edited and re-landed.
+/probe*.mjs
+
 # Agent tooling (Gas Town / Claude Code / editor state)
 .runtime/
 .beads/
