@@ -7,6 +7,12 @@
  * against each other and still cannot be read out from under one another. Measured: with a single page
  * a `search_items` call that takes 70s blocks `browse_feed`, which does 1.5s of real work.
  *
+ * A bounded handful more, for one job: the detail fan-out (`Session.fanoutSurface`). Those are leased
+ * by whoever holds the shared lock and are invisible to everything else, so the invariant above is
+ * untouched -- still one page the DOM tools read, still one lock -- while `detail: 50` gets to load two
+ * listings at a time instead of one. What a fan-out *cannot* have is an unbounded pool: see
+ * `DETAIL_POOL_MAX` for why the ceiling is structural rather than a matter of taste.
+ *
  * A third page exists only while the boot warm-up runs, on purpose, and is closed before it returns --
  * see `warmUp`. It is the only navigation this server makes before a tool has asked for one.
  *
@@ -53,6 +59,24 @@ const apiOf = (url: string): string => { try { return new URL(url).pathname.matc
 
 /** One tapped mtop response: goofish's own `ret`, and its `data` when there is any. */
 export type MtopReply = { api: string; ret: string; ok: boolean; data: any };
+
+/** The most extra DOM pages a session will ever hold open at once, whatever a caller asks for.
+ *
+ *  Four is not a round number chosen here: it is the width the fan-out was measured at, and four is
+ *  where each listing's own latency stopped improving (11.4s -> 20.5s at four) while the wall clock
+ *  kept falling (2.4x). Above that the measurement says nothing, and a fan-out whose width was never
+ *  measured is a fan-out that can be turned up by a typo and answer with zero listings. So the bound
+ *  lives here rather than in the caller: `fanoutSurface` refuses a slot outside it, and the width the
+ *  detail walk asks for is clamped to it before it asks. */
+export const DETAIL_POOL_MAX = 4;
+
+/** One leased DOM page: the page, the tap on the mtop replies its own bundle produced, and the
+ *  verdict on the load that put it there.
+ *
+ *  All three travel together rather than the last two living on the session, because a fan-out has
+ *  two of these in flight at once and a shared `Session.lastLoad` can only name whichever load
+ *  finished last -- which is how a decline would get attached to the wrong listing. */
+export type DomSurface = { page: Page; tap: MtopTap; load: { url: string; declined: string; ms: number } };
 
 /** A bounded collector for the mtop responses a page makes on our behalf.
  *
@@ -241,8 +265,18 @@ export class Session {
   /** What the last `open` load actually got: where it ended, whether goofish served its refusal
    *  instead of the app, and how long it took. Read by `item_view`'s attempt loop so a decline is named
    *  after one load rather than five, and published by `capabilities`. A page that is merely slow says
-   *  nothing here, so a caller cannot read a refusal into a slow site. */
+   *  nothing here, so a caller cannot read a refusal into a slow site.
+   *
+   *  `domPage`'s loads only, and deliberately: a fan-out has its own pages and its own verdicts, which
+   *  travel with the lease (`DomSurface.load`) rather than through here, so two concurrent loads
+   *  cannot overwrite each other's. */
   lastLoad: { url: string; declined: string; ms: number } = { url: '', declined: '', ms: 0 };
+  /** Extra DOM pages, created on demand by the detail fan-out and by nothing else. Each carries its
+   *  own tap, so a reply can never be handed to a page that did not make the call. They are *not* on
+   *  the DOM tools' lock because they are not on their page: the fan-out runs inside a lock it already
+   *  holds, and no other tool can name slot 0. That is the whole reason the fan-out needed a session
+   *  redesign rather than a loop edit -- and it is why the pool is bounded rather than open-ended. */
+  private readonly pool: { page: Page; tap: MtopTap }[] = [];
   /** The boot warm-up's outcome, published by `capabilities` so a caller can tell a session that has
    *  already paid its first load from one that is about to make them pay it. `pending` is the normal
    *  answer for the first few seconds of a session, and `failed` costs nothing but the memory it used. */
@@ -306,9 +340,9 @@ export class Session {
    *  processes per session, invisible to the client that had already exited. */
   async close(): Promise<void> {
     const context = this.context, browser = this.browser;
-    if (!browser) { this.context = this.browser = this.apiPage = this.domPage = null; this.apiTap.clear(); this.domTap.clear(); return; }
+    if (!browser) { this.context = this.browser = this.apiPage = this.domPage = null; this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0; return; }
     this.context = this.browser = this.apiPage = this.domPage = null;
-    this.apiTap.clear(); this.domTap.clear();
+    this.apiTap.clear(); this.domTap.clear(); this.pool.length = 0;   // the handles are dead with the context; keeping them would hand a dead page to the next fan-out
     await Promise.race([
       (async () => { await context?.close().catch(() => {}); await browser.close().catch(() => {}); })(),
       new Promise((r) => setTimeout(r, 5000)),
@@ -449,32 +483,83 @@ export class Session {
     }
   }
 
-  /** Load a goofish URL into the DOM page and wait for mtop. The allowlist is checked before
-   *  navigating and again afterwards, and once more on the way out: goto follows redirects, so goofish
-   *  itself (a risk-control bounce, say) could otherwise land us somewhere we would then scrape as if
-   *  it were a listing -- and the settle and mtop wait below are tens of seconds of following the page
-   *  around, so the last check is the one that is actually current when the caller scrapes. Nothing here
-   *  clicks the login dialog: it is an overlay over content that is already in the DOM, and closing it
-   *  measurably *stopped* the result list from rendering.
+  /** Load a goofish URL into `page`, wait for its mtop client, and hand back the page with its own
+   *  tap and the verdict on the load. The one function that navigates a page this caller owns, which
+   *  is why `open` and `fanoutSurface` both go through it: a second navigation site is a second place
+   *  the allowlist check can be left out, and the check is the only thing between this server and a
+   *  scraper aimed at whatever goofish redirected us to.
+   *
+   *  The allowlist is checked before the load and again afterwards, and once more on the way out:
+   *  goto follows redirects, so goofish itself (a risk-control bounce, say) could otherwise land us
+   *  somewhere we would then scrape as if it were a listing -- and the settle and mtop wait below are
+   *  tens of seconds of following the page around, so the last check is the one that is actually
+   *  current when the caller scrapes. Nothing here clicks the login dialog: it is an overlay over
+   *  content that is already in the DOM, and closing it measurably *stopped* the result list from
+   *  rendering.
    *
    *  The decline check between the settle and the mtop wait is worth its own line: a page goofish has
    *  refused never grows an mtop client, so waiting for one there buys exactly the clock -- up to 15s,
-   *  per load, on the loads that are already lost. `lastLoad` carries the verdict out, because the
-   *  caller is the only one that can act on it: its attempt loop is what has to stop early. */
-  async open(url: string): Promise<Page> {
+   *  per load, on the loads that are already lost. The verdict travels out with the surface, because
+   *  the caller is the only one that can act on it: its attempt loop is what has to stop early, and it
+   *  has to stop early for *its* load rather than for whichever one finished last.
+   *
+   *  Deliberately not taken under `move`: the lock serialises navigations on a page *shared* with
+   *  another caller, and each pool page belongs to exactly one fan-out slot. Taking it here would put
+   *  two listings' loads back in a queue, which is the entire thing the fan-out is not. */
+  private async loadInto(page: Page, tap: MtopTap, url: string): Promise<DomSurface> {
     const target = ensureGoofishUrl(url);
-    const page = await this.domReady();
-    this.domTap.clear();   // replies from the page we are leaving are not answers about the new one
+    tap.clear();   // replies from the page we are leaving are not answers about the new one
     const began = Date.now();
     await load(page, target);
     ensureGoofishUrl(page.url());
     // 800ms so the page has begun painting; callers then poll for the content they actually need, which beats a longer fixed sleep.
     await settle(page, 800);
     const declined = await probeDecline(page);
-    this.lastLoad = { url: page.url(), declined, ms: Date.now() - began };
+    const verdict = { url: page.url(), declined, ms: Date.now() - began };
     if (!declined) await waitForMtop(page);
     ensureGoofishUrl(page.url());
-    return page;
+    return { page, tap, load: verdict };
+  }
+
+  /** Load a goofish URL into the DOM page and wait for mtop, for the tools that share it. The verdict
+   *  is also published on `lastLoad`, which is how a caller that reached for the shared page reads it. */
+  async open(url: string): Promise<Page> {
+    const surface = await this.loadInto(await this.domReady(), this.domTap, url);
+    this.lastLoad = surface.load;
+    return surface.page;
+  }
+
+  /** Lease fan-out slot `i` and load `url` into it: the bounded detail fan-out's private page.
+   *
+   *  Not the shared `domPage`, and that is the point. The caller is inside a `search_items`, and that
+   *  page is holding the search results the fan-out exists to deepen -- navigating it away would
+   *  throw away the answers for everything past the first batch. So each slot is its own page with
+   *  its own tap, invisible to the DOM tools, and the lock the caller already holds is the only thing
+   *  standing between two searches' fan-outs: they cannot overlap, because `exclusive()` wraps the
+   *  whole tool rather than this lease.
+   *
+   *  Bounded by `DETAIL_POOL_MAX` because a pool that grows on request is a pool nobody measured. */
+  async fanoutSurface(i: number, url: string): Promise<DomSurface> {
+    if (!Number.isInteger(i) || i < 0 || i >= DETAIL_POOL_MAX) throw new BrowserError(`detail fan-out slot ${i} does not exist: a session leases at most ${DETAIL_POOL_MAX} extra DOM pages, and slot ${i} is outside that`);
+    return this.loadInto(await this.poolSlot(i), this.pool[i].tap, url);
+  }
+
+  /** The page behind a fan-out slot, created on first use and then reused -- so a `detail: 50` walk
+   *  pays for one page per slot rather than one per listing. Under `move` because opening a page is
+   *  browser-wide state, and two slots asked at once must not both decide the browser was dead. */
+  private async poolSlot(i: number): Promise<Page> {
+    const have = this.pool[i]?.page;
+    if (have && !have.isClosed()) return have;
+    return this.move(async () => {
+      await this.ensureLaunched();
+      const again = this.pool[i]?.page;   // another caller may have opened it while this one waited
+      if (again && !again.isClosed()) return again;
+      const page = await this.context!.newPage();
+      const slot = { page, tap: new MtopTap() };
+      this.tap(page, slot.tap);
+      this.pool[i] = slot;
+      return page;
+    });
   }
 
   /** Run a batch of mtop calls through the api page's own client. Retries with a cache-busted reload:
