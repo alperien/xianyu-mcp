@@ -930,10 +930,28 @@ const readListing = async (session: any, item: string, deadline: number): Promis
 };
 
 /** What this server can and cannot do right now, verified against the live site. A diagnostic must never be the thing that crashes, so every probe is guarded and reported as status rather than raised -- including a browser that has gone away. */
-const capabilities = async (): Promise<Data> => {
-  const session = getSession();
+const CAP_ARGS = { probe: z.boolean().default(true) };
+/** The live picture, and the freshness answer that must not wait for it.
+ *
+ *  The split is `probe`. Everything below that needs a browser is behind it, and the freshness answer
+ *  is not -- because freshness is a pure function of (build stamp, base ref, checkout state) and a
+ *  cold Chromium launch cannot change its result. Queuing the answer to a question behind work that
+ *  cannot affect it is the whole defect (xi-cln): the caller who wants to know "is this deploy
+ *  current?" -- a spawn-time freshness gate, a performance measurement, a trust check -- paid a
+ *  measured 60-90s for it, and on a wedged browser paid longer still.
+ *
+ *  `probe` defaults to true, so every existing caller's contract is exactly what it was. `probe: false`
+ *  is the fast path, and it is honest about being one: the four probe conclusions below come back
+ *  **null**, not defaulted, and `probes` names them as unmeasured. `feed_reachable: false` would be a
+ *  lie on this path -- it reads "the feed did not answer" when the truth is "nobody asked" -- and null
+ *  is this repo's standing idiom for exactly that difference, the same one `build.stale: null` uses
+ *  for "could not be measured". A freshness answer that implied a browser had launched and succeeded
+ *  would be the failure this whole change exists to prevent, so the payload cannot report one. */
+const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promise<Data> => {
   const status: any = {
-    requires_xianyu_account: false, session_state: 'unknown', login_probe_ret: '', feed_reachable: false,
+    requires_xianyu_account: false,
+    // Null, not their live defaults, on the unprobed path -- see the header.
+    session_state: null, login_probe_ret: null, feed_reachable: null, browser_launches: null,
     // The deployment's own address, up top and unmissable: which commit is answering, whether it is
     // behind main, and why. `stale: null` means it could not be measured, which is not the same as
     // `false` -- a build nobody can place is unverified, and reporting it as current is the exact
@@ -988,12 +1006,36 @@ const capabilities = async (): Promise<Data> => {
     // The known causes, in the order they were actually observed; static, so it survives a dead browser.
     note: 'goofish did not serve a usable page. Known causes, in the order actually observed: (1) the network resolves goofish to IPv6 but has no working IPv6 route, so Chromium gets ERR_ADDRESS_UNREACHABLE where curl over v4 returns 200; (2) resource exhaustion, ERR_INSUFFICIENT_RESOURCES, usually a small /tmp; (3) goofish answering with its risk-control page instead of the app -- a 200 whose whole body reads "非法访问 ... 请使用正常浏览器访问闲鱼" -- which is the state to check for first, because it is indistinguishable from "no results" unless it is named, and it is server-side so it lifts after a pause; (4) a footer-only shell as a successful 200. The mtop-only tools need only the mtop client, which comes up even on (3) and (4), so they survive every one of these.',
   };
+  // Which of the four keys above are conclusions of a live probe, named rather than left for the
+  // caller to infer from a null. On the fast path they are all unmeasured, which is a different fact
+  // from "measured and false" and must not be readable as the latter.
+  const PROBED = ['session_state', 'login_probe_ret', 'feed_reachable', 'browser_launches'];
+  status.probes = {
+    ran: probe,
+    measured: probe ? PROBED : [],
+    not_measured: probe ? [] : PROBED,
+    note: probe
+      ? 'the four keys above are conclusions of live probes against goofish; a probe that failed reports under its own <key>_error rather than being folded into a verdict'
+      : 'probe: false -- nothing was asked of goofish and no browser was launched, so the four keys above are null because nobody looked, NOT because a probe failed. Call again with probe: true (the default) for the live picture.',
+  };
+  // The fast path returns here, and returns *here*: `getSession()` below is what pulls in a browser,
+  // so the freshness answer is only complete once this branch is taken. Nothing below is awaited on
+  // this path, which is what makes it instant rather than merely reordered.
+  if (!probe) return status;
+  // Past this point the probes WILL run, so the four conclusions get their live baselines before any
+  // of them is attempted. This is what keeps the two states distinguishable rather than collapsing
+  // them: `unknown` means a probe ran and could not tell, `null` means no probe ran. Restoring the
+  // original literals here rather than above is deliberate -- above, they are null for a reason.
+  status.session_state = 'unknown';
+  status.login_probe_ret = '';
+  status.feed_reachable = false;
   // Each probe is guarded on its own and reports under its own key: merged into one try, a throwing loginuser probe skipped the feed probe and its verdict, and both looked like a dead browser. The per-probe keys are the difference between "not logged in" and "not reachable".
-  const probe = async (key: string, run: () => Promise<void>): Promise<void> => { try { await run(); } catch (e: unknown) { const d = describe(e); status[`${key}_error`] = `${d.error_type}: ${d.message}`; } };
-  await probe('browser', async () => { await session.ensureReady(); });
+  const session = getSession();
+  const runProbe = async (key: string, run: () => Promise<void>): Promise<void> => { try { await run(); } catch (e: unknown) { const d = describe(e); status[`${key}_error`] = `${d.error_type}: ${d.message}`; } };
+  await runProbe('browser', async () => { await session.ensureReady(); });
   // loginuser.get is used only to prove the session is logged out, never to act as one -- and only a session- or token-shaped ret is proof; anything else leaves session_state 'unknown' rather than reading as anonymity.
-  await probe('login', async () => { const me = (await session.call([['me', LOGINUSER_API, {}]]))?.me || {}; status.login_probe_ret = String(me.ret || ''); status.session_state = me.ok ? 'unexpectedly_logged_in' : hasMarker(me.ret, NO_SESSION_MARKERS) ? 'logged_out' : 'unknown'; });
-  await probe('feed', async () => { status.feed_reachable = Boolean((await session.call([['f', FEED_API, { pageNumber: 1 }]]))?.f?.ok); });
+  await runProbe('login', async () => { const me = (await session.call([['me', LOGINUSER_API, {}]]))?.me || {}; status.login_probe_ret = String(me.ret || ''); status.session_state = me.ok ? 'unexpectedly_logged_in' : hasMarker(me.ret, NO_SESSION_MARKERS) ? 'logged_out' : 'unknown'; });
+  await runProbe('feed', async () => { status.feed_reachable = Boolean((await session.call([['f', FEED_API, { pageNumber: 1 }]]))?.f?.ok); });
   // read after the probes, so a browser that had to be relaunched shows up
   status.browser_launches = session.launches;
   // Which build is running, and whether it is current. This is here rather than in a separate check
@@ -1062,7 +1104,7 @@ const locked = (run: (args: any) => Promise<Data>): ((args: any) => Promise<Data
 const tool = <S extends z.ZodRawShape>(def: { name: string; description: string; schema: S; run: (args: Args<S>) => Promise<Data> }): ToolDef => def as ToolDef;
 const NO_ACCOUNT = ' No Xianyu account, cookie or login is required or used. Read-only: this server cannot publish, message, or change anything.';
 export const TOOLS: ToolDef[] = [
-  tool({ name: 'capabilities', description: 'Report what this server can do without a Xianyu account right now, probing the live site: session_state, feed_reachable, the split between what works and what is flaky, the measured cost of each call, the known failure causes, and `build` -- which commit is answering your calls and whether it is behind main. Read `build` first if you are measuring performance or trusting a result against the documentation: a deployment can be many commits and a whole release behind and still answer every call plausibly. Start here if you are unsure whether a call will work, what it will cost, or what a refusal means. Never raises, not even if the browser is gone. Args: none.' + NO_ACCOUNT, schema: {}, run: capabilities }),
+  tool({ name: 'capabilities', description: 'Report what this server can do without a Xianyu account right now: session_state, feed_reachable, the split between what works and what is flaky, the measured cost of each call, the known failure causes, and `build` -- which commit is answering your calls and whether it is behind main. Read `build` first if you are measuring performance or trusting a result against the documentation: a deployment can be many commits and a whole release behind and still answer every call plausibly. Start here if you are unsure whether a call will work, what it will cost, or what a refusal means. Never raises, not even if the browser is gone. Args: probe (bool, default true) -- with probe:false this answers ONLY the questions no browser is needed for (`build`, `cache`, the tool list, the measured costs) and returns immediately instead of launching Chromium first, which is what a spawn-time freshness gate or a latency measurement wants. The four live-probe keys are then null with `probes.not_measured` naming them, never a false that would read as a probe having failed.' + NO_ACCOUNT, schema: CAP_ARGS, run: capabilities }),
   tool({ name: 'browse_feed', description: 'Page through goofish\'s public homepage feed: live listings with item_id, title, price, city, seller, want_count and image_urls. Not keyword-filterable, so use it to sample inventory, not to answer a query. Args: page_number (1-10000, default 1), pages (1-25, default 1), limit (max items, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'How many goofish listings match a keyword, and whether there are any. Unlike search_items this is not subject to goofish\'s per-page-load declines -- verified returning about 28,800 for "x220" and 0 for a nonsense string anonymously. Args: query (str).' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'goofish\'s own search-box autocomplete: keyword suggestions for a prefix, plus the total suggestion count. Args: query (str), limit (default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),

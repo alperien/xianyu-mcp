@@ -120,6 +120,30 @@ and a dated section for it would be claiming a release that did not happen.
     `search_card_cache` fallback is never written to it, because pinning a five-field card for the TTL
     would turn one degraded read into a window of them. Cached pages are pooled and judged by the same
     relevance guard as a live walk, so a cached answer cannot be a laxer one.
+- **`capabilities` gained a `probe` argument, default `true`, so the freshness answer stops waiting
+  for a browser.** The `build` block — which commit is answering, and is it behind `origin/main` — was
+  assembled inside the same payload as the live browser/mtop probes, so a caller who wanted only "is
+  this deploy current?" paid a measured 60-90s cold Chromium launch for an answer that is a pure
+  function of the build stamp, the base ref and the checkout. A browser cannot change that answer,
+  and on a wedged Chromium the wait was unbounded. One caller filed the server as hung; it was
+  answering, slowly.
+  - `probe: false` returns `build`, `cache` and the static payload immediately and never calls
+    `getSession()`. Nothing about the default contract changed: `probe` defaults to `true`, so every
+    existing caller still gets the live picture, and the default itself is pinned by the
+    published-arguments invariant.
+  - **The fast path cannot imply a probe it did not run.** `session_state`, `login_probe_ret`,
+    `feed_reachable` and `browser_launches` come back `null` on the unprobed path, not `false`, and a
+    new `probes` block names them under `not_measured`. `feed_reachable: false` would assert goofish
+    did not answer when nobody asked — and a freshness gate trusting it would report a healthy server
+    as unreachable. `null` is the same "could not measure" idiom `build.stale: null` already uses,
+    and the distinction survives probe failure: `unknown` means a probe ran and could not tell, `null`
+    means none ran.
+  - Deliberately **not** a second tool, and not a two-stage answer within one call. A separate tool
+    would be a second code path to staleness, and the two could disagree about whether a deployment
+    is current — a worse bug than the latency. An MCP tool result is one-shot, so "freshness first,
+    probes after" has to be two invocations. Both paths call the same `buildBlock()`, which is the
+    same `src/build-info.ts` logic `npm run check:deploy` runs, so there is one staleness rule,
+    tested once.
 
 ### Changed
 

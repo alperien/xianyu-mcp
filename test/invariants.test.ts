@@ -191,7 +191,9 @@ test('the published argument names and defaults are exactly these', () => {
     return [k, parsed.data === undefined ? '<optional>' : parsed.data];
   }));
   const published: Record<string, any> = {
-    capabilities: {},
+    // `probe: true` by default, and it exists at all so the freshness answer does not have to wait
+    // for a browser launch -- see capabilities in tools.ts.
+    capabilities: { probe: true },
     browse_feed: { page_number: 1, pages: 1, limit: 60 },
     search_count: { query: '<required>' },
     search_suggest: { query: '<required>', limit: 20 },
