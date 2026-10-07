@@ -1,71 +1,68 @@
-/** A TTL cache for the two answers that are both expensive to produce and safe to produce again --
- *  and, the part that actually matters here, the rule that a cached answer is never allowed to look
- *  like a live one.
+/** A TTL cache for the two answers that are both expensive to produce and safe to produce again, and
+ *  for the rule that a cached answer never gets to look like a live one.
  *
- *  Two things are cached and nothing else: the listing `readListing` produced for an item id, and the
- *  raw `mtop.taobao.idlemtopsearch.pc.search` payload for one (query, page) pair. Both are keyed on
- *  what identifies the answer rather than on how it was asked for, and both are read back through
- *  the same relevance and identity guards a live answer is held to -- a cached pool of search pages
- *  is pooled and judged by the same `finishSearch`, and a cached listing is the listing the detail
- *  API was checked to be about. A cache that short-circuits those checks would be a second, laxer
- *  answer path, which is the opposite of what is wanted here.
+ *  Two things are cached and nothing else: the listing `readListing` produced for an item id, and
+ *  the raw `mtop.taobao.idlemtopsearch.pc.search` payload for one (query, page) pair. Both are keyed
+ *  on what identifies the answer rather than on how it was asked for, and both are read back through
+ *  the same relevance and identity guards a live answer is held to. A cached pool of search pages is
+ *  pooled and judged by the same `finishSearch`, and a cached listing is the listing the detail API
+ *  was checked to be about. A cache that short-circuited those checks would be a second, laxer
+ *  answer path.
  *
- *  The mtop-only tools are deliberately not cached (`search_count`, `search_suggest`, `seller_*`),
- *  and neither is the homepage feed. The first three cost 0.4-2.2s and there is nothing to save; the
- *  feed is a different matter -- measured, two identical `browse_feed` calls return completely
- *  disjoint inventory, so goofish serves each visitor a randomised slice and a repeat call is not a
- *  stale copy of the first one, it is a different answer. Caching it would replace "a sample of
- *  inventory" with "the same sample of inventory", which is a change of meaning dressed as a speed-up.
+ *  The mtop-only tools are not cached (`search_count`, `search_suggest`, `seller_*`), and neither is
+ *  the homepage feed. The first three cost 0.4-2.2s and there is nothing to save. The feed is a
+ *  different matter: measured, two identical `browse_feed` calls return completely disjoint
+ *  inventory, so goofish serves each visitor a randomised slice and a repeat call is a different
+ *  answer rather than a stale copy. Caching it would replace a sample of inventory with the same
+ *  sample of inventory.
  *
- *  ## Why these TTLs, rather than a number that looked reasonable
+ *  ## Why 45s and 120s
  *
- *  The honest position is that nobody here has measured how fast an individual Xianyu listing sells,
- *  and this file does not invent one. What the repo does hold is two change-rate facts and a set of
- *  costs, and the defaults are chosen against those:
+ *  Nobody here has measured how fast an individual Xianyu listing sells, and this file does not
+ *  invent a figure. The repo holds two change-rate facts and a set of costs, and the defaults are
+ *  chosen against those:
  *
- *  - **The market moves inside a single session.** goofish's own match counter for "x220" was
- *    observed at 28,791 / 28,804 / 28,810 -- a live-inventory count that drifts by ~0.07% within one
- *    session's calls. A listing *set* cached for minutes is already describing a market that has
- *    measurably turned over under it, which is the argument against a long TTL, not a short one.
- *  - **What the cache replaces is expensive.** An item page load is 4-10s (measured, warm and cold),
- *    a `detail` read ~8s a listing, a warm re-search 4-12s, and one page of the result pager
- *    5-9.5s. A TTL below the cost of the read it replaces buys nothing at all: the entry would
- *    expire before the caller came back for it.
- *  - **The two caches are not the same risk.** A stale *item detail* is a price on a listing that
- *    may since have been sold, which is the specific failure the bead calls worse than a slow
- *    response -- so it gets the shorter window. A stale *search page* is 30 listings being compared
- *    against each other, none of which the caller is transacting, and the liveness of any one of
- *    them is exactly what a detail read re-checks. So it gets the longer one.
+ *    - the market turns over inside one session. goofish's own match counter for "x220" was observed
+ *      at 28,791 / 28,804 / 28,810, a live-inventory count drifting ~0.07% within one session's
+ *      calls. A listing *set* cached for minutes is describing a market that has measurably moved
+ *      under it, which is the argument against a long TTL.
+ *    - what the cache replaces is expensive. An item page load is 4-10s (measured, warm and cold), a
+ *      `detail` read ~8s a listing, a warm re-search 4-12s, and one page of the result pager
+ *      5-9.5s. A TTL under the cost of the read it replaces buys nothing: the entry expires before
+ *      the caller comes back for it.
+ *    - the two caches carry different risk. A stale *item detail* is a price on a listing that may
+ *      since have been sold, which is worse than a slow response, so it takes the shorter window. A
+ *      stale *search page* is 30 listings compared against each other, none of which the caller is
+ *      transacting, and a detail read re-checks the liveness of any one of them, so it takes the
+ *      longer one.
  *
- *  Hence 45s for an item detail and 120s for a search page: each long enough to cover the loop the
+ *  So 45s for an item detail and 120s for a search page: each long enough to cover the loop the
  *  cache exists for (read a result page, open what looks interesting, open it again), each short
- *  enough that a sold listing is at most 45s out of date, and neither pretending to a freshness the
- *  site has not promised. Both are overridable per process -- `XIANYU_CACHE_ITEM_TTL_S`,
- *  `XIANYU_CACHE_SEARCH_TTL_S` -- and `XIANYU_CACHE=0` turns the whole thing off, which is the answer
- *  for a caller who would rather pay the 8s than reason about a TTL at all. Read per call, like
- *  `budget` in tools.ts, so a script can change it without a restart.
+ *  enough that a sold listing is at most 45s out of date, and neither claiming a freshness the site
+ *  has not promised. Both are overridable per process (`XIANYU_CACHE_ITEM_TTL_S`,
+ *  `XIANYU_CACHE_SEARCH_TTL_S`), and `XIANYU_CACHE=0` turns the whole thing off, which is the answer
+ *  for a caller who would rather pay the 8s than reason about a TTL. Read per call, like `budget` in
+ *  tools.ts, so a script can change it without a restart.
  *
  *  ## Staleness is published, never silent
  *
  *  Every answer that can come from here carries a `CacheVerdict` on its envelope: `hit`, `age_s`,
  *  `stored_at`, `ttl_s`, the `key` it was looked up under, and a sentence saying in plain words
- *  whether goofish was asked at all. A miss publishes the same block with `hit: false` and null
- *  ages, so the shape of the answer does not depend on where the answer came from -- which is the
- *  same rule the `typed`/`missing` block follows for the routes that answer a listing. The
- *  alternative -- serving cached bytes in the shape of a live read and hoping nobody asks -- is the
- *  one thing this module exists to prevent.
+ *  whether goofish was asked at all. A miss publishes the same block with `hit: false` and null ages,
+ *  so the shape of the answer does not depend on where it came from, the same rule the
+ *  `typed`/`missing` block follows for the routes that answer a listing. Serving cached bytes in the
+ *  shape of a live read and hoping nobody asks is the one thing this module exists to prevent.
  *
- *  Only successes are ever stored. There is no `putFailure` and no way to reach one: a refused or
- *  unparseable answer leaves the cache exactly as it found it, because a miss is always safe and a
- *  wrong cache is not. */
+ *  Only successes are stored. There is no `putFailure` and no way to reach one: a refused or
+ *  unparseable answer leaves the cache as it found it. A miss is always safe, a wrong cache is not. */
 type Entry = { value: any; stored: number };
 
-/** What every answer this cache touches publishes about itself. `hit` is the contract; the rest is
- *  there so a caller can see how old the answer is and look up what it was keyed on. */
+/** What every answer this cache touches publishes about itself. `hit` is the contract; the rest lets
+ *  a caller see how old the answer is and what it was keyed on. */
 export type CacheVerdict = {
   /** true only when this value came out of this process rather than off goofish. */
   hit: boolean;
-  /** What it was keyed on -- `item:809806779491`, `search:thinkpad x220#2` -- so a miss reads as
+  /** What it was keyed on, `item:809806779491` or `search:thinkpad x220#2`, so a miss reads as
    *  "a different thing was asked for" rather than "the cache is broken". */
   key: string;
   /** Whole seconds since the value was stored. null on a miss: a miss has no age. */
@@ -78,16 +75,16 @@ export type CacheVerdict = {
   note: string;
 };
 
-/** One store per kind rather than one with prefixed keys: the caps differ by two orders of
- *  magnitude (a listing is kilobytes, a page of 30 raw search cards is ~100KB) and so do the TTLs,
- *  and a caller reading `stats` should see the two numbers separately. */
+/** One store per kind rather than one with prefixed keys: a listing is kilobytes and a page of 30 raw
+ *  search cards ~100KB, the TTLs differ, and a caller reading `stats` should see the two numbers
+ *  separately. */
 const items = new Map<string, Entry>(), pages = new Map<string, Entry>();
-/** 64 listings holds the 50 a `detail: 50` comparison reads plus room, and 16 search pages holds a
- *  full deepest walk (10 pager pages + the 2 top-up pages) with a little slack -- so the cache is
- *  sized to the largest answer this server can produce, not to an arbitrary round number. */
+/** 64 listings holds the 50 a `detail: 50` comparison reads plus room; 16 search pages holds a full
+ *  deepest walk (10 pager pages + the 2 top-up pages) with slack. The caps are sized to the largest
+ *  answer this server can produce rather than to a round number. */
 const MAX_ITEMS = 64, MAX_SEARCH_PAGES = 16;
 /** An override is floored at 1s so a typo cannot turn the cache into a no-op that still claims to be
- *  on, and capped at 600s so it cannot restore a window no measurement here supports. `0` is how you
+ * on, and capped at 600s so it cannot restore a window no measurement here supports. `0` is how you
  *  ask for the whole thing off -- see `on()`. */
 const TTL_FLOOR_S = 1, TTL_CEILING_S = 600;
 const DEFAULT_ITEM_TTL_S = 45, DEFAULT_SEARCH_TTL_S = 120;
@@ -100,27 +97,27 @@ const ttl = (name: string, fallback: number): number => {
   const raw = process.env[name], n = Number(raw);
   return raw?.trim() && Number.isInteger(n) ? Math.max(TTL_FLOOR_S, Math.min(TTL_CEILING_S, n)) : fallback;
 };
-/** How long a listing read may be served again. See the header for why 45s and why it is not more. */
+/** How long a listing read may be served again. See the header for why 45s and why not more. */
 export const itemTtl = (): number => ttl('XIANYU_CACHE_ITEM_TTL_S', DEFAULT_ITEM_TTL_S);
 /** How long one page of search results may be served again. See the header. */
 export const searchTtl = (): number => ttl('XIANYU_CACHE_SEARCH_TTL_S', DEFAULT_SEARCH_TTL_S);
 
-/** Copy on the way in and on the way out. The values here are plain data read off a JSON payload,
- *  but the callers spread them into their own envelopes and one of them (`enrichDetails`) merges a
- *  cached listing into a card it then publishes -- so handing out a live reference into module state
- *  would let a later edit of an answer rewrite the cached copy of it. A microsecond of structuredClone
- *  is not a price worth paying to make that impossible. */
+/** Copy on the way in and on the way out. These values are plain data read off a JSON payload, but
+ *  callers spread them into their own envelopes and one of them (`enrichDetails`) merges a cached
+ *  listing into a card it then publishes, so a live reference into module state would let a later
+ *  edit of an answer rewrite the cached copy of it. A microsecond of structuredClone is cheap for
+ *  making that impossible. */
 const copy = <T>(value: T): T => (value === null || typeof value !== 'object' ? value : structuredClone(value));
 
 /** Insert, then evict the least recently used entry if the store is over its cap. Re-inserting on
  *  read as well as on write is what makes the eviction LRU rather than oldest-written, so re-opening
- *  the listing you are actually working on keeps its place. */
+ *  the listing you are working on keeps its place. */
 const store = (into: Map<string, Entry>, key: string, value: any, cap: number): void => {
   into.delete(key);
   into.set(key, { value, stored: Date.now() });
   while (into.size > cap) into.delete(into.keys().next().value as string);
 };
-/** A live entry for this key, or null. Expired entries are deleted on the way past rather than left
+/** A live entry for this key, or null. An expired entry is deleted on the way past rather than left
  *  to be counted, so `stats` cannot report a window the cache would not actually serve. */
 const load = (from: Map<string, Entry>, key: string, ttlS: number): Entry | null => {
   const hit = from.get(key);
@@ -134,9 +131,9 @@ const load = (from: Map<string, Entry>, key: string, ttlS: number): Entry | null
 const iso = (ms: number): string => new Date(ms).toISOString();
 const seconds = (s: number): number => Math.round(s * 10) / 10;
 
-/** A `hit: true` block: where the value came from, how old it is, and the sentence that says
- *  goofish was not asked. `age_s` is deliberately a float -- "0" reads as "just now" when it may
- *  mean "0.4s ago", and rounding to whole seconds is what makes a cache look fresher than it is. */
+/** A `hit: true` block: where the value came from, how old it is, and the sentence saying goofish
+ *  was not asked. `age_s` is a float because "0" reads as "just now" when it may mean "0.4s ago", and
+ *  rounding to whole seconds is what makes a cache look fresher than it is. */
 const hit = (key: string, entry: Entry, ttlS: number, what: string): CacheVerdict => {
   const ageS = seconds((Date.now() - entry.stored) / 1000);
   return { hit: true, key, age_s: ageS, stored_at: iso(entry.stored), ttl_s: ttlS,
@@ -147,7 +144,7 @@ const hit = (key: string, entry: Entry, ttlS: number, what: string): CacheVerdic
 export const missed = (key: string, ttlS: number, what: string): CacheVerdict => ({
   hit: false, key, age_s: null, stored_at: null, ttl_s: ttlS,
   note: on() ? `${what} was not in the cache (or what was there is past its ${ttlS}s TTL), so goofish answered it live just now` : `the cache is off (XIANYU_CACHE=0), so ${what} was answered live just now` });
-/** A `hit: false` block for a route that never consults the cache at all -- search_items' rendered-page
+/** A `hit: false` block for a route that never consults the cache: search_items' rendered-page
  *  fallback, which scrapes the DOM rather than reading the search API's payload. Same shape as every
  *  other verdict so the envelope does not change with the route, and an empty `key` because nothing
  *  was looked up. */
@@ -157,19 +154,19 @@ export const notCached = (what: string, ttlS: number): CacheVerdict => ({
 
 export const itemKey = (itemId: string): string => `item:${itemId}`;
 /** The key is the *normalized* query, lowercased, because the relevance guard it will be pooled
- *  through matches titles case-insensitively ("X220" and "x220" are the same search) -- so keying on
- *  the raw string would store the same page twice and serve half of it never. */
+ *  through matches titles case-insensitively ("X220" and "x220" are the same search). Keying on the
+ *  raw string would store the same page twice and serve half of it never. */
 export const searchKey = (query: string, page: number): string => `search:${String(query).trim().toLowerCase()}#${page}`;
 
 /** A listing read earlier in this process, or null. `readListing` asks this before it opens a page,
- *  which is the whole saving: a repeat view costs nothing instead of 4-10s. */
+ *  and that is the whole saving: a repeat view costs nothing instead of 4-10s. */
 export const getItem = (itemId: string): { value: any; verdict: CacheVerdict } | null => {
   if (!on()) return null;
   const key = itemKey(itemId), ttlS = itemTtl(), entry = load(items, key, ttlS);
   if (!entry) return null;
   return { value: copy(entry.value), verdict: hit(key, entry, ttlS, 'this listing') };
 };
-/** Store a listing read just now. Only ever called with a listing goofish actually answered for: the
+/** Store a listing read just now. Called only with a listing goofish answered in full: the
  *  `search_card_cache` fallback deliberately does not come through here, because pinning a
  *  five-field card for the TTL would turn one degraded read into a window of them. */
 export const putItem = (itemId: string, listing: any): void => { if (on() && listing) store(items, itemKey(itemId), copy(listing), MAX_ITEMS); };
@@ -185,9 +182,9 @@ export const getSearchPage = (query: string, page: number): { value: any; verdic
 export const putSearchPage = (query: string, page: number, payload: any): void => { if (on() && payload) store(pages, searchKey(query, page), copy(payload), MAX_SEARCH_PAGES); };
 
 /** The `cache` block a pooled search answer publishes: one line per pager page, so which of the
- *  listings behind `count` were read when is visible rather than implied. A search whose pages came
- *  from different moments -- page 1 fresh, page 3 ninety seconds old -- is a real case here, and
- *  reporting one age for the whole set would be a claim about a set that does not exist. */
+ *  listings behind `count` were read when is visible rather than implied. Pages read at different
+ *  moments happen here (page 1 fresh, page 3 ninety seconds old), and one age for the whole set
+ *  would be a claim about a set that does not exist. */
 export const pageReport = (lines: { page: number; hit: boolean; age_s: number | null }[]): Record<string, any> => {
   const ttlS = searchTtl(), hits = lines.filter((l) => l.hit);
   return { enabled: on(), hits: hits.length, misses: lines.length - hits.length, ttl_s: ttlS, pages: lines,
@@ -196,11 +193,11 @@ export const pageReport = (lines: { page: number; hit: boolean; age_s: number | 
       : `${hits.length} of ${lines.length} page(s) were served from this process's own cache and the rest were read live just now; a cached page may no longer be what goofish would return, so read a listing before relying on its price (TTL ${ttlS}s)` };
 };
 
-/** What `capabilities` reports, so the cache is visible before it is relied on rather than only
+/** What `capabilities` reports, so the cache is visible before it is relied on rather than first
  *  discovered inside a `cache` block on a tool answer. */
 export const stats = (): Record<string, any> => ({ enabled: on(), item_ttl_s: itemTtl(), search_page_ttl_s: searchTtl(), listings: items.size, search_pages: pages.size,
   note: 'item detail and search pages are cached in this process for the TTLs above, and every answer that can come from the cache says so in a `cache` block. Set XIANYU_CACHE=0 to turn it off; nothing else in this server is cached, and the homepage feed deliberately is not -- goofish serves each visitor a different slice of it, so a repeat call is a different answer rather than a stale copy.' });
 
-/** Forget everything. The stores are module state that outlives a call, and a test that seeded one
+/** Forget everything. These stores are module state that outlives a call, so a test that seeded one
  *  would otherwise have the next tool answered from it -- the same reason `resetCardCache` exists. */
 export const reset = (): void => { items.clear(); pages.clear(); };
