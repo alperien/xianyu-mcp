@@ -22,6 +22,33 @@ been released and a dated section for it would have been claiming a release that
 
 ### Added
 
+- **`search_items`'s `detail` reads two listing pages at a time, and says when it stops.** One page
+  load per listing is the cost of `detail`, measured warm at a median of 13.4s (n=8, 8/8 answered) --
+  about 4.5 minutes for 20 listings and 11 for the 50 a side-by-side comparison wants. Loading four at
+  once was measured and not built, because it needed four DOM pages and the fan-out loop is
+  `search_items`' own; the loop now has the pages, so it is built. Measured: 66.3s → 27.1s for four
+  listings (2.4x, not 4x), at the price of each listing's *own* latency going 11.4s → 20.5s.
+  - *Width two, not four.* The wider fan-out buys its throughput by making every individual answer
+    slower, and the caller reads those per-listing milliseconds, not the batch. Four is where the
+    measurement stops improving the per-listing figure at all, so it is also the hard ceiling on the
+    pool (`DETAIL_POOL_MAX`), and `XIANYU_DETAIL_FANOUT` (0–4, default 2) moves the width below it.
+  - *The guard, which is the other half of the measurement.* On a throttled site four-at-once answered
+    0/4 where the serial walk of the same four still answered 2/4: batching turns a per-listing latency
+    problem into an all-or-nothing one, and a partial answer is reportable here while a missing one is
+    not. So the first fan-out batch that comes back with nothing at all turns the fan-out off for the
+    rest of the call, and the remaining listings are read the old way. The check reads what goofish
+    answered, not whether a listing came back -- a dead batch falls back to the search card this call
+    already has, which would have read as `ok` for every listing and kept the fan-out running exactly
+    when it was buying nothing.
+  - *It never touches the shared page.* The pool is leased from the session (`Session.fanoutSurface`),
+    one page and one mtop tap per slot, capped and refused rather than grown; the shared `domPage` is
+    holding the search results the call is deepening. The lock is the one `search_items` already takes,
+    so two searches' fan-outs cannot overlap and no other tool can name a slot.
+  - *It is published, not asserted.* `detail_fanout` carries the width, the batches, how many listings
+    came back out of one and whether it backed off; every listing in `detail_report` carries its own
+    `ms`, its `via` (`fanout` / `serial`) and its `slot`. `XIANYU_DETAIL_FANOUT=0` is the exact serial
+    walk that shipped before any of this.
+
 - **`scripts/serve.mjs`, a launcher that will not start a server on a `dist/` it cannot vouch for.**
   Point an MCP client at it instead of at `node dist/index.js` and a stale deployment stops being
   possible rather than merely detectable. It compares the build's stamp against the checkout's HEAD at

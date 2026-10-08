@@ -95,6 +95,7 @@ full answer, base ref and fetch included, is what it runs when it has to rebuild
 | `XIANYU_RECOMMENDATIONS_BUDGET_S` | 45 | wall-clock budget for the `recommendations` retry loop (5–600s) |
 | `XIANYU_SELLER_PROFILE_BUDGET_S` | 90 | wall-clock budget for the item-page hop `seller_profile` / `seller_items` make when given an `item_id` (5–600s). A lookup by `user_id` runs no loop and spends none of it |
 | `XIANYU_SEARCH_MAX_ITEMS` | 300 | ceiling for one `search_items` call, in listings -- clamps both `limit` and how deep the pager walk goes (30–300), so a huge walk stays inside `XIANYU_SEARCH_BUDGET_S` |
+| `XIANYU_DETAIL_FANOUT` | 2 | how many listing pages `detail` loads at once (0–4), `0` reads them one at a time -- see [the detail fan-out](#detail-reads-two-listings-at-a-time-and-says-when-it-stops) |
 | `XIANYU_CACHE` | `1` | `0` turns the item-detail / search-page cache off entirely, no restart -- see [the cache](#repeat-views-are-cached-and-the-cache-says-so) |
 | `XIANYU_CACHE_ITEM_TTL_S` | 45 | how long a listing read in full may be served again (1–600) |
 | `XIANYU_CACHE_SEARCH_TTL_S` | 120 | how long one page of search results may be served again (1–600) |
@@ -259,13 +260,10 @@ a thin market at about 14s extra rather than letting a degraded page silently un
 `detail: N` reads the top N of the ranked results in full -- description, every photo, and the seller
 with their city, tenure, sales count, rating, reply rate, signature and 芝麻 status. It is **one page
 load per listing -- measured at a median of 13.4s warm** (n=8, 8/8 answered: 4.5s to `domcontentloaded`,
-then goofish's own detail call lands 9–17s after that) -- and it is walked serially. That serial walk is
-deliberate, and the reason was re-measured rather than assumed: `item_view` cannot be an SPA route
-change (0/8 answered in 32s -- the item page is a micro-frontend with no reachable router and no item
-links to click), while four pages loading four listings at once does cut the batch's wall clock when
-the site is healthy (27.1s for 4 against 66.3s serially, 2.4×) but loses answers outright when it is
-not (0/4 answered against 2/4 serially) and doubles each listing's own latency. So it buys throughput
-by risking the answers, which is not a trade this server makes silently. Budget for 6–11 minutes on 50.
+then goofish's own detail call lands 9–17s after that) -- and `item_view` cannot skip it: an SPA route
+change is not available at all (0/8 answered in 32s, because the item page is a micro-frontend with no
+reachable router and no item links to click). What `detail` *can* do is stop loading them one after
+another. See [the next section](#detail-reads-two-listings-at-a-time-and-says-when-it-stops).
 
 **`search_items("thinkpad x220", pages: 2, limit: 50, detail: 50)`, measured:**
 
@@ -286,6 +284,42 @@ you want in depth, not on all fifty.
 answered, from which route, and what goofish said when it did not. A listing that will not answer
 falls back to the search card rather than being dropped, and says so in `detail_source` -- a shorter
 list is fine, a dishonest one is not.
+
+### `detail` reads two listings at a time, and says when it stops
+
+Four pages loading four listings at once takes the batch's wall clock from **66.3s to 27.1s** -- 2.4×,
+not 4× -- and costs something the wall clock hides: each listing's *own* latency goes **11.4s →
+20.5s**. On a site that was throttling the anonymous IP the same four-wide run answered **0/4**, where
+the serial walk of the same four still answered **2/4**. So the second number is the one that decides
+the shape: batching turns a per-listing latency problem into an all-or-nothing one, and on a
+read-only server a partial answer is reportable while a missing one is not.
+
+So `detail` does it anyway, bounded and guarded:
+
+| | |
+|---|---|
+| **width** | 2 at a time (`XIANYU_DETAIL_FANOUT`, 0–4), each on a page of its own -- **never** the shared page, which is still holding the search results the call is deepening |
+| **the pool** | leased from the session and capped at `DETAIL_POOL_MAX`; a slot past it is refused rather than opened, because a pool that grows on request is a pool nobody measured |
+| **the guard** | the first batch that comes back with *no* answer at all turns the fan-out off for the rest of the call, and the rest is read the old way -- one load at a time on the shared page |
+| **the report** | `detail_fanout` says the width, the batches, how many listings came back out of one, and whether it backed off; every listing in `detail_report` carries its own `ms`, its `via` (`fanout` / `serial`) and its `slot` |
+
+The guard reads what **goofish** answered, not whether a listing came back at all -- a throttled batch
+fails every page and falls back to the search card this call already has, which is `ok` for every
+listing. A check on `ok` would have kept the fan-out running exactly when it was buying nothing. It
+also means a batch of two listings that are both simply gone reads the same way and backs the fan-out
+off: serial is the slow, conservative route, so the cost of a wrong guess is a slower `detail`, never a
+listing that was never read.
+
+**This costs nothing for anyone who does not ask for it.** `detail: 0` is unchanged, `detail: 1` leases
+one page, and `XIANYU_DETAIL_FANOUT=0` is the exact serial walk that shipped before any of this -- the
+same pages, the same report, the same envelope.
+
+**What it costs, measured.** The 50-listing run above (410s, then 548s) was the serial walk; the
+fan-out's own measurement is 66.3s → 27.1s for four listings, and its width here is half that, so a
+`detail: 50` on a healthy site should land well under the serial number -- but the honest reading is
+that this is a speed-up worth measuring on *your* site, not a new constant: `detail_fanout.batches` and
+every listing's own `ms` are in the envelope, which is how you check whether the guard fired and what
+it actually bought. Budget 6–11 minutes on 50 if it falls back.
 
 A query matches by its terms, in any order. That is not a detail. goofish titles are in whatever
 word order the seller typed, and Chinese has no spaces to learn word boundaries from, so an exact
@@ -594,6 +628,11 @@ page -- named as `site_error`, and retried rather than waited on.
   the live site are then `null` under `probes.not_measured`, never `false`: "nobody looked" is not
   "looked, and it failed", and `capabilities` must not report a probe it did not run. See
   [which build is answering](#which-build-is-answering-and-is-it-current).
+- **A speed-up is never invisible.** `detail`'s fan-out reports the width it ran at, how many batches,
+  and whether it fell back, in `detail_fanout` -- and every listing in `detail_report` carries its own
+  `ms`, its `via` and its `slot`. The batch's wall clock is never presented as the listing's cost,
+  because measured on this site it is not: at four wide the batch fell 2.4x while each listing's own
+  latency rose from 11.4s to 20.5s. See [the detail fan-out](#detail-reads-two-listings-at-a-time-and-says-when-it-stops).
 - **The page is never clicked.** A structural test fails if a `.click(` call appears anywhere in
   `src/` or `test/`, and if the dismisser's selectors come back.
 - One version, written once. The version in the MCP handshake is read out of `package.json` at

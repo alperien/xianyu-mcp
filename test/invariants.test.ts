@@ -140,6 +140,31 @@ test('the two seller tools take the shared lock only for the item-page hop, and 
   }
 });
 
+test('the detail fan-out is reachable only from inside the lock its caller already holds', () => {
+  // `detail`'s fan-out loads two listing pages at a time, and the thing that keeps that safe is not a
+  // lock of its own -- it is that it runs *inside* `search_items`, which is already wrapped in the
+  // shared lock. A second search, an `item_view` and a `recommendations` call therefore cannot be in
+  // flight beside a fan-out, and the pool pages are invisible to every other tool. That property is
+  // entirely about where this is called from, so it is asserted here rather than trusted: the fan-out
+  // has exactly one caller, that caller has exactly two call sites, and both are inside the tool that
+  // holds the lock.
+  const toolsSrc = read(join(ROOT, 'src', 'tools.ts'));
+  const fanout = toolsSrc.match(/const enrichDetails = [\s\S]*?\n};/)?.[0] ?? '';
+  assert.match(fanout, /session\.fanoutSurface\(/, 'the fan-out leases its pages from the session');
+  assert.equal((toolsSrc.match(/enrichDetails\(/g) ?? []).length, 1, 'exactly one call site');
+  assert.equal((toolsSrc.match(/publishSearch\(/g) ?? []).length, 2, 'and exactly two call sites for its publisher');
+  assert.equal((toolsSrc.match(/session\.fanoutSurface\(/g) ?? []).length, 1, 'so nothing else leases a pool page');
+  // both routes into a pooled answer -- the cache fast path and the live walk -- go through that one
+  // publisher, so there is no way to reach the fan-out that skips the lock
+  const search = toolsSrc.match(/const searchItems = async[\s\S]*?\n};/)?.[0] ?? '';
+  assert.equal((search.match(/publishSearch\(/g) ?? []).length, 2, 'both are inside search_items');
+  assert.match(toolsSrc, /run: locked\(searchItems\)/, 'and the tool that reaches it holds the shared lock');
+  // The fallback is not a silent one: the fan-out either ran or says why it did not, and both are in
+  // the envelope rather than in a comment above this function.
+  assert.match(fanout, /fellBack/, 'the answer-rate check is in the loop, not beside it');
+  assert.match(toolsSrc, /readFromGoofish/, 'and the check reads what goofish answered, not whether a card was returned');
+});
+
 test('every tool says that no account is required, and that it is read-only', () => {
   for (const t of TOOLS) {
     assert.match(t.description, /No Xianyu account/, t.name);
@@ -232,22 +257,27 @@ test('both navigation sites re-check the URL, before and after the redirect', ()
   const src = read(join(ROOT, 'src', 'browser.ts'));
   const [load] = src.match(/async function load\([\s\S]*?\n}/) ?? [];
   assert.ok(load && load.includes('page.goto('), 'the one place a chosen URL is loaded from');
-  // open() and fanoutSurface() both delegate to loadInto(), which is now the single place a URL is
-  // loaded from -- so the allowlist checks belong there, and asserting them inside open() would only
-  // be asserting the shape of an earlier refactor.
-  const into = src.match(/private async loadInto\([\s\S]*?\n  }/)?.[0] ?? '';
-  assert.ok(into, 'loadInto is where a chosen URL is loaded from');
-  for (const site of ['open', 'fanoutSurface']) {
-    const body = src.match(new RegExp(`async ${site}\\([\\s\\S]*?\\n  }`))?.[0] ?? '';
-    assert.ok(body.includes('this.loadInto('), `${site} must go through loadInto, not page.goto directly`);
-  }
+  // loadInto is the one function that navigates a page a caller owns, and open() (the shared dom page)
+  // and fanoutSurface() (a fan-out slot's own page) both go through it. That is the shape the ordering
+  // assertions below are about: there is a single navigation site, so a second one that forgot the
+  // allowlist cannot be written -- and the two entry points are checked to still be delegating, since
+  // the failure mode of this refactor is a third site growing beside it rather than the check moving.
+  const site = src.match(/private async loadInto\([\s\S]*?\n  }/)?.[0] ?? '';
   // before the goto, after it, and once more on the way out: the settle and the mtop wait after the
   // second check can take tens of seconds, so the check that is still current when the caller scrapes
   // is the last.
-  assert.ok((into.match(/ensureGoofishUrl\(/g) ?? []).length >= 3, into);
-  assert.ok(into.indexOf('ensureGoofishUrl(url)') < into.indexOf('load(page, target)'));
-  assert.ok(into.indexOf('load(page, target)') < into.indexOf('ensureGoofishUrl(page.url())'));
-  assert.ok(into.lastIndexOf('ensureGoofishUrl(page.url())') > into.indexOf('waitForMtop(page)'), into);
+  assert.ok((site.match(/ensureGoofishUrl\(/g) ?? []).length >= 3, site);
+  assert.ok(site.indexOf('ensureGoofishUrl(url)') < site.indexOf('load(page, target)'));
+  assert.ok(site.indexOf('load(page, target)') < site.indexOf('ensureGoofishUrl(page.url())'));
+  assert.ok(site.lastIndexOf('ensureGoofishUrl(page.url())') > site.indexOf('waitForMtop(page)'), site);
+  // the fan-out's page is a page like any other: it gets the same checks, not a cheaper navigation
+  const lease = src.match(/async fanoutSurface\([\s\S]*?\n  }/)?.[0] ?? '';
+  assert.match(lease, /this\.loadInto\(/, 'the fan-out must navigate through the one checked site');
+  assert.equal(/load\(page|\.goto\(|\.reload\(/.test(lease), false, 'and must not navigate on its own');
+  const open = src.match(/async open\([\s\S]*?\n  }/)?.[0] ?? '';
+  assert.match(open, /this\.loadInto\(/, 'open must navigate through the one checked site');
+  // and the fan-out's bound is a refusal rather than a clamp: a slot past the measured width is an error
+  assert.match(src.match(/async fanoutSurface\([\s\S]*?\n  }/)?.[0] ?? '', /DETAIL_POOL_MAX/);
   // reloadFresh re-validates wherever the page ended up, which is not something we chose, and it
   // does not swallow that refusal: its three callers scrape whatever is on the page next.
   const fresh = src.match(/async function reloadFresh\([\s\S]*?\n}/)?.[0] ?? '';
