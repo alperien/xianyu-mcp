@@ -1,23 +1,25 @@
-/** The ten tools. Capability split, all of it measured rather than assumed: browse_feed, search_count, search_suggest, related_items, seller_profile and seller_items run on the api page and need nothing but goofish's mtop client; item_view and search_items drive the dom page and read what its own bundle fetches; capabilities never raises, even if the browser is gone. Nothing that touches a page goes through anything but browser.ts, so a Playwright failure arrives as a typed XianyuError rather than escaping a tool call.
+/** The ten tools. Six run on the api page and need nothing but goofish's mtop client:
+ *  browse_feed, search_count, search_suggest, related_items, seller_profile, seller_items. Two drive
+ *  the dom page and read the replies its own bundle fetches: item_view and search_items.
+ *  capabilities never raises, even when the browser is gone. Every page read goes through
+ *  browser.ts, so a Playwright failure arrives as a typed XianyuError instead of escaping a call.
  *
- *  The mtop-only tools do not queue behind the two that drive a browser, and that is the largest
- *  latency change in the server: they used to share one page, so a search that took 70s held up a feed
- *  call that does 1.5s of work. That promise is kept *here* rather than in the entry point: the lock is
- *  taken by the three tools that read the one navigating page (`search_items`, `item_view`,
- *  `recommendations`), and by nothing else. Wrapping every tool at the entry point instead -- which is
- *  what used to happen -- silently re-serialised the fast ones behind every slow one, and the test
- *  that claimed to prove otherwise called `t.run` directly and so never exercised the shipped path.
+ *  The mtop-only tools do not queue behind the ones that drive a browser. They used to share one
+ *  page, and a 70s search held up a feed call that does 1.5s of work. The lock therefore sits here,
+ *  on the three tools that read the one navigating page (`search_items`, `item_view`,
+ *  `recommendations`), and nowhere else. Wrapping every tool at the entry point re-serialised the
+ *  fast ones behind the slow ones, and the test that claimed to rule that out called `t.run`
+ *  directly, so it never ran the shipped path.
  *
- *  `seller_profile` and `seller_items` are the exception that proves it, and they are the reason the
- *  rule is stated as "the lock is taken where a navigating page is read" rather than as a tool list.
- *  Given a `user_id` they are two plain mtop calls and take nothing. Given an `item_id` they have to
- *  find the seller behind that listing first, and the only route to that is the detail call the item
- *  page makes for itself -- so they take the lock for exactly that hop and release it before the mtop
- *  calls. See `resolveSeller`.
+ *  `seller_profile` and `seller_items` are why the rule is stated as "where a navigating page is
+ *  read" and not as a tool list. With a `user_id` they are two plain mtop calls that take nothing.
+ *  With an `item_id` they have to find the seller behind that listing first, and the only route to
+ *  one is the detail call the item page makes for itself: they hold the lock for that hop and drop
+ *  it before the mtop calls. See `resolveSeller`.
  *
  *  One thing does hold more than one page, and only inside a lock it already holds: `detail`'s bounded
- *  fan-out loads two listing pages at a time from the session's own pool, because a search is the one
- *  caller that is allowed to be slow on purpose and the pool pages are invisible to every other tool.
+ *  fan-out loads two listing pages at a time out of the session's own pool, because a search is the
+ *  one caller allowed to be slow on purpose and the pool pages are invisible to every other tool.
  *  See `enrichDetails` for the measurement that set the width and the guard that shuts it off. */
 import { z } from 'zod';
 import type { Page } from 'playwright';
@@ -25,49 +27,57 @@ import { DetailUnavailableError, describe, GatedError, NavigationError, ParseErr
 import { buildBlock } from './build.ts';
 import { getItem, getSearchPage, itemKey, itemTtl, missed, notCached, pageReport, putItem, putSearchPage, searchTtl, stats as cacheStats } from './cache.ts';
 import type { CacheVerdict } from './cache.ts';
-import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { DETAIL_POOL_MAX, type DomSurface } from './browser.ts';
+import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
-// The mtop endpoints this server is allowed to name. Recovered by extracting all 51 `mtop.*` names from goofish's own JS bundles (idle-pc/xy-site); reading the minified call sites gave the exact parameter shapes, which is what made these work first time. All answer anonymously, and a test fails the build if any other mtop name appears.
+// The mtop endpoints this server is allowed to name. Found by pulling all 51 `mtop.*` names out of
+// goofish's own JS bundles (idle-pc/xy-site) and reading the minified call sites for the parameter
+// shapes, which is why these nine worked first time. All of them answer anonymously, and a test fails
+// the build if any other mtop name shows up anywhere in the tree.
 //
-// The last two are never called by us. They are named because the page calls them and we read the
-// replies off the wire -- see `item_view` and `search_items`. Re-issuing either through the page's own
-// mtop client, with the payload the page itself sent, answers TIMEOUT::接口超时: goofish stamps the
-// requests its own bundle originates with a per-call anti-bot blob, and a request we synthesise does
-// not carry it. Letting the page make the call and reading what comes back works, and returns strictly
-// more than scraping the DOM did.
+// DETAIL_API and SEARCH_API are never called by us. The page calls them and we read the replies off
+// the wire, in `item_view` and `search_items`. Re-issuing either through the page's own mtop client,
+// with the payload the page itself sent, answers TIMEOUT::接口超时: goofish stamps the requests its
+// own bundle originates with a per-call anti-bot blob, and a synthesised request carries none. Letting
+// the page make the call works, and returns strictly more than the DOM did.
 //
-// The two seller endpoints below are the other side of that rule, and they are here because it was
-// measured rather than assumed. goofish stamps only the calls its own bundle originates, so an endpoint
-// the *current* page never happens to use can be issued through the very same client and answers
-// normally: `page.head` was verified SUCCESS from an item page, which never calls it, with nothing but
-// `{userId}`. Response interception cannot make that call at all, which is why these two exist at all.
+// The two seller endpoints turn that rule round. goofish stamps only what its own bundle originates,
+// so an endpoint the *current* page never happens to use can go through the very same client and
+// answers normally: `page.head` was verified SUCCESS from an item page, which never calls it, on
+// nothing but `{userId}`. Response interception cannot make that call at all, which is why these two
+// endpoints exist.
 const FEED_API = 'mtop.taobao.idlehome.home.webpc.feed';
-// The match counter. The search page calls it with the same payload shape as search and reads `data.hitnum`, so it answers "how many items match this keyword" for a logged-out visitor even on the page loads where search is declined. This is the endpoint that makes keyword work possible without the search page: about 28,800 for "x220" (it drifts, 28,791 / 28,804 / 28,810 observed), 0 for nonsense.
+// The match counter. The search page calls it with the same payload shape as search and reads
+// `data.hitnum`, so it answers "how many items match this keyword" for a logged-out visitor even on
+// the loads where search is declined. Keyword work does not need the search page because of this:
+// about 28,800 for "x220" (it drifts -- 28,791 / 28,804 / 28,810 observed), 0 for nonsense.
 const HITNUM_API = 'mtop.taobao.idle.filter.hitnum.pc.get';
 const SUGGEST_API = 'mtop.taobao.idlemtopsearch.pc.search.suggest';
 const RECOMMEND_API = 'mtop.taobao.idle.item.web.recommend.list';
 const LOGINUSER_API = 'mtop.taobao.idlemessage.pc.loginuser.get';   // never used to act as a user: it exists only to *prove* the session is logged out
 const DETAIL_API = 'mtop.taobao.idle.pc.detail';
 const SEARCH_API = 'mtop.taobao.idlemtopsearch.pc.search';
-// The seller profile endpoint -- the one the /personal?userId= page calls for itself. `{userId}` alone
-// is enough: measured, a payload of `encryptedUserId` by itself is refused with
-// FAIL_BIZ_CLIENT_PARAM_INVALID, so the encrypted id a search card carries is not a way in, and adding
+// The seller profile endpoint -- the one the /personal?userId= page calls for itself. `{userId}`
+// alone is enough: measured, a payload of `encryptedUserId` by itself is refused with
+// FAIL_BIZ_CLIENT_PARAM_INVALID, so the encrypted id a search card carries is not a way in, and
 // `self: false` or an empty `encryptedUserId` changes nothing. Returns `data.baseInfo` and
 // `data.module.{base,shop,social,tabs}`. A user that does not exist answers FAIL_BIZ_USER_NOT_FOUND
 // rather than an empty object, which is what makes it worth a tool.
 const SELLER_HEAD_API = 'mtop.idle.web.user.page.head';
-// One seller's own listings -- the endpoint the same /personal page calls for the tab it heads 宝贝.
-// `{userId, pageNumber, pageSize, needGroupInfo}`. `nextPage` is trustworthy; `totalCount` is always 0,
-// measured at two page sizes against a seller with six live listings, so it is never read.
+// One seller's own listings -- the tab the same /personal page heads with 宝贝.
+// `{userId, pageNumber, pageSize, needGroupInfo}`. `nextPage` can be trusted; `totalCount` is always 0,
+// measured at two page sizes against a seller with six live listings, so nothing reads it.
 const SELLER_ITEMS_API = 'mtop.idle.web.xyh.item.list';
-// The keys this endpoint's payload carries whatever else it does, measured on both of its shapes: a
-// page with listings on it, and a page past the end (which omits `cardList` and keeps the rest). Used
-// to tell "this seller has nothing here" from "this is not the payload I asked for" -- the first is an
-// answer and the second is a `ParseError`, and a check on `cardList` alone cannot tell them apart.
+// The keys this payload carries whatever else it does, measured on both of its shapes: a page with
+// listings on it, and a page past the end (which omits `cardList` and keeps the rest). They tell "this
+// seller has nothing here" apart from "this is not the payload I asked for". The first is an answer,
+// the second is a `ParseError`, and a check on `cardList` alone cannot tell them apart.
 const payloadKeys = ['cardList', 'nextPage', 'totalCount', 'itemGroupList', 'itemTopicList', 'serverTime'];
-// pageSize is hardcoded to 30 in goofish's bundle and the endpoint rejects anything else with FAIL_BIZ_COMMON_PARAM_ILLEGAL, so `limit` is applied client-side after the call. A missing itemId is rejected outright, so the generic case uses goofish's own seed id -- what its bundle substitutes when there is no item context.
+// pageSize is hardcoded to 30 in goofish's bundle and the endpoint rejects anything else with
+// FAIL_BIZ_COMMON_PARAM_ILLEGAL, so `limit` is applied client-side after the call. A missing itemId is
+// rejected outright, so the generic case uses goofish's own seed id -- what its bundle substitutes when
+// there is no item context.
 const RECOMMEND_PAGE_SIZE = 30, RECOMMEND_SEED_ITEM_ID = '809806779491';
 // One seller's own listings, 20 a page. Verified at 20 and at 2: at 2 `nextPage` went true and a page 2
 // returned the two listings after the first two, so the pager is real and not just a field that exists.
@@ -75,24 +85,29 @@ const RECOMMEND_PAGE_SIZE = 30, RECOMMEND_SEED_ITEM_ID = '809806779491';
 // 1000 listings, measured as the exact edge (page 50 SUCCESS, page 51 FAIL_BIZ_FORBIDDEN::||最大可查看
 // 页数或者每页最大可查看商品数超限; pageSize 30 refused at page 1).
 const SELLER_PAGE_SIZE = 20, MAX_SELLER_PAGE = 50;
-// goofish's own feed runs out of pages long before this; the bound only exists so a nonsense page_number cannot become a nonsense request.
+// goofish's own feed runs out of pages well before this; the bound is here so a nonsense page_number
+// cannot become a nonsense request.
 const MAX_PAGES = 25, MAX_LIMIT = 500, MAX_PAGE_NUMBER = 10_000;
-// Every field item_view reports, in one place so the honesty contract (fields_present / fields_missing) and the scraper cannot drift apart. Exported, and a test asserts every entry is a key the scraper actually returns.
+// Every field item_view reports, in one place so the honesty contract (fields_present /
+// fields_missing) and the scraper cannot drift apart. Exported, and a test asserts every entry is a
+// key the scraper actually returns.
 export const ITEM_FIELDS = ['title', 'price', 'want_count', 'browse_count', 'description', 'seller', 'seller_tenure_years', 'seller_items_sold', 'seller_positive_rate', 'image_urls'] as const;
-// The same contract for seller_profile, and it is split in two because the two halves come from
-// different places and cost different things. The profile endpoint answers the seller's *standing* --
-// credit tier, shop level and score, praise ratio, review count, followers, how many listings they have
-// up, which identity checks they have passed -- and says nothing at all about where they are or how
-// long they have been on goofish: those four live on the item page's `sellerDO`, and reading them costs
-// a page load. So a caller who passes `user_id` gets the standing fields, the other four come back null
-// and are named in `missing`, and the tool description says which argument buys which half. Exported for
-// the same reason ITEM_FIELDS is: a test asserts every entry is a key the tool actually returns, which
-// is what stops a field being renamed here and left stale there.
+// The same contract for seller_profile, split in two because the halves come from different places
+// and cost different things. The profile endpoint answers the seller's *standing* -- credit tier, shop
+// level and score, praise ratio, review count, followers, how many listings they have up, which
+// identity checks they have passed -- and says nothing about where they are or how long they have been
+// on goofish: those seven live on the item page's `sellerDO`, and reading them costs a page load. A
+// caller who passes `user_id` gets the standing fields, the other seven come back null and are named in
+// `missing`, and the tool description says which argument buys which half. Exported for the same reason
+// ITEM_FIELDS is: a test asserts every entry is a key the tool actually returns, so a field cannot be
+// renamed here and left stale there.
 export const SELLER_PROFILE_FIELDS = ['display_name', 'avatar_url', 'signature', 'seller_credit', 'buyer_credit', 'level', 'level_score', 'praise_ratio', 'review_count', 'listings_count', 'ratings_count', 'followers', 'following', 'verified_real_name', 'verified_real_person', 'verified_zhima', 'city', 'tenure_years', 'items_sold', 'items_listed', 'positive_rate', 'reply_rate_24h', 'last_active'] as const;
 // Which of those come from the item page rather than the profile endpoint. Named as data rather than
 // left implicit in an `if`, so the test that pins the honesty contract reads the same list the tool does.
 export const SELLER_ITEM_PAGE_FIELDS = ['city', 'tenure_years', 'items_sold', 'items_listed', 'positive_rate', 'reply_rate_24h', 'last_active'] as const;
-// goofish renders anonymous pages as a coin flip: the same URL comes back fully rendered or as an empty shell. Retry a few times before calling it a failure. Reloads are cache-busted with a nonce, since a cached empty shell is exactly the failure to escape.
+// goofish renders anonymous pages as a coin flip: the same URL comes back fully rendered or as an empty
+// shell. Retry a few times before calling it a failure. Reloads are cache-busted with a nonce, since a
+// cached empty shell is exactly the failure to escape.
 const RENDER_ATTEMPTS = 5, RENDER_SETTLE_MS = 3500;
 const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
 // The pager only ever renders boxes 1..10 (`1 2 ... 10 ... 50`), so 10 pages is as deep as this
@@ -106,15 +121,15 @@ const MAX_SEARCH_PAGES = 10, MAX_SEARCH_DETAIL = 50;
 const DETAIL_FANOUT_DEFAULT = 2;
 // How many extra pages a walk may take when the ones it was asked for leave fewer than `limit`
 // matches. It is named here rather than inside the walk because the cache fast path has to know the
-// deepest page a call could reach before it decides whether it can answer without a browser at all.
+// deepest page a call could reach before it can decide whether it can answer without a browser at all.
 const SEARCH_TOPUP_PAGES = 2;
 // The whole pager: ten numbered boxes at 30 listings a page. That is the most a walk can collect,
 // and it is also the bound a huge walk has to respect alongside the wall clock.
 const MAX_SEARCH_ITEMS = MAX_SEARCH_PAGES * 30, DEFAULT_SEARCH_ITEMS = 120;
-// How long item_view waits for the page's own detail call before deciding the listing is not coming.
-// The reply lands with the render that uses it, so this is the same window the old DOM poll needed
-// (32s) and nothing more: the point of the change is that a reply which never comes is a dead listing,
-// not a slow one, and a 90s budget that has to cover two minutes of reloads was buying nothing.
+// How long item_view waits for the page's own detail call before it calls the listing dead. The reply
+// lands with the render that uses it, so this is the same window the old DOM poll needed (32s) and no
+// more: a reply that never comes is a dead listing, not a slow one, and a 90s budget that has to cover
+// two minutes of reloads was buying nothing.
 const ITEM_READY_WAIT_MS = 32_000;
 // How long search waits for the page's own search call after Enter. Same reasoning: the results render
 // from that reply, so there is no separate DOM wait to cover.
@@ -126,13 +141,17 @@ const SEARCH_REPLY_WAIT_MS = 32_000;
 // hits, i.e. the 猜你喜欢 rail. So the query is typed into the header input and submitted, and only
 // the last attempt falls back to a URL, which is expected to be the rail and is expected to be
 // refused. The homepage is also a 512-character footer-only shell for 8-14s before the app mounts,
-// so "no input yet" is the normal first ten seconds and is a poll, not a verdict.
+// so a missing input in the first ten seconds is normal and gets polled, not judged.
 const SEARCH_INPUT_WAIT_MS = 15_000, SEARCH_RESULT_WAIT_MS = 32_000, SEARCH_TYPED_ATTEMPTS = 3;
-// A result set is only believable if a *fraction* of the page's cards really match, not if one title happens to contain the query: a 40-card rail with 12 incidental hits and one match both pass a `hits > 0` test. 20% of the cards on the page, and never less than one.
+// A result set is believable only if a *fraction* of the page's cards really match. One title
+// containing the query proves nothing: a 40-card rail with 12 incidental hits and one match both pass a
+// `hits > 0` test. 20% of the cards on the page, and never less than one.
 const MIN_MATCH_FRACTION = 0.2;
 // Ret strings that mean "goofish will not serve this to you", as opposed to a bug.
 const GATE_MARKERS = ['mini_login', 'RGV587', 'FAIL_SYS_SESSION_EXPIRED', 'FAIL_SYS_TOKEN', 'ILLEGAL_ACCESS', 'TIMEOUT', '非法访问', '令牌过期'];
-// The narrower list, for the one gate that means something specific: `session_state` is the whole point of `capabilities`, and a rate limit (RGV587) or a TIMEOUT says nothing about whether a session exists -- reporting those as proof of anonymity is how a throttled probe reads as a verified fact.
+// The narrower list, for the one gate that means something specific: `session_state` is the point of
+// `capabilities`, and a rate limit (RGV587) or a TIMEOUT says nothing about whether a session exists.
+// Reporting either as proof of anonymity is how a throttled probe reads as a verified fact.
 const NO_SESSION_MARKERS = ['SESSION_EXPIRED', 'TOKEN', '令牌过期'];
 
 // ---------------------------------------------------------------- pure helpers
@@ -164,14 +183,18 @@ const dedupe = (items: any[]): any[] => {
 const rankItems = (items: any[], limit: number): any[] => items.slice(0, limit).map((it, i) => ({ ...it, rank: i + 1 }));
 /** "Non-empty" presence: an array is truthy in JS, so a gallery that never loaded must not be reported as if it were there. */
 const present = (v: unknown): boolean => (Array.isArray(v) ? v.length > 0 : Boolean(v));
-/** Wall-clock budget for one best-effort tool's retry *loop*, overridable via XIANYU_<NAME>_BUDGET_S, floored at 5s and capped at 600s: a floor keeps the tools usable, and a ceiling keeps the override from restoring the multi-minute hang the function exists to prevent. It does not bound the call -- a page load costs 10-25s on a slow link, and one already in flight runs to completion. Read per call, so a script can change it. */
+/** Wall-clock budget for one best-effort tool's retry *loop*, overridable via XIANYU_<NAME>_BUDGET_S,
+ *  floored at 5s and capped at 600s: a floor keeps the tools usable, a ceiling keeps the override from
+ *  restoring the multi-minute hang the function exists to prevent. It does not bound the call -- a page
+ *  load costs 10-25s on a slow link and one already in flight runs to completion. Read per call, so a
+ *  script can change it. */
 export const budget = (name: string, defaultS: number): number => { const raw = process.env[`XIANYU_${name}_BUDGET_S`]; const n = Number(raw); return raw?.trim() && Number.isInteger(n) ? clamp(n, 5, 600) : defaultS; };
 /** The runtime ceiling on one search_items call, overridable via XIANYU_SEARCH_MAX_ITEMS and read
  *  per call like `budget`. It clamps both `limit` and how deep the pager walk goes (one page per
- *  30 listings), so even "pages: 10, limit: 500" stops at this many results -- and the point of
- *  the ceiling is that a capped walk fits inside the XIANYU_SEARCH_BUDGET_S wall clock, since the
- *  deeper the walk the more serial page loads it spends on the one shared dom page. Default answers
- *  the whole pager; the floor keeps a typo'd override from silently neutering search. */
+ *  30 listings), so even "pages: 10, limit: 500" stops at this many results. The ceiling exists so a
+ *  capped walk still fits inside the XIANYU_SEARCH_BUDGET_S wall clock: the deeper the walk, the more
+ *  serial page loads it spends on the one shared dom page. The default answers the whole pager, and
+ *  the floor keeps a typo'd override from silently neutering search. */
 export const searchCap = (): number => { const raw = process.env.XIANYU_SEARCH_MAX_ITEMS; const n = Number(raw); return raw?.trim() && Number.isInteger(n) ? clamp(n, 30, MAX_SEARCH_ITEMS) : MAX_SEARCH_ITEMS; };
 /** How many listings `detail` loads at a time: 2, overridable via `XIANYU_DETAIL_FANOUT`, read per
  *  call like `budget` and `searchCap`. `0` (or `1`) turns the fan-out off and every listing is loaded
@@ -183,27 +206,33 @@ export const searchCap = (): number => { const raw = process.env.XIANYU_SEARCH_M
  *  reads those per-listing milliseconds, not the batch. `DETAIL_POOL_MAX` caps the override where the
  *  measurement stops. */
 export const fanoutSize = (): number => { const raw = process.env.XIANYU_DETAIL_FANOUT; const n = Number(raw); return raw?.trim() && Number.isInteger(n) ? clamp(n, 0, DETAIL_POOL_MAX) : DETAIL_FANOUT_DEFAULT; };
-/** The one way this file reads the DOM. `Session.open` checks the allowlist on the URL it landed on, but that is point-in-time: `search_items` then polls for up to 32s and `item_view` for up to 32s before it reads anything, and the page can be moved off goofish in that window. So the check is repeated on the URL that is live *now*, in the same statement as the read, and every scraper goes through here. `timeoutS` is for the cheap probes, which must not inherit the 90s an in-page read is allowed. */
+/** The one way this file reads the DOM. `Session.open` checks the allowlist on the URL it landed on,
+ *  but that is point-in-time: `search_items` then polls for up to 32s and `item_view` for up to 32s
+ *  before either reads anything, and the page can be moved off goofish in that window. So the check
+ *  runs again on the URL that is live *now*, in the same statement as the read, and every scraper goes
+ *  through here. `timeoutS` is for the cheap probes, which must not inherit the 90s an in-page read is
+ *  allowed. */
 const scrape = (page: Page, fn: any, arg: any, what: string, timeoutS?: number): Promise<any> => { ensureGoofishUrl(page.url()); return evaluate(page, fn, arg, what, timeoutS); };
 /** Every listing this server publishes goes through here: the flat fields the normalisers produced,
  *  plus `typed` (the same values as numbers, ISO timestamps and structured objects) and `missing` (the
  *  paths inside `typed` the site did not render). One function rather than four because the shape a
- *  caller reads must not depend on which route answered -- a feed card, a search card, a DOM-scraped
- *  card and the detail API each fill a different subset of the same block, and all four publish the
- *  same keys, so "which of these is absent" is a question about the answer rather than about the
- *  plumbing.
+ *  caller reads must not depend on which route answered. A feed card, a search card, a DOM-scraped
+ *  card and the detail API each fill a different subset of the same block and all four publish the
+ *  same keys, so "which of these is absent" is a question about the answer, not about the plumbing.
  *
  *  It only ever *adds*. The flat fields keep the site's own strings -- `price` stays `"366"` next to
  *  `typed.price_amount: 366` -- because a field that changes type under an existing caller is a
- *  breaking change wearing a version number, and the block beside it is what removes the reason to
- *  parse anything. See `enrichListing` in extract.ts for the values and the missing-field rule.
+ *  breaking change wearing a version number. The block beside it is what removes the reason to parse
+ *  anything. See `enrichListing` in extract.ts for the values and the missing-field rule.
  *
  *  It runs here, in Node, rather than inside `FEED_NORMALIZE_JS`, for the same reason the rail markers
  *  are passed into the scrapers: an in-page script is serialised alone with its one argument, so a
  *  second copy of these rules inside it would be a second copy to drift. */
 const withTyped = <T extends Record<string, any>>(items: T[] | null | undefined): any[] => (items ?? []).map((i) => enrichListing(i));
 // -------------------------------------------------------------------- the tools
-/** Page through goofish's public homepage feed. The feed is personalised-by-anonymity rather than by keyword: each pageNumber returns a different slice of live inventory. Verified 8 pages / 157 unique listings, 0 duplicates, no rate limiting. */
+/** Page through goofish's public homepage feed. The feed is personalised-by-anonymity rather than by
+ *  keyword: each pageNumber returns a different slice of live inventory. Verified 8 pages / 157 unique
+ *  listings, 0 duplicates, no rate limiting. */
 const browseFeed = async ({ page_number = 1, pages = 1, limit = 60 }: FeedArgs): Promise<Data> => {
   const start = clamp(page_number, 1, MAX_PAGE_NUMBER);
   const wanted = Array.from({ length: clamp(pages, 1, MAX_PAGES) }, (_, i) => start + i);
@@ -219,7 +248,8 @@ const browseFeed = async ({ page_number = 1, pages = 1, limit = 60 }: FeedArgs):
     rows.push(...cards);
   }
   if (!rows.length) {
-    // Nothing came back. A gate across every page is a refusal; anything else is more likely a shape change, and the two need different advice.
+    // Nothing came back. A gate on every page is a refusal; anything else is more likely a shape change,
+    // and the two call for different advice.
     const gated = pageReports.find((r) => isGated(r.ret));
     if (gated) throw new GatedError(`goofish refused the anonymous feed on every page of [${wanted}]: ${gated.ret}. It may be rate limiting this IP; wait a minute and retry.`);
     throw new ParseError(`feed returned no cards for pages [${wanted}]: ${JSON.stringify(pageReports)}. The card shape may have changed.`);
@@ -231,7 +261,9 @@ const browseFeed = async ({ page_number = 1, pages = 1, limit = 60 }: FeedArgs):
   return { source: 'homepage_feed', account_required: false, requested_pages: wanted, page_reports: pageReports, raw_cards: rows.length, unique_items: items.length, count: ranked.length, items: ranked };
 };
 
-/** How many listings match a keyword. Uses the filter-counter endpoint the search page itself calls to populate its result count: it takes the same payload as search but is a different endpoint, so unlike search it is not subject to goofish's per-page-load declines. */
+/** How many listings match a keyword. Uses the filter-counter endpoint the search page itself calls to
+ *  populate its result count: it takes the same payload as search but is a different endpoint, so unlike
+ *  search it is not subject to goofish's per-page-load declines. */
 const searchCount = async ({ query }: CountArgs): Promise<Data> => {
   const q = requireQuery(query);
   const session = getSession();
@@ -239,12 +271,14 @@ const searchCount = async ({ query }: CountArgs): Promise<Data> => {
   const entry = (await session.call([['hitnum', HITNUM_API, { pageNumber: 1, keyword: q, rowsPerPage: 30, searchReqFromPage: 'pcSearch', extraFilterValue: '{}', userPositionJson: '{}', customDistance: '', customGps: '', gps: '' }]]))?.hitnum || {};
   if (!entry.ok) throw new GatedError(`goofish refused the match counter for ${JSON.stringify(q)}: ${entry.ret}`);
   const raw = entry.data?.hitnum, count = raw == null || raw === '' ? NaN : Number(raw);
-  // A count that cannot be read is not a count of zero: a missing, null, 'oops' or '1,234' hitnum is a shape change, and answering "no matches" to "I don't know" is the one reply this tool must never make.
+  // A count that cannot be read is not a count of zero. A missing, null, 'oops' or '1,234' hitnum is a
+  // shape change, and "no matches" is the one reply this tool must never give to "I don't know".
   if (!(count >= 0)) throw new ParseError(`match counter returned an unreadable hitnum for ${JSON.stringify(q)}: ${JSON.stringify(raw)}. data keys=${Object.keys(entry.data ?? {}).sort().slice(0, 10)}`);
   return { query: q, match_count: Math.trunc(count), has_matches: count > 0, account_required: false, source: 'filter_hitnum' };
 };
 
-/** goofish's own search-box autocomplete: turns "x220" into "x220笔记本" and friends, and is a cheap signal that a term is understood at all. */
+/** goofish's own search-box autocomplete: turns "x220" into "x220笔记本" and friends, and is a cheap
+ *  signal that a term is understood at all. */
 const searchSuggest = async ({ query, limit = 20 }: SuggestArgs): Promise<Data> => {
   const q = requireQuery(query);
   const session = getSession();
@@ -263,7 +297,9 @@ const searchSuggest = async ({ query, limit = 20 }: SuggestArgs): Promise<Data> 
   return { query: q, account_required: false, source: 'search_suggest', total_count: Number.isInteger(data.totalCount) ? data.totalCount : null, count: trimmed.length, suggestions: trimmed };
 };
 
-/** Listings goofish recommends for a given item ("more like this"), or its generic recommendation set when item_id is omitted -- which is what the page itself requests. The cards are the same shapes the homepage feed returns, so they go through the same normalizer. */
+/** Listings goofish recommends for a given item ("more like this"), or its generic recommendation set
+ *  when item_id is omitted -- which is what the page itself requests. The cards are the same shapes the
+ *  homepage feed returns, so they go through the same normalizer. */
 const relatedItems = async ({ item_id, limit = 30, page = 1 }: RelatedArgs): Promise<Data> => {
   const iid = item_id ? normalizeItemId(item_id) : '';
   const session = getSession(), pg = await session.ensureReady();
@@ -280,23 +316,23 @@ const relatedItems = async ({ item_id, limit = 30, page = 1 }: RelatedArgs): Pro
 
 /** Which seller a call is about, and what it cost to find out.
  *
- *  The two arguments are alternatives, not a pair: `user_id` names the seller directly and costs nothing
- *  beyond the mtop call that follows, while `item_id` means "whoever is selling this listing" and has to
- *  be resolved first. Both are refused together rather than one quietly winning, because a caller who
- *  passes both and gets the wrong one has no way to tell from the envelope that their `item_id` was
- *  ignored -- which is the failure this server keeps making elsewhere and keeps paying for.
+ *  The two arguments are alternatives, not a pair. `user_id` names the seller outright and costs
+ *  nothing beyond the mtop call that follows; `item_id` means "whoever is selling this listing" and
+ *  has to be resolved first. Passing both is refused rather than letting one quietly win, because a
+ *  caller who passes both and gets the wrong one cannot tell from the envelope that their `item_id`
+ *  was dropped -- the failure this server keeps making elsewhere and keeps paying for.
  *
- *  The resolution hop is the one part of a seller tool that is not mtop-only, and it is not mtop-only
- *  because it cannot be. `mtop.taobao.idle.pc.detail` re-issued through the page's own client answers
- *  `TIMEOUT::接口超时` -- verified again while building this, on the same page and the same client that
- *  answer every other call here -- because goofish stamps the requests its own bundle originates. So the
- *  item page is loaded and its own detail reply is read off the wire, which is the route `item_view`
- *  takes, on the shared dom page, under the shared lock.
+ *  The resolution hop is the one part of a seller tool that is not mtop-only, and it cannot be.
+ *  `mtop.taobao.idle.pc.detail` re-issued through the page's own client answers `TIMEOUT::接口超时`
+ *  -- verified again while building this, on the same page and the same client that answer every
+ *  other call here -- because goofish stamps the requests its own bundle originates. So the item page
+ *  is loaded and its own detail reply is read off the wire: the route `item_view` takes, on the shared
+ *  dom page, under the shared lock.
  *
- *  The lock is taken *around that hop only*, and the mtop calls that follow run outside it. Taking it
- *  for the whole tool -- which is what wrapping these in `locked()` would do -- would put two tools
- *  that are otherwise pure mtop calls in the queue behind every 70s search, undoing the one latency
- *  property the two-page session exists to provide. */
+ *  The lock covers that hop and nothing else, and the mtop calls that follow run outside it. Holding
+ *  it for the whole tool, which is what wrapping these in `locked()` would do, would queue two plain
+ *  mtop tools behind every 70s search and give back the one latency property the two-page session
+ *  exists for. */
 const resolveSeller = async ({ user_id, item_id }: SellerArgs): Promise<{ user_id: string; item_id: string; listing: any | null }> => {
   const uid = normalizeUserId(user_id), item = item_id === undefined || item_id === null || item_id === '' ? '' : normalizeItemId(item_id);
   if (user_id && !uid) throw new XianyuError(`user_id must be digits or a goofish /personal?userId= URL, got ${JSON.stringify(user_id)}`);
@@ -305,10 +341,10 @@ const resolveSeller = async ({ user_id, item_id }: SellerArgs): Promise<{ user_i
   if (uid) return { user_id: uid, item_id: '', listing: null };
   if (!item) throw new XianyuError('give user_id (the seller id seller_profile reports) or item_id (a listing, to find its seller)');
   const session = getSession();
-  // The clock starts before the load, for the reason item_view's does: the page load is the slowest step
+  // The clock starts before the load, for the same reason item_view's does: the load is the slowest step
   // in the hop and a budget that ignores it is not a budget. This one is overridable under its own name
   // because it is a different call from item_view's -- a caller walking 20 listings wants 20 short
-  // budgets, not one long one -- and a direct user_id lookup runs no loop and so spends none of it.
+  // budgets, not one long one -- and a direct user_id lookup runs no loop, so it spends none of it.
   const started = Date.now(), deadline = started + budget('SELLER_PROFILE', 90) * 1000;
   const read = await exclusive(() => readListing(session, item, deadline));
   const found = normalizeUserId(read.listing?.seller_id);
@@ -318,9 +354,10 @@ const resolveSeller = async ({ user_id, item_id }: SellerArgs): Promise<{ user_i
   return { user_id: found, item_id: item, listing: read.listing };
 };
 
-/** The four standing numbers a seller's city, tenure and sales history come from -- and the only ones
- *  that cost a page load. Read out of a detail payload's `sellerDO` rather than through `detailListing`,
- *  because this needs the raw payload and `detailListing` has already reduced it to a listing. */
+/** The standing numbers a seller's city, tenure and sales history come from, read out of a detail
+ *  payload's `sellerDO`, and the only ones in `SELLER_ITEM_PAGE_FIELDS` that cost a page load. Taken
+ *  raw rather than through `detailListing`, because that needs the payload and `detailListing` has
+ *  already reduced it to a listing. */
 const sellerStanding = (listing: any | null): Data => {
   const s = listing ?? {};
   return { city: asText(s.seller_city), tenure_years: asText(s.seller_tenure_years), items_sold: asText(s.seller_items_sold), items_listed: asText(s.seller_items_listed), positive_rate: asText(s.seller_positive_rate), reply_rate_24h: asText(s.seller_reply_rate_24h), last_active: asText(s.seller_last_active) };
@@ -330,19 +367,19 @@ const sellerStanding = (listing: any | null): Data => {
  *
  *  Two hops, and only one of them costs anything. Given a `user_id` this is a single call to the
  *  endpoint the /personal page uses, issued through that page's own mtop client from a page that never
- *  makes it -- which is the only way it can be reached, and which works because goofish stamps only the
- *  calls its own bundle originates (see `SELLER_HEAD_API`). Given an `item_id` the seller is found
- *  first, off the item page's own detail reply, and that hop also yields the four fields the profile
- *  endpoint has no answer for at all: the seller's city, tenure, sales count and positive rate. The
+ *  makes it -- the only way to reach it, and it works because goofish stamps only the calls its own
+ *  bundle originates (see `SELLER_HEAD_API`). Given an `item_id` the seller is found first, off the
+ *  item page's own detail reply, and that hop also yields the seven fields the profile endpoint has no
+ *  answer for at all: city, tenure, sales, listings, positive rate, reply rate and last active. The
  *  profile's own `module.base.ipLocation` is deliberately not published as the city -- it is where
  *  goofish thinks the *request* came from, and it measured 上海市 for a seller whose own record says
  *  北京. See `sellerProfileOf`.
  *
- *  The honesty contract is the interesting part: the two halves are named in `SELLER_PROFILE_FIELDS`
- *  and `SELLER_ITEM_PAGE_FIELDS`, so a caller that passed `user_id` sees the standing fields and the
- *  rest explicitly null and listed in `missing`, rather than an empty-looking profile that reads as
- *  "this seller has no history". `verified_*` are the exception: a tag that is absent and a tag that is
- *  false both publish `false`, because both mean the same thing and neither means verified. */
+ *  What a caller passed shows up in the envelope rather than in a null. The two halves are named in
+ *  `SELLER_PROFILE_FIELDS` and `SELLER_ITEM_PAGE_FIELDS`, so a caller that passed `user_id` sees the
+ *  standing fields and the rest explicitly null and listed in `missing`, instead of an empty-looking
+ *  profile that reads as "this seller has no history". `verified_*` are the exception: a tag that is
+ *  absent and a tag that is false both publish `false`, because both mean the same thing. */
 const sellerProfile = async (args: SellerArgs): Promise<Data> => {
   const { user_id: uid, item_id: item, listing } = await resolveSeller(args);
   const session = getSession();
@@ -360,8 +397,8 @@ const sellerProfile = async (args: SellerArgs): Promise<Data> => {
   const standing = sellerStanding(listing);
   const data = { ...profile, ...standing, user_id: uid, profile_url: `${HOME}personal?userId=${uid}`, item_id: item || null, account_required: false };
   return { ...data, source: item ? 'item_detail+idle_user_page_head' : 'idle_user_page_head',
-    // Spelled out rather than left for the reader to infer from nulls, because the difference is the
-    // cost of the call and an agent deciding whether to re-run it with an item_id needs to see it.
+    // Spelled out rather than left for the reader to infer from nulls: the difference is the cost of the
+    // call, and an agent deciding whether to re-run it with an item_id has to see it.
     note: item ? 'the city, tenure, sales and rating below came from this listing\'s detail record; the standing came from the seller profile endpoint.' : 'pass item_id as well for this seller\'s city, tenure, sales count and positive rate -- those live on a listing\'s detail record, not on the profile, so they are missing rather than blank.',
     fields_present: SELLER_PROFILE_FIELDS.filter((f) => present(data[f])), fields_missing: SELLER_PROFILE_FIELDS.filter((f) => !present(data[f])) };
 };
@@ -369,15 +406,15 @@ const sellerProfile = async (args: SellerArgs): Promise<Data> => {
 /** The listings one seller currently has up, logged out. The 宝贝 tab of the same /personal page, from
  *  the endpoint that tab calls for itself.
  *
- *  This is the gap that made the profile worth having: nothing else in this server can answer "what else
- *  does this seller have", and on a site with no ratings and no feedback threads that question is the
- *  whole of due diligence. The cards carry a price, a category, a photo and the label strip, and they go
- *  through `sellerListings` rather than the feed normaliser because this endpoint's title field is not
- *  the feed's title field and its `detailUrl` is an app deep link.
+ *  This is the gap that made the profile worth having: nothing else in this server can answer "what
+ *  else does this seller have", and on a site with no ratings and no feedback threads that question is
+ *  the whole of due diligence. The cards carry a price, a category, a photo and the label strip, and
+ *  they go through `sellerListings` rather than the feed normaliser because this endpoint's title field
+ *  is not the feed's title field and its `detailUrl` is an app deep link.
  *
- *  `has_more` comes from the payload's own `nextPage`, which was checked against a real second page
- *  rather than assumed: at `pageSize: 2` against a seller with six listings it went true, and page 2
- *  returned the next two ids. `totalCount` is in the payload, is always 0, and is not published.
+ *  `has_more` comes from the payload's own `nextPage`, checked against a real second page rather
+ *  than assumed: at `pageSize: 2` against a seller with six listings it went true, and page 2 returned
+ *  the next two ids. `totalCount` is in the payload, is always 0, and is not published.
  *
  *  Two things this endpoint does that the others do not, both found by a live run rather than by
  *  reading its payload. It omits `cardList` entirely on a page past the end -- a `SUCCESS` with no
@@ -400,18 +437,23 @@ const sellerItems = async ({ user_id, item_id, limit = SELLER_PAGE_SIZE, page = 
   const payload = entry.data || {};
   const cards = sellerListings(payload);
   // No cards is an answer, not a failure: an empty cardList and an absent cardList both mean this
-  // seller has nothing on this page. What is NOT an answer is a payload that does not look like this
-  // endpoint's at all, which is why the check is for its always-present keys rather than for the one
-  // that can be missing.
+  // seller has nothing on this page. A payload that does not look like this endpoint's at all is not an
+  // answer, which is why the check is for its always-present keys rather than for the one that can
+  // go missing.
   if (!cards.length && !payloadKeys.some((k) => k in payload)) throw new ParseError(`the seller listing endpoint returned a payload for ${uid} carrying none of its own keys (${payloadKeys.join(', ')}): got ${Object.keys(payload).sort().slice(0, 10)}. The payload shape may have changed.`);
   const items = dedupe(cards).slice(0, cap).map((it: any, i: number) => ({ ...it, rank: i + 1 }));
   return { user_id: uid, profile_url: `${HOME}personal?userId=${uid}`, item_id: item || null, page: wanted, account_required: false, source: 'idle_xyh_item_list', raw_cards: cards.length, has_more: Boolean(payload.nextPage), count: items.length, items };
 };
 
-/** Scrape goofish's 猜你喜欢 / 为你推荐 rails for an anonymous visitor. Renders are flaky, so retry -- under a clock, like the other two best-effort tools, because five renders with a reload between each is up to five minutes of somebody's timeout at the 60s navigation timeout -- and if the DOM never cooperates fall back to the feed API and say so in `source` rather than returning an empty list. */
+/** Scrape goofish's 猜你喜欢 / 为你推荐 rails for an anonymous visitor. Renders are flaky, so this
+ *  retries under a clock, like the other two best-effort tools: five renders with a reload between each
+ *  is five minutes of somebody's timeout at the 60s navigation timeout. When the DOM never cooperates it
+ *  falls back to the feed API and says so in `source`, rather than returning an empty list. */
 const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => {
   const cap = clamp(limit, 1, MAX_LIMIT), target = url || HOME;
-  // The clock starts before the load, for the same reason item_view's does: a budget that ignores the slowest step in the call is not a budget, and the elapsed time in `fallback_reason` was understating itself by one page load.
+  // The clock starts before the load, for the same reason item_view's does: a budget that ignores the
+  // slowest step in the call is not a budget. The elapsed time in `fallback_reason` was understating
+  // itself by one page load.
   const started = Date.now(), deadline = started + budget('RECOMMENDATIONS', 45) * 1000;
   const session = getSession(), page = await session.open(target);
   let payload: any = {}, attemptNo = 0;
@@ -430,14 +472,14 @@ const recommendations = async ({ limit = 30, url }: RecoArgs): Promise<Data> => 
 
 /** Type `query` into goofish's own header search input and press Enter, then wait for the router to
  *  land on /search. Returns the attempt log's verdict rather than throwing, because every way this
- *  can go wrong is retryable and the retry is the caller's decision. Three waits, in order:
- *  (1) the input -- the homepage is a footer-only shell for 8-14s before the app mounts, so a miss is
- *      polled, not concluded; (2) the keys, sent with `keyboard.type` because the SPA owns the
- *      input's value and a DOM assignment React never sees would submit an empty keyword; (3) the
- *      route, which needs ~12s after Enter and during which the SPA destroys the execution context
- *      out from under the poll -- a lost context is waited out, since it is the navigation landing
- *      rather than a failure. Nothing is clicked: the login dialog's ant-modal-mask sits over the
- *      header and Playwright's click actionability check times out against it. */
+ *  can go wrong is retryable and the retry is the caller's decision. Three waits, in order: (1) the
+ *  input, which the homepage does not have for the first 8-14s while the app mounts, so a miss is
+ *  polled rather than concluded; (2) the keys, sent with `keyboard.type` because the SPA owns the
+ *  input's value and a DOM assignment React never sees would submit an empty keyword; (3) the route,
+ *  which needs ~12s after Enter and during which the SPA destroys the execution context out from
+ *  under the poll -- a lost context is waited out, since that is the navigation landing rather than a
+ *  failure. Nothing is clicked: the login dialog's ant-modal-mask sits over the header and
+ *  Playwright's click actionability check times out against it. */
 const typeSearch = async (page: Page, query: string, deadline: number): Promise<any> => {
   let box: any = { found: false };
   for (let until = Date.now() + Math.min(SEARCH_INPUT_WAIT_MS, Math.max(0, deadline - Date.now())); Date.now() < until;) {
@@ -446,22 +488,22 @@ const typeSearch = async (page: Page, query: string, deadline: number): Promise<
     await settle(page, 400);
   }
   if (!box?.found) return { retryable: 'no-search-input-on-homepage', inputs_on_page: box?.inputs ?? 0, page_chars: box?.chars ?? 0, home_path: box?.path || '' };
-  // Type, then READ BACK what the input actually holds. goofish's SPA re-renders the search input
-  // under the cursor, and a `keyboard.type` burst that spans a re-render is silently truncated:
-  // measured, "thinkpad x220" landing as "th", which then submits an empty-ish keyword and returns
-  // the rail, which used to be reported as a refusal. The input is refocused and the missing tail
-  // re-sent until it holds the whole query, so a lost keystroke is a retry rather than a wrong answer.
-  // A cleared field is typed from the start (the SPA discarded the prefix, not just the tail).
+  // Type, then read back what the input actually holds. goofish's SPA re-renders the search input under
+  // the cursor, and a `keyboard.type` burst that spans a re-render is silently truncated: measured,
+  // "thinkpad x220" landing as "th". That submits an empty-ish keyword, brings back the rail, and used
+  // to be reported as a refusal. The input is refocused and the missing tail re-sent until it holds the
+  // whole query, so a lost keystroke costs a retry rather than a wrong answer. A cleared field is typed
+  // from the start: the SPA discarded the prefix, not just the tail.
   for (let tries = 0; tries < 4; tries++) {
     const held = String(box?.value ?? '');
     if (held === query) break;
     if (held && query.startsWith(held)) { await page.keyboard.type(query.slice(held.length), { delay: 60 }); }
     else {
-      // The input holds something that is not a prefix of this query -- which is the *normal* state
-      // on a warm page, where it still holds the previous search. Typing over it appends, and
-      // "thinkpad x220" + "ipad air" submits as one nonsense keyword that legitimately finds nothing.
-      // Select-all and type replaces the selection with real key events, which the SPA's own
-      // controlled input actually sees; assigning `.value` would not, because React never hears it.
+      // The input holds something that is not a prefix of this query, which is the *normal* state on a warm
+      // page: it still holds the previous search. Typing over it appends, and "thinkpad x220" + "ipad
+      // air" submits as one nonsense keyword that legitimately finds nothing. Select-all and type
+      // replaces the selection with real key events, which the SPA's own controlled input sees;
+      // assigning `.value` would not, because React never hears it.
       await scrape(page, SEARCH_INPUT_JS, SEARCH_MARK, 'search input refocus');
       if (held) await page.keyboard.press('ControlOrMeta+A');
       await page.keyboard.type(query, { delay: 60 });
@@ -489,46 +531,45 @@ const typeSearch = async (page: Page, query: string, deadline: number): Promise<
  *  fresh/persistent profile and direct-URL/search-input, and only the cell that typed into the SPA's
  *  header input returned results -- every direct-URL cell, headed included, served the 猜你喜欢 rail.
  *
- *  Two things make it fast, and both are new:
+ *  Two things make it fast. Both are new.
  *
- *  1. The answer is the page's own `mtop.taobao.idlemtopsearch.pc.search` reply, read off the wire.
- *     That payload is 30 structured results -- the same card shape the homepage feed returns, so the
- *     same normaliser reads it -- where the DOM scrape could see a title, a price and a city and
- *     nothing else. A want count, a seller and an image per listing are simply not in the DOM card,
- *     and they are all here.
- *  2. A warm page is reused. Re-searching by retyping into the header input of the page already
- *     showing results is an SPA route change: measured 4-12s, against 15-41s for a cold load, and a
- *     cold load is what every attempt used to pay. The homepage is only reloaded when there is no
- *     page, when the input is not there, or when a page load has failed.
+ *  1. The answer is the page's own `mtop.taobao.idlemtopsearch.pc.search` reply, read off the wire:
+ *     30 structured results in the same card shape the homepage feed returns, so the same normaliser
+ *     reads it. The DOM scrape saw a title, a price and a city; a want count, a seller and an image
+ *     per listing are simply not in the DOM card, and all three are here.
+ *  2. A warm page is reused. Retyping into the header input of the page already showing results is an
+ *     SPA route change: measured 4-12s against 15-41s for a cold load, and a cold load is what every
+ *     attempt used to pay. The homepage is reloaded only when there is no page, when the input is not
+ *     there, or when a page load has failed.
  *
- *  The relevance guard is unchanged in spirit and now runs over real titles: a *fraction* of the
- *  results must really match, so a rail can never be presented as results.
+ *  The relevance guard runs over real titles: a *fraction* of the results has to really match, so a
+ *  rail can never be published as results.
  *
- *  Nothing clicks anything, and that is a measured result rather than a style choice. goofish's
- *  anonymous login dialog puts an ant-modal-mask over the header; the listings render *underneath* it,
- *  so a read works through the mask and needs no dismissal. Measured headed, same URL, one fresh
- *  context per arm: with nothing dismissed the cards were in the DOM by t+12s under the mask, while
- *  dismissing at t+6s or t+12s clicked four close controls and the result list then never rendered at
- *  any later sample, serving the 猜你喜欢 rail instead. The searchbox flow also has to `focus()`
- *  rather than click, because Playwright's click actionability check times out against that mask
- *  (measured: element resolved, never receiving the event) while `focus()` needs no pointer. */
+ *  Nothing here clicks anything, and that is measured rather than a style choice. goofish's anonymous
+ *  login dialog puts an ant-modal-mask over the header; the listings render *underneath* it, so a read
+ *  works through the mask and needs no dismissal. Measured headed, same URL, one fresh context per
+ *  arm: with nothing dismissed the cards were in the DOM by t+12s under the mask, while dismissing at
+ *  t+6s or t+12s clicked four close controls and the result list then never rendered at any later
+ *  sample, serving the 猜你喜欢 rail instead. The searchbox flow also has to `focus()` rather than
+ *  click, because Playwright's click actionability check times out against that mask (measured:
+ *  element resolved, never receiving the event) while `focus()` needs no pointer. */
 const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEARCH_ATTEMPTS, pages = 1, detail = 0 }: SearchArgs): Promise<Data> => {
   const q = requireQuery(query), maxAttempts = clamp(attempts, 1, MAX_SEARCH_ATTEMPTS), cap = clamp(limit, 1, searchCap()), pagesWanted = clamp(pages, 1, Math.max(1, Math.min(MAX_SEARCH_PAGES, Math.ceil(searchCap() / 30))));
   const session = getSession(), log: any[] = [];
   let payload: any = {};
-  // The budget has to fit what was asked for. Depth is a page load per listing at ~8s, so a
-  // `detail: 50` needs minutes and the flat 90s default would have silently refused most of
-  // them -- the 8-deep case measured 0/8 answered before this.
+  // The budget has to fit what was asked for. Depth is a page load per listing at ~8s, so
+  // `detail: 50` needs minutes, and the flat 90s default would have refused most of
+  // them: the 8-deep case measured 0/8 answered before this.
   const started = Date.now(), deadline = started + budget('SEARCH', detail > 0 ? Math.min(600, 60 + detail * 10) : 90) * 1000;
   // The deepest page this call could reach, needed before the walk starts: it is the last page the
   // cache fast path has to find before it can answer with no page in the process at all.
   const deepLimit = Math.min(MAX_SEARCH_PAGES, pagesWanted + SEARCH_TOPUP_PAGES);
-  // The whole call can end here. If every page this search asked for is already in the cache there is
-  // nothing to ask goofish: no page load, no keystroke, no mtop call, and therefore no chance of being
-  // declined by a site that declines some loads. The pooled pages go through the same relevance guard
-  // a live walk is held to (`finishSearch`), and normalising them needs no page -- FEED_NORMALIZE_JS
-  // is a pure function over cards we already hold, which is the very reason it is the one in-page
-  // script allowed to run without the URL re-check.
+  // The whole call can end here. Every page this search asked for is already in the cache, so there is
+  // nothing to ask goofish: no page load, no keystroke, no mtop call, and no chance of being declined
+  // by a site that declines some loads. The pooled pages face the same relevance guard a live walk
+  // faces (`finishSearch`), and normalising them needs no page -- FEED_NORMALIZE_JS is a pure
+  // function over cards we already hold, which is why it is the one in-page script allowed to run
+  // without the URL re-check.
   const cachedLines: { page: number; hit: boolean; age_s: number | null }[] = [], pooled: any[] = [];
   for (let pn = 1; pn <= pagesWanted; pn++) {
     const warm = getSearchPage(q, pn);
@@ -539,7 +580,7 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
   if (pooled.length === pagesWanted) {
     const found = await finishSearch(pooled, q, cap, (rows) => FEED_NORMALIZE_JS({ rows }));
     // A cached pool that no longer passes the guard is not an answer, and neither is a short one: a
-    // caller who asked for three pages does not get two and a note. Either way, fall through to the
+    // caller who asked for three pages does not get two and a note. Both cases fall through to the
     // live search rather than publish a set this code would have refused a moment ago.
     if (found) {
       log.push({ via: 'cache', pages: pooled.length, results: found.scanned, note: `every page this search asked for was already cached, so goofish was not asked at all; ages are in the cache block below` });
@@ -547,12 +588,15 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
     }
   }
   for (let attemptNo = 1; attemptNo <= maxAttempts; attemptNo++) {
-    // A failed page load is a declined attempt, not a fatal error: this network throws ERR_INSUFFICIENT_RESOURCES / ERR_ADDRESS_UNREACHABLE often enough that aborting the whole call would make search useless. The clock is checked at the foot of the loop either way, so ten failed loads cannot outrun the budget.
+    // A failed page load is a declined attempt, not a fatal error. This network throws
+    // ERR_INSUFFICIENT_RESOURCES / ERR_ADDRESS_UNREACHABLE often enough that aborting the whole call
+    // would make search useless. The clock is checked at the foot of the loop either way, so ten failed
+    // loads cannot outrun the budget.
     payload = {};
     const via = attemptNo <= SEARCH_TYPED_ATTEMPTS ? 'searchbox' : 'direct_url';
     // The warm path. `session.open` is skipped when the page already holds a usable input, so the
-    // second and later searches of a session are SPA route changes rather than fresh loads. Only a
-    // page that is not on goofish, has no input, or is mid-flight with no results forces a load.
+    // second and later searches of a session are SPA route changes rather than fresh loads. A page
+    // that is off goofish, has no input, or is mid-flight with no results is what forces a load.
     const reuse = via === 'searchbox' && (await warmInputUsable(session));
     let page: Page | null = null;
     if (reuse) { page = await session.domReady(); log.push({ attempt: attemptNo, via, reused_page: true, path: page.url() }); }
@@ -565,7 +609,7 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
         // Forget every reply the page has made so far, so the only search reply this attempt can
         // accept is one its own keystroke provoked. Without this a warm page hands back the previous
         // query's results -- a full 30, all of them for the wrong keyword -- and the relevance guard
-        // throws away a perfectly good answer to go looking for a DOM fallback.
+        // throws away a good answer to go looking for a DOM fallback.
         session.domTap.clear();
         const step = await typeSearch(page, q, deadline);
         log.push({ attempt: attemptNo, via, ...step });
@@ -577,28 +621,28 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
       if (reply?.ok) {
         // Walk the pager for the rest. One reply is 30 listings and the search API cannot be
         // re-issued (replaying the page's own payload through the same client answers TIMEOUT), so the
-        // page's own pager is the only way deeper -- and it is much cheaper than a fresh load.
+        // page's own pager is the only way deeper, and it is much cheaper than a fresh load.
         const replies = [reply.data], pageLines: { page: number; hit: boolean; age_s: number | null }[] = [{ page: 1, hit: false, age_s: null }];
         // The page was just asked, so page 1 is live whatever was cached under it -- and it refreshes
         // the entry. A fresh answer is never discarded in favour of one this process already had.
         putSearchPage(q, 1, reply.data);
         // Walking the pager is not deterministic: page 3 sometimes returns items already seen on
         // pages 1-2, and a degraded page can match far fewer than its 30. Measured across three
-        // sessions, `pages: 2` yielded 25, 28 and 55 matches out of 60 scanned. For a caller who asked
-        // for `limit` listings that is a silent shortfall, so the walk tops up -- bounded, so a
+        // sessions, `pages: 2` yielded 25, 28 and 55 matches out of 60 scanned. To a caller who asked
+        // for `limit` listings that is a silent shortfall, so the walk tops up, bounded so a
         // genuinely thin market cannot turn a cheap call into an expensive one.
         const seen = () => new Set(replies.flatMap((d) => searchListings(d).map((c) => c?.detailParams?.itemId).filter(Boolean))).size;
         for (let want = 2; want <= deepLimit; want++) {
           if (want > pagesWanted && seen() >= cap) break;
           if (Date.now() >= deadline) { log.push({ stopped: `time budget reached at page ${want}` }); break; }
-          // A page this process already walked costs nothing to re-read, and the pager click it would
-          // otherwise take is 5-9.5s. It is pooled with the live pages and judged by the same guard;
-          // its age is published per page in the `cache` block, because a walk whose pages were read
-          // at different moments is the normal case here and one age for the whole set would be a
-          // claim about a set that does not exist.
+          // A page this process already walked costs nothing to re-read, against the 5-9.5s the pager click it
+          // would otherwise take. It is pooled with the live pages and judged by the same guard, and
+          // its age is published per page in the `cache` block: pages in one walk are read at
+          // different moments all the time, and a single age for the whole set would be a claim about
+          // a set that does not exist.
           const warm = getSearchPage(q, want);
           if (warm) { replies.push(warm.value); pageLines.push({ page: want, hit: true, age_s: warm.verdict.age_s }); log.push({ pager: want, cache: 'hit', age_s: warm.verdict.age_s, items: searchListings(warm.value).length }); continue; }
-          // The reply arrives a moment before the pager finishes rebuilding itself, and clicking in
+          // The reply arrives a moment before the pager finishes rebuilding itself, and a click in
           // that window finds no page box at all -- measured as `pages: 3` walking one page and then
           // giving up with "no such page box" on a pager that plainly had one. So wait until the pager
           // says it is showing the page we are leaving.
@@ -624,12 +668,15 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
       if (reply && !reply.ok) log.push({ attempt: attemptNo, via, search_api_ret: reply.ret });
       for (let until = Date.now() + SEARCH_RESULT_WAIT_MS; Date.now() < until && Date.now() < deadline;) {
         await settle(page, 1000);
-        // Over-ask, then filter. The scraper stops collecting at `limit` but counts to the end of the page, and the filter below runs over what it *collected*, so truncating at `limit` first let a few leading non-matching cards empty the result set and report a successful, self-contradicting answer next to `query_hits: 195`.
+        // Over-ask, then filter. The scraper stops collecting at `limit` but counts to the end of the page,
+        // and the filter below runs over what it *collected*, so truncating at `limit` first let a few
+        // leading non-matching cards empty the result set and report a successful, self-contradicting
+        // answer next to `query_hits: 195`.
         payload = (await scrape(page, SCRAPE_CARDS_JS, { query: q, terms: queryTerms(q), limit: Math.max(cap, 200), rails: RAIL_MARKERS }, 'search-page scrape')) ?? {};
         if (payload?.rendered) break;
       }
-      // The fraction is over every card on the page, not the `limit` we kept, and it is counted on the
-      // looser of the two relevance rules -- all the query's terms, in any order -- for the same reason
+      // The fraction is over every card on the page, not the `limit` we kept, and it counts on the
+      // looser of the two relevance rules -- all the query's terms, in any order -- for the reason
       // the API route does: goofish titles are not in the searcher's word order.
       const cards = Number(payload.cards_scanned) || 0, hits = Number(payload.query_hits) || 0, tokenHits = Number(payload.token_hits) || 0;
       const minHits = Math.max(1, Math.ceil(cards * MIN_MATCH_FRACTION)), accepted = Math.max(hits, tokenHits);
@@ -646,7 +693,7 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
   }
   // Count distinct attempts, not log entries. A searchbox attempt logs twice -- the typing step and
   // then the scrape -- so counting entries reported "6 attempt(s)" for a call that made 3, and counted
-  // the typed attempts the same way. An operator reading a refusal to decide whether to raise
+  // the typed attempts the same way. Somebody reading a refusal to decide whether to raise
   // `attempts` or the budget needs the real number.
   const attemptsMade = new Set(log.filter((e) => e.attempt).map((e) => e.attempt)).size;
   const typed = new Set(log.filter((e) => e.via === 'searchbox' && e.attempt).map((e) => e.attempt)).size;
@@ -660,21 +707,21 @@ const searchItems = async ({ query, limit = DEFAULT_SEARCH_ITEMS, attempts = SEA
  *
  *  One function for both routes into a pooled answer -- off the wire, and out of the cache -- because
  *  the two must not be able to differ in what they honour. The cache fast path was written first and
- *  returned the pool as it stood, which meant a `detail: 1` call answered from the cache with plain
- *  cards and no `detail_report` at all: a silent downgrade wearing the same envelope, and the worst
- *  shape this server can take an answer in. The depth still costs what it costs -- a listing this
- *  process has not read in full is read now, and `detail_report` says which ones came from the cache. */
+ *  returned the pool as it stood, so a `detail: 1` call answered from the cache with plain cards and
+ *  no `detail_report` at all: a silent downgrade wearing the same envelope. The depth still costs what
+ *  it costs -- a listing this process has not read in full is read now, and `detail_report` says which
+ *  ones came from the cache. */
 const publishSearch = async (session: any, q: string, found: any, detail: number, deadline: number, out: any): Promise<Data> => {
   if (detail < 1) return out;
   const deep = await enrichDetails(session, found.items, detail, deadline, out.items);
   return { ...out, items: deep.items, detail_requested: deep.report.requested, detailed: deep.report.ok, detail_ms: deep.report.ms_total,
-    // How the depth was bought: how wide the fan-out ran, how many batches it managed, how many of
-    // the listings actually came back out of one, and -- the part that matters -- whether it turned
-    // itself off because goofish went quiet. A caller that sees `fell_back` knows the wall clock it
-    // just paid was the serial one, and a caller that does not can still see it in `detail_report`.
+    // How the depth was bought: how wide the fan-out ran, how many batches it managed, how many of the
+    // listings actually came back out of one, and -- the part that matters -- whether it turned itself
+    // off because goofish went quiet. A caller that sees `fell_back` knows the wall clock it just paid
+    // was the serial one, and a caller that does not can still see it in `detail_report`.
     detail_fanout: deep.report.fanout,
-    // Per-listing outcomes, so a caller knows exactly which of the fifty it got in full and
-    // which are still cards -- rather than having to infer it from a missing field.
+    // Per-listing outcomes, so a caller knows exactly which of the fifty it got in full and which are
+    // still cards -- rather than having to infer it from a missing field.
     detail_report: deep.report.per_listing };
 };
 
@@ -682,7 +729,7 @@ const publishSearch = async (session: any, q: string, found: any, detail: number
  *  into it instead of paying for a fresh page load? A page that is still loading, that is showing the
  *  risk-control notice, or that has been moved off goofish all answer no -- and a `no` is safe, because
  *  the caller then does a real `open`, which re-checks the allowlist properly. The read goes through
- *  `scrape` so the URL is re-checked in the same statement, exactly as every other DOM read is. */
+ *  `scrape` so the URL is re-checked in the same statement, like every other DOM read. */
 const warmInputUsable = async (session: any): Promise<boolean> => {
   try {
     const page = await session.domReady();
@@ -692,16 +739,16 @@ const warmInputUsable = async (session: any): Promise<boolean> => {
 };
 
 /** Turn a captured search reply into ranked, deduped, filtered listings -- or null if it is not a
- *  believable result set for this query. The same relevance guard as the DOM path: a *fraction* of
- *  the results have to really carry the query, so a rail can never be presented as results. A result
+ *  believable result set for this query. Same relevance guard as the DOM path: a *fraction* of the
+ *  results has to really carry the query, so a rail can never be published as results. A result
  *  carries it by containing the phrase, or by containing every term of it in any order -- see
  *  `queryTerms`, which is the difference between this working on this site and returning nothing.
  *
  *  The normaliser is passed in rather than reached for through a page, because the same pooled
  *  payloads are judged twice: once when they arrive off the wire, and once when every page of them
  *  came from the cache and there is no page in the process at all. Passing the function rather than
- *  duplicating the call keeps one guard and one normaliser, which is the property that stops a cached
- *  answer from being a laxer one. */
+ *  duplicating the call keeps one guard and one normaliser, and that is what keeps a cached answer
+ *  from being a laxer one. */
 const finishSearch = async (payloads: any[], q: string, cap: number, normalize: (rows: any[]) => any[] | Promise<any[]>): Promise<any | null> => {
   // Every page walked contributes its 30 listings, and they are pooled before the guard runs: the
   // fraction has to be over the whole result set, or page 2 could be judged on 30 cards while the
@@ -718,8 +765,9 @@ const finishSearch = async (payloads: any[], q: string, cap: number, normalize: 
   const matches = all.filter((i: any) => hasAllTerms(i.title, terms));
   const scanned = all.length;
   const minHits = Math.max(1, Math.ceil(scanned * MIN_MATCH_FRACTION));
-  // Fewer than a fifth of the results really matching is what a declined search looks like from the
-  // API side too, so the same refusal applies; a short page of real matches still passes on the floor of one.
+  // Fewer than a fifth of the results really matching is what a declined search looks like from
+  // the API side too, so the same refusal applies; a short page of real matches still passes on the
+  // floor of one.
   if (matches.length < minHits) return null;
   const items = rankItems(matches, cap);
   for (const it of items) rememberCard(it);
@@ -730,9 +778,9 @@ const finishSearch = async (payloads: any[], q: string, cap: number, normalize: 
     non_matching_count: Math.max(0, scanned - matches.length), count: items.length, items };
 };
 
-/** Wait until the results pager reports `want` as its active page. Bounded, and honest about it:
- *  a false `settled` is not an error, it just means the next click is being made on a pager that has
- *  not caught up, and the click itself reports that. */
+/** Wait until the results pager reports `want` as its active page. Bounded. A false `settled` is not
+ *  an error: it means the next click is being made on a pager that has not caught up, and the click
+ *  reports that itself. */
 const waitForPager = async (page: Page, want: string, budgetMs: number): Promise<{ settled: boolean; on_page: string }> => {
   const until = Date.now() + budgetMs;
   for (;;) {
@@ -742,6 +790,15 @@ const waitForPager = async (page: Page, want: string, budgetMs: number): Promise
     await settle(page, 250);
   }
 };
+
+/** Did goofish actually answer for this listing, or is this the card the search that started the call
+ *  already had? The fan-out's health check reads this and not `ok`, and the distinction is the whole
+ *  guard: a throttled batch fails every page and falls back to the remembered card, which is `ok` for
+ *  every listing -- so a check on `ok` would keep the fan-out running precisely when it is buying
+ *  nothing. It is also why a batch of two listings that are both simply gone reads the same way and
+ *  backs the fan-out off for the rest of the call: serial is the slow, conservative route, and the
+ *  cost of guessing is a slower `detail` rather than a listing that was never read. */
+const readFromGoofish = (r: any): boolean => Boolean(r?.ok) && r.source !== 'search_card_cache';
 
 /** What the `detail_fanout` block publishes: how wide the fan-out was, how many batches it managed, how
  *  many listings were read inside one, and whether it turned itself off. `width: 0` means it never
@@ -833,11 +890,11 @@ const enrichDetails = async (session: any, ranked: any[], want: number, deadline
       for (let k = 0; k < batch.length; k++) if (!results[k]) results[k] = await deepen(batch[k], 'serial');
       report.push(...results);
       i += batch.length;
-      // The answer-rate check. Zero answers out of a batch is the throttled-site signal and it is
-      // terminal for the fan-out on this call: batching must never be the reason a listing is missed
-      // when the serial route would still have answered it.
+      // The answer-rate check. Nothing at all coming back from goofish is the throttled-site signal and
+      // it is terminal for the fan-out on this call: batching must never be the reason a listing is
+      // missed when the serial route would still have answered it.
       if (!reads.length) fellBack = `no fan-out page could be opened for batch ${batches}, so every listing in this call was read on the shared page instead`;
-      else if (!reads.some((r) => r.ok)) fellBack = `goofish answered none of the ${held.length} listing(s) in fan-out batch ${batches}, which is what a throttled site looks like (four pages at once measured 0/4 where the serial walk still answered 2/4) -- the rest of this call was read serially`;
+      else if (!reads.some(readFromGoofish)) fellBack = `goofish answered none of the ${held.length} listing(s) in fan-out batch ${batches}, which is what a throttled site looks like (four pages at once measured 0/4 where the serial walk still answered 2/4) -- the rest of this call was read serially`;
       continue;
     }
     report.push(await deepen(targets[i], 'serial'));
@@ -849,12 +906,12 @@ const enrichDetails = async (session: any, ranked: any[], want: number, deadline
     fanout: fanoutBlock(canFanOut ? width : 0, batches, fanned, fellBack), per_listing: report } };
 };
 
-/** Ids search has already returned this process, newest last. `search_items` fills it, and item_view
- *  checks it first: searching for a term and then viewing a result is the ordinary sequence, and in
- *  that case the listing is already in hand, so a search card answers without a page load at all. A
- *  card is only ever a *fallback* -- the detail API has everything and the card has five fields -- so
- *  this is the exception, not the rule. Bounded, so a long-lived server does not accumulate every
- *  listing it has ever seen. */
+/** Ids search has already returned this process, newest last. `search_items` fills it and item_view
+ *  checks it first: searching for a term and then viewing a result is the ordinary sequence, and
+ *  there the listing is already in hand, so a search card answers without a page load. A card is only
+ *  ever a *fallback* -- the detail API has everything and the card has five fields -- so this is the
+ *  exception, not the rule. Bounded, so a long-lived server does not accumulate every listing it has
+ *  ever seen. */
 const seenIds = new Map<string, any>();
 const rememberCard = (it: any): void => { if (it?.item_id) { seenIds.delete(String(it.item_id)); seenIds.set(String(it.item_id), it); if (seenIds.size > 500) seenIds.delete(seenIds.keys().next().value as string); } };
 /** Forget every remembered card. Module state outlives a single call, and a test that has seeded it
@@ -863,42 +920,41 @@ export const resetCardCache = (): void => { seenIds.clear(); };
 
 /** One listing by id. The page is loaded and its own detail reply is what answers -- measured 4-10s,
  *  and about fifteen fields a search card does not have. A card this process already returned from a
- *  search is the *fallback*, for a listing the item page will not serve: it is the ordinary
- *  "search, then open a result" sequence, but since the detail call is cheap there is no longer a
- *  reason to short-circuit on it and throw those fields away. This replaced a fallback that ran up
- *  to eight whole keyword searches, each a fresh 10-25s page load. */
+ *  search is the *fallback*, for a listing the item page will not serve. It used to be the first
+ *  choice, because "search, then open a result" is the ordinary sequence, but the detail call is
+ *  cheap and there is no reason to short-circuit on it and throw those fields away. The fallback it
+ *  replaced ran up to eight whole keyword searches, each a fresh 10-25s page load. */
 const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
   const item = normalizeItemId(item_id);
   if (!item) throw new XianyuError(`item_id must be digits or a goofish item URL, got ${JSON.stringify(item_id)}`);
-  // The clock starts before the load, not after it -- a budget that ignores the slowest step in the
+  // The clock starts before the load, not after it: a budget that ignores the slowest step in the
   // call is not a budget. The detail reply lands with the render that uses it, so the wait is one
-  // window rather than a load plus a poll: measured, 4-6s warm and about 10s cold.
+  // window rather than a load plus a poll -- measured, 4-6s warm and about 10s cold.
   const started = Date.now(), deadline = started + budget('ITEM_VIEW', 90) * 1000;
   // The item page is loaded on the DOM page and its own `mtop.taobao.idle.pc.detail` reply is what the
-  // answer is built from. That call is not ours to make: re-issuing it through the same client, with
-  // the same payload, times out, because goofish stamps requests the page originates with a per-call
+  // answer is built from. That call is not ours to make: re-issued through the same client with the
+  // same payload it times out, because goofish stamps the requests the page originates with a per-call
   // anti-bot blob. So the page makes the call and we read the reply off the wire.
   //
-  // This replaces a premise the tool was built on. It used to be documented -- in three separate
-  // comments, and in the tool description -- that "goofish does not serve item pages to logged-out
-  // visitors" and that the answer had to come from a search sweep instead. Measured against the live
-  // site, that is not true: the detail block renders, and the detail API answers SUCCESS anonymously,
-  // carrying the title, the full gallery, the description and the seller's statistics. The old code
-  // therefore spent its budget reloading a page that was never going to answer, and the sweep it fell
-  // back to -- up to eight keyword searches, each a fresh page load -- was dead weight on a path that
-  // almost never ran.
+  // This replaces a premise the tool was built on. Three separate comments and the tool description
+  // used to say that "goofish does not serve item pages to logged-out visitors" and that the answer
+  // had to come from a search sweep. Measured against the live site, that is wrong: the detail block
+  // renders, and the detail API answers SUCCESS anonymously with the title, the full gallery, the
+  // description and the seller's statistics. So the old code spent its budget reloading a page that
+  // was never going to answer, and the sweep behind it -- up to eight keyword searches, each a fresh
+  // page load -- was dead weight on a path that almost never ran.
   const session = getSession(), read = await readListing(session, item, deadline);
   if (read.listing) {
     const l = read.listing;
     // `item_id` is added here rather than in `readListing` because the two routes return different
-    // shapes -- the API route has it in the payload, the DOM route has it as `page_item_id` -- and the
+    // shapes -- the API route has it in the payload, the DOM route as `page_item_id` -- and the
     // envelope has to be the same whichever one answered.
     return { ...l, item_id: item, page_item_id: item, url: `${HOME}item?id=${item}`, account_required: false,
       attempts: read.tries, wants: asCount(l.want_count), browses: asCount(l.browse_count),
       reco_anchors: 0, image_candidates: (l.image_urls || []).length,
       // The cache decision travels with the answer, always. `attempts: 0` beside `cache.hit: true`
-      // means no page was loaded and goofish was never asked -- which is a ~0s repeat view, and is
-      // only safe to publish as such if it is also impossible to mistake for a live read.
+      // means no page was loaded and goofish was never asked: a ~0s repeat view, publishable as one
+      // only because it cannot be mistaken for a live read.
       cache: read.cache,
       fields_present: ITEM_FIELDS.filter((f) => present(l[f])), fields_missing: ITEM_FIELDS.filter((f) => !present(l[f])) };
   }
@@ -916,29 +972,29 @@ const itemView = async ({ item_id }: ItemArgs): Promise<Data> => {
 };
 
 /** The core of `item_view`, shared with `search_items`' `detail` argument: load the item page, read
- *  the call it makes for itself, and return the listing. Never throws -- a caller that is reading 20
- *  listings wants "this one would not answer", not an exception that abandons the other nineteen.
+ *  the call it makes for itself, and return the listing. Never throws -- a caller reading 20 listings
+ *  wants "this one would not answer", not an exception that abandons the other nineteen.
  *
  *  It owns the navigation as well as the read, because the reply it wants only exists once the page
- *  has loaded: the first version of the `detail` argument reused this function without the load and
- *  quietly produced zero details for every listing, since a page sitting on a search results page
- *  never issues a detail call. That failure is invisible in the envelope unless you ask, which is
- *  exactly why `search_items` publishes `detail_report`.
+ *  has loaded. The first version of the `detail` argument reused this function without the load and
+ *  quietly produced zero details for every listing: a page sitting on a search results page never
+ *  issues a detail call. The envelope does not show that unless you ask, which is why `search_items`
+ *  publishes `detail_report`.
  *
  *  It is also the one seam the listing cache sits on, which is why it is here rather than in
  *  `item_view`: `item_view`, the `detail` argument and `resolveSeller`'s hop all come through this
  *  function, so one check covers all three and none of them can grow a private one. The check runs
- *  *before* the navigation, because that is the entire saving -- an item page load is 4-10s measured
+ *  *before* the navigation, because that is the whole saving -- an item page load is 4-10s measured
  *  -- and every return carries the `cache` verdict, which is what keeps a repeat view from reading as
- *  a live one. A hit returns `page: null` because it opened nothing; no caller of this function
- *  reads `page` (they read `listing`, `tries` and `payload`), which is why that is safe.
+ *  a live one. A hit returns `page: null` because it opened nothing. No caller of this function reads
+ *  `page` (they read `listing`, `tries` and `payload`), so that is safe.
  *
  *  `surface` is the bounded fan-out's lease: a page of its own, a tap on that page's own replies, and
- *  the verdict on that page's load. Without one this reads the shared `domPage`, as it always did. With
- *  one, all three follow the lease rather than the session, because a fan-out has two of these in
- *  flight at once -- a reply read off the shared tap could be the other listing's, and a decline read
- *  off `lastLoad` could be the other load's. That is the whole difference between the two routes; the
- *  attempt loop below is identical either way. */
+ *  the verdict on that page's load. Without one this reads the shared `domPage`, as it always did.
+ *  With one, all three follow the lease rather than the session, because a fan-out has two of these
+ *  in flight at once -- a reply read off the shared tap could be the other listing's, and a decline
+ *  read off `lastLoad` could be the other load's. That is the whole difference between the two
+ *  routes; the attempt loop below is identical either way. */
 const readListing = async (session: any, item: string, deadline: number, surface?: DomSurface): Promise<{ listing: any | null; payload: any; tries: number; page: Page | null; cache: CacheVerdict }> => {
   const warm = getItem(item);
   if (warm) return { listing: warm.value, payload: {}, tries: 0, page: null, cache: warm.verdict };
@@ -947,27 +1003,27 @@ const readListing = async (session: any, item: string, deadline: number, surface
   const live = (): CacheVerdict => missed(itemKey(item), itemTtl(), 'this listing');
   const page: Page = surface ? surface.page : await session.open(`${HOME}item?id=${item}`);
   const tap = surface ? surface.tap : session.domTap;
-  const land = surface ? surface.load : session.lastLoad;
+  const land = surface ? surface.load : session.lastLoad;   // the verdict belongs to the load that made it
   let payload: any = {}, tries = 0;
   for (tries = 1; tries <= RENDER_ATTEMPTS; tries++) {
-    // The API reply and the DOM are read in the same loop, not one then the other: the detail block
-    // paints from that same reply, so waiting for one tells you about the other, and two serial
-    // waits would double the call for no new information.
+    // The API reply and the DOM are read in the same loop rather than one after the other: the detail
+    // block paints from that same reply, so waiting for one tells you about the other, and two serial
+    // waits would double the call for nothing.
     const reply = await tap.take(DETAIL_API, Math.min(ITEM_READY_WAIT_MS, Math.max(0, deadline - Date.now())));
     if (reply) {
       if (reply.ok) {
         // The richest route by a long way, and the only one that fills most of the typed block: the
         // detail payload carries the seller's province and city, the transport fee, the create and
-        // modify epochs and the 成色 attribute, none of which a card has.
+        // modify epochs and the 成色 attribute. A card has none of those.
         const listing = detailListing(reply.data, item);
         if (listing) {
           const full = { ...enrichListing(listing), source: 'item_detail_api' };
           putItem(item, full);
           return { listing: full, payload, tries, page, cache: live() };
         }
-        // It answered with a different listing, or with no listing at all. That is a page that is not
-        // the one that was asked for, and the id check below would refuse it -- but saying so now is
-        // cheaper than waiting out a poll that cannot change it.
+        // It answered with a different listing, or with none. That is a page that is not the one
+        // that was asked for, and the id check below would refuse it -- but saying so now is
+        // cheaper than waiting out a poll that cannot change.
         payload = { api_item_id: asText(reply.data?.itemDO?.itemId) };
         break;
       }
@@ -982,7 +1038,7 @@ const readListing = async (session: any, item: string, deadline: number, surface
     // failing outright. Both are terminal for this URL, and spending five reloads and ~2 minutes
     // proving it to a caller who is waiting on an answer is the defect.
     if (payload?.site_error || payload?.rail_only) break;
-    // A third kind of "answered", and the only one this loop could not see for itself: goofish declined
+    // A third kind of "answered", and the only one this loop cannot see for itself: goofish declined
     // the load outright and served its risk-control page or its own error notice instead of the app.
     // That is in the page text from the first paint and in no mtop call at all, so browser.ts reads it
     // at the load (`loadInto`, published as `Session.lastLoad` for the shared page and as the
@@ -1000,15 +1056,15 @@ const readListing = async (session: any, item: string, deadline: number, surface
     // the ordinary "search, then open a result" sequence, and a card is a real listing -- but it is a
     // card, so `source` says so and the fields only the detail page has are named as missing rather
     // than left looking read. This route is deliberately NOT stored in the TTL cache: a five-field
-    // card held for its TTL would turn one degraded read into a window of them, and the cache is only
-    // ever worth having when what it holds is something goofish read in full.
+    // card held for its TTL would turn one degraded read into a window of them, and a cache is only
+    // worth having when what it holds is something goofish read in full.
     const cached = seenIds.get(item);
     if (cached) {
       // Unless this same process already read it in full. `search_items`'s `detail` argument merges
       // the detail fields into the very card object the cache holds, so a listing deepened earlier in
-      // this session comes back with a description and a seller's statistics -- and blanking those
-      // here would throw away data we were actually holding. The blanking is for the plain-card case
-      // only, and is exactly the set of fields a card cannot have.
+      // this session comes back with a description and a seller's statistics, and blanking those here
+      // would throw away data we are holding. The blanking is for the plain-card case only, and is
+      // exactly the set of fields a card cannot have.
       const blank = cached.detailed ? {} : { description: '', want_count: '', browse_count: '', seller: '', seller_tenure_years: '', seller_items_sold: '', seller_positive_rate: '' };
       const fields = { ...cached, ...blank, item_id: item, page_item_id: item };
       return { listing: { ...enrichListing(fields), source: 'search_card_cache', attempts: tries, page_attempts: tries,
@@ -1018,28 +1074,49 @@ const readListing = async (session: any, item: string, deadline: number, surface
     return { listing: null, payload, tries, page, cache: live() };
   }
   // Unconditional: a page that renders the detail block but has no `?id=` in its URL is a redirect or
-  // a challenge page, not the listing, and skipping the check when `served` is empty is what let an
+  // a challenge page, not the listing. Skipping the check when `served` is empty is what let an
   // off-site page's fields be reported as this item's.
   const served = String(payload.page_item_id ?? '');
   if (served !== item) throw new ParseError(`asked goofish for item ${item} but the page it served reports item ${served || '(no ?id= in its URL)'}; refusing to report one listing's fields as another's.`);
   // The rendered page yields ten fields and no epoch, no province and no fee, so most of the typed block
-  // is null here and `missing` says so by name. That is the honest answer for this route rather than a
-  // thinner one: the keys are the same either way, and a caller can tell which route answered.
+  // is null here and `missing` says so by name. That is the answer this route can give, and the keys
+  // are the same either way, so a caller can tell which route answered.
   const rendered = Object.fromEntries(ITEM_FIELDS.map((f) => [f, payload[f] ?? (f === 'image_urls' ? [] : '')]));
   const listing = { ...enrichListing(rendered), source: 'item_page_dom' };
   putItem(item, listing);
   return { listing, payload, tries, page, cache: live() };
 };
 
-/** What this server can and cannot do right now, verified against the live site. A diagnostic must never be the thing that crashes, so every probe is guarded and reported as status rather than raised -- including a browser that has gone away. */
-const capabilities = async (): Promise<Data> => {
-  const session = getSession();
+/** What this server can and cannot do right now, verified against the live site. A diagnostic must
+ *  never be the thing that crashes, so every probe is guarded and reported as status rather than
+ *  raised -- including a browser that has gone away. */
+const CAP_ARGS = { probe: z.boolean().default(true) };
+/** The live picture, and the freshness answer that must not wait for it.
+ *
+ *  The split is `probe`. Everything below that needs a browser is behind it, and the freshness answer
+ *  is not -- because freshness is a pure function of (build stamp, base ref, checkout state) and a
+ *  cold Chromium launch cannot change its result. Queuing the answer to a question behind work that
+ *  cannot affect it is the whole defect (xi-cln): the caller who wants to know "is this deploy
+ *  current?" -- a spawn-time freshness gate, a performance measurement, a trust check -- paid a
+ *  measured 60-90s for it, and on a wedged browser paid longer still.
+ *
+ *  `probe` defaults to true, so every existing caller's contract is exactly what it was. `probe: false`
+ *  is the fast path, and it is honest about being one: the four probe conclusions below come back
+ *  **null**, not defaulted, and `probes` names them as unmeasured. `feed_reachable: false` would be a
+ *  lie on this path -- it reads "the feed did not answer" when the truth is "nobody asked" -- and null
+ *  is this repo's standing idiom for exactly that difference, the same one `build.stale: null` uses
+ *  for "could not be measured". A freshness answer that implied a browser had launched and succeeded
+ *  would be the failure this whole change exists to prevent, so the payload cannot report one. */
+const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promise<Data> => {
   const status: any = {
-    requires_xianyu_account: false, session_state: 'unknown', login_probe_ret: '', feed_reachable: false,
-    // The deployment's own address, up top and unmissable: which commit is answering, whether it is
-    // behind main, and why. `stale: null` means it could not be measured, which is not the same as
-    // `false` -- a build nobody can place is unverified, and reporting it as current is the exact
-    // mistake that let a nine-commit-old dist keep serving a town full of agents. `npm run check:deploy`
+    requires_xianyu_account: false,
+    // Null, not their live defaults, on the unprobed path -- see the header.
+    session_state: null, login_probe_ret: null, feed_reachable: null, browser_launches: null,
+    // The deployment's own address, up top: which commit is answering, whether it is
+    // behind main. `stale: null` means it could not be measured, which is not the same as
+    // `false` -- a build nobody can place is unverified, and reporting it as current is exactly
+    // what let a nine-commit-old dist keep serving a town full of agents. `npm run check:deploy`
+
     // runs the same rules from the command line, and it fetches first, because a cached remote-tracking
     // ref is itself a thing that goes stale. See src/build-info.ts.
     build: {
@@ -1073,13 +1150,13 @@ const capabilities = async (): Promise<Data> => {
       'An mtop endpoint the current page never happens to use CAN be issued through that page\'s own client and answers normally -- goofish stamps only the calls its own bundle originates. That is the whole route to a seller profile, and it is why these two endpoints exist here at all: response interception can only report a call the page already decided to make.',
       'Chromium on a network with broken IPv6 can fail to connect at all (ERR_ADDRESS_UNREACHABLE) where curl succeeds, which looks like an empty page -- see the cause list below.',
     ],
-    // The measurements that used to live inside the tool descriptions, where every agent paid for them on
+    // These measurements used to live inside the tool descriptions, where every agent paid for them on
     // every session whether it searched or not. They are here instead: fetched once, on demand, by the
-    // agent that is about to pay the latency and actually needs to know what it costs.
+    // agent that is about to pay the latency and does need to know what it costs.
     measured_latency: {
       'cold browser launch': '~5s, once per session; the session is then reused',
       'item page load': 'a full page load per listing, warm: median 13.4s (n=8, 8/8 answered) -- 4.5s to domcontentloaded, then goofish\'s own detail call lands 9-17s after that. item_view cannot skip the load: an SPA route change answered 0/8 in 32s, because the item page is a micro-frontend with no reachable router and no item links (measured, xi-x8x). 20 listings is about 4.5 minutes, 50 is about 11, and `detail` now reads two of them at a time on pages of its own -- see below',
-      'two listings at once': '`detail` reads two listing pages at a time, each on a page of its own, so the batch\'s wall clock falls while every listing\'s own latency rises -- measured at four wide: 27.1s of wall clock for 4 against 66.3s serially (2.4x, not 4x) with each listing\'s own latency going 11.4s -> 20.5s. That is why the shipped width is 2 (XIANYU_DETAIL_FANOUT, 0-4) and why every listing publishes its own `ms` and `via` in `detail_report`: the trade is reported, not asserted. The guard is the other half of the measurement: on a throttled site four-at-once answered 0/4 where the serial walk still answered 2/4, so the first fan-out batch that comes back with no answers turns the rest of the call serial and says so in `detail_fanout.fell_back`',
+      'two listings at once': '`detail` reads two listing pages at a time, each on a page of its own, so the batch\'s wall clock falls while every listing\'s own latency rises -- measured at four wide: 27.1s of wall clock for 4 against 66.3s serially (2.4x, not 4x) with each listing\'s own latency going 11.4s -> 20.5s. That is why the shipped width is 2 (XIANYU_DETAIL_FANOUT, 0-4) and why every listing publishes its own `ms` and `via` in `detail_report`: the trade is reported, not asserted. The guard is the other half of that measurement: on a throttled site four-at-once answered 0/4 where the serial walk still answered 2/4, so the first fan-out batch that comes back with no answers turns the rest of the call serial and says so in `detail_fanout.fell_back`',
       'cold start': 'the session\'s first load is paid in the background at boot rather than on your first call; see cold_start_warm for whether it got there',
       'search, warm page': '4-12s (an SPA route change -- search does route, unlike the item page); the first search of a session used to pay 15-41s for a cold load, which the boot warm-up now pays instead',
       'search pager walk': '30 listings a page at 5-9.5s each, against 13-25s for a fresh page load',
@@ -1090,15 +1167,42 @@ const capabilities = async (): Promise<Data> => {
     // The known causes, in the order they were actually observed; static, so it survives a dead browser.
     note: 'goofish did not serve a usable page. Known causes, in the order actually observed: (1) the network resolves goofish to IPv6 but has no working IPv6 route, so Chromium gets ERR_ADDRESS_UNREACHABLE where curl over v4 returns 200; (2) resource exhaustion, ERR_INSUFFICIENT_RESOURCES, usually a small /tmp; (3) goofish answering with its risk-control page instead of the app -- a 200 whose whole body reads "非法访问 ... 请使用正常浏览器访问闲鱼" -- which is the state to check for first, because it is indistinguishable from "no results" unless it is named, and it is server-side so it lifts after a pause; (4) a footer-only shell as a successful 200. The mtop-only tools need only the mtop client, which comes up even on (3) and (4), so they survive every one of these.',
   };
-  // Each probe is guarded on its own and reports under its own key: merged into one try, a throwing loginuser probe skipped the feed probe and its verdict, and both looked like a dead browser. The per-probe keys are the difference between "not logged in" and "not reachable".
-  const probe = async (key: string, run: () => Promise<void>): Promise<void> => { try { await run(); } catch (e: unknown) { const d = describe(e); status[`${key}_error`] = `${d.error_type}: ${d.message}`; } };
-  await probe('browser', async () => { await session.ensureReady(); });
-  // loginuser.get is used only to prove the session is logged out, never to act as one -- and only a session- or token-shaped ret is proof; anything else leaves session_state 'unknown' rather than reading as anonymity.
-  await probe('login', async () => { const me = (await session.call([['me', LOGINUSER_API, {}]]))?.me || {}; status.login_probe_ret = String(me.ret || ''); status.session_state = me.ok ? 'unexpectedly_logged_in' : hasMarker(me.ret, NO_SESSION_MARKERS) ? 'logged_out' : 'unknown'; });
-  await probe('feed', async () => { status.feed_reachable = Boolean((await session.call([['f', FEED_API, { pageNumber: 1 }]]))?.f?.ok); });
+  // Which of the four keys above are conclusions of a live probe, named rather than left for the
+  // caller to infer from a null. On the fast path they are all unmeasured, which is a different fact
+  // from "measured and false" and must not be readable as the latter.
+  const PROBED = ['session_state', 'login_probe_ret', 'feed_reachable', 'browser_launches'];
+  status.probes = {
+    ran: probe,
+    measured: probe ? PROBED : [],
+    not_measured: probe ? [] : PROBED,
+    note: probe
+      ? 'the four keys above are conclusions of live probes against goofish; a probe that failed reports under its own <key>_error rather than being folded into a verdict'
+      : 'probe: false -- nothing was asked of goofish and no browser was launched, so the four keys above are null because nobody looked, NOT because a probe failed. Call again with probe: true (the default) for the live picture.',
+  };
+  // The fast path returns here, and returns *here*: `getSession()` below is what pulls in a browser,
+  // so the freshness answer is only complete once this branch is taken. Nothing below is awaited on
+  // this path, which is what makes it instant rather than merely reordered.
+  if (!probe) return status;
+  // Past this point the probes WILL run, so the four conclusions get their live baselines before any
+  // of them is attempted. This is what keeps the two states distinguishable rather than collapsing
+  // them: `unknown` means a probe ran and could not tell, `null` means no probe ran. Restoring the
+  // original literals here rather than above is deliberate -- above, they are null for a reason.
+  status.session_state = 'unknown';
+  status.login_probe_ret = '';
+  status.feed_reachable = false;
+  // Each probe is guarded on its own and reports under its own key: merged into one try, a throwing
+  // loginuser probe skipped the feed probe and its verdict, and both looked like a dead browser. The
+  // per-probe keys are what separate "not logged in" from "not reachable".
+  const session = getSession();
+  const runProbe = async (key: string, run: () => Promise<void>): Promise<void> => { try { await run(); } catch (e: unknown) { const d = describe(e); status[`${key}_error`] = `${d.error_type}: ${d.message}`; } };
+  await runProbe('browser', async () => { await session.ensureReady(); });
+  // loginuser.get proves the session is logged out, never acts as one. Only a session- or token-shaped ret
+  // is proof; anything else leaves session_state 'unknown' rather than reading as anonymity.
+  await runProbe('login', async () => { const me = (await session.call([['me', LOGINUSER_API, {}]]))?.me || {}; status.login_probe_ret = String(me.ret || ''); status.session_state = me.ok ? 'unexpectedly_logged_in' : hasMarker(me.ret, NO_SESSION_MARKERS) ? 'logged_out' : 'unknown'; });
+  await runProbe('feed', async () => { status.feed_reachable = Boolean((await session.call([['f', FEED_API, { page: 1 }]]))?.f?.ok); });
   // read after the probes, so a browser that had to be relaunched shows up
   status.browser_launches = session.launches;
-  // Which build is running, and whether it is current. This is here rather than in a separate check
+  // Which build is running, and whether it is current. It is here rather than in a separate check
   // because the deployment that motivated it went stale silently: opencode.json pointed at a dist built
   // nine commits behind main, every tool answered plausibly, and nothing said so. A tool every agent
   // is told to call first is the one place that cannot be skipped.
@@ -1107,7 +1211,7 @@ const capabilities = async (): Promise<Data> => {
   // returns '' on failure, so a machine with no git, no dist/, or no checkout still gets an answer.
   // That is a property of that module, not of this call site -- `readFileSync` inside it is the only
   // way this could throw, and it is guarded there. The per-probe keys above exist for the same reason
-  // and do not cover this one, so the guarantee rests entirely on build-info.ts holding its line.
+  // and do not cover this one, so the guarantee rests on build-info.ts holding its line.
   //
   // What the boot warm-up managed, so a caller can tell a session that has already paid its first load
   // from one that is about to make them pay it. `pending` is normal for a session's first few seconds
@@ -1117,7 +1221,11 @@ const capabilities = async (): Promise<Data> => {
 };
 
 // -------------------------------------------------------- the published contract
-// The zod shape IS the published argument contract, and each handler's argument type is inferred from that same shape, so a renamed or retyped argument is a type error rather than a silent drift between schema and implementation. `Partial` because the defaults live in the schema; the destructuring defaults in each handler are what a direct call (tests, one-off scripts) gets, and only browse_feed's are asserted behaviourally.
+// The zod shape IS the published argument contract, and each handler's argument type is inferred from
+// that same shape, so a renamed or retyped argument is a type error rather than a silent drift between
+// schema and implementation. `Partial` because the defaults live in the schema; the destructuring
+// defaults in each handler are what a direct call (tests, one-off scripts) gets, and only browse_feed's
+// are asserted behaviourally.
 type Args<S extends z.ZodRawShape> = Partial<z.infer<z.ZodObject<S>>>;
 const FEED_ARGS = { page_number: z.number().int().min(1).max(MAX_PAGE_NUMBER).default(1), pages: z.number().int().min(1).max(MAX_PAGES).default(1), limit: z.number().int().min(1).max(MAX_LIMIT).default(60) };
 const COUNT_ARGS = { query: z.string().min(1) };
@@ -1157,21 +1265,21 @@ type SearchArgs = Args<typeof SEARCH_ARGS>; type RelatedArgs = Args<typeof RELAT
 type SellerArgs = Args<typeof SELLER_ARGS>;
 
 type ToolDef = { name: string; description: string; schema: z.ZodRawShape; run: (args: any) => Promise<Data> };
-/** Wrap a tool so it takes the one lock that matters: the three DOM tools read and navigate the single
+/** Wrap a tool so it takes the one lock that matters. The three DOM tools read and navigate the single
  *  shared `domPage`, so two of them at once would navigate it out from under each other and one would
  *  report the other's page as its own data. The mtop-only tools and `capabilities` are deliberately
- *  left out -- they never touch `domPage`, so making them queue behind a 70s search bought nothing but
- *  latency. The lock lives here, on the tools that need it, rather than in the entry point where it
- *  would apply to all eight. */
+ *  left out: they never touch `domPage`, so making them queue behind a 70s search bought latency and
+ *  nothing else. The lock lives here, on the tools that need it, rather than in the entry point where
+ *  it would apply to all eight. */
 const locked = (run: (args: any) => Promise<Data>): ((args: any) => Promise<Data>) => (args: any) => exclusive(() => run(args));
 const tool = <S extends z.ZodRawShape>(def: { name: string; description: string; schema: S; run: (args: Args<S>) => Promise<Data> }): ToolDef => def as ToolDef;
 const NO_ACCOUNT = ' No Xianyu account, cookie or login is required or used. Read-only: this server cannot publish, message, or change anything.';
 export const TOOLS: ToolDef[] = [
-  tool({ name: 'capabilities', description: 'Report what this server can do without a Xianyu account right now, probing the live site: session_state, feed_reachable, the split between what works and what is flaky, the measured cost of each call, the known failure causes, and `build` -- which commit is answering your calls and whether it is behind main. Read `build` first if you are measuring performance or trusting a result against the documentation: a deployment can be many commits and a whole release behind and still answer every call plausibly. Start here if you are unsure whether a call will work, what it will cost, or what a refusal means. Never raises, not even if the browser is gone. Args: none.' + NO_ACCOUNT, schema: {}, run: capabilities }),
+  tool({ name: 'capabilities', description: 'Report what this server can do without a Xianyu account right now: session_state, feed_reachable, the split between what works and what is flaky, the measured cost of each call, the known failure causes, and `build` -- which commit is answering your calls and whether it is behind main. Read `build` first if you are measuring performance or trusting a result against the documentation: a deployment can be many commits and a whole release behind and still answer every call plausibly. Start here if you are unsure whether a call will work, what it will cost, or what a refusal means. Never raises, not even if the browser is gone. Args: probe (bool, default true) -- with probe:false this answers ONLY the questions no browser is needed for (`build`, `cache`, the tool list, the measured costs) and returns immediately instead of launching Chromium first, which is what a spawn-time freshness gate or a latency measurement wants. The four live-probe keys are then null with `probes.not_measured` naming them, never a false that would read as a probe having failed.' + NO_ACCOUNT, schema: CAP_ARGS, run: capabilities }),
   tool({ name: 'browse_feed', description: 'Page through goofish\'s public homepage feed: live listings with item_id, title, price, city, seller, want_count and image_urls. Not keyword-filterable, so use it to sample inventory, not to answer a query. Args: page_number (1-10000, default 1), pages (1-25, default 1), limit (max items, default 60).' + NO_ACCOUNT, schema: FEED_ARGS, run: browseFeed }),
   tool({ name: 'search_count', description: 'How many goofish listings match a keyword, and whether there are any. Unlike search_items this is not subject to goofish\'s per-page-load declines -- verified returning about 28,800 for "x220" and 0 for a nonsense string anonymously. Args: query (str).' + NO_ACCOUNT, schema: COUNT_ARGS, run: searchCount }),
   tool({ name: 'search_suggest', description: 'goofish\'s own search-box autocomplete: keyword suggestions for a prefix, plus the total suggestion count. Args: query (str), limit (default 20).' + NO_ACCOUNT, schema: SUGGEST_ARGS, run: searchSuggest }),
-  tool({ name: 'search_items', description: 'Search goofish listings by keyword, logged out. Depth is two arguments. `pages` (1-10, default 1) walks the result pager for 30 listings a page; it is a floor, not a ceiling -- if the pages walked leave fewer than `limit` matches, up to two more are walked. Read `count` rather than assuming 30 a page. `detail` (0-50, default 0) reads that many of the top-ranked results in full -- description, every photo, and the seller with their city, tenure, sales count, rating, reply rate and signature -- one page load each, two at a time on pages of the session\'s own (`XIANYU_DETAIL_FANOUT`, 0-4, default 2), so the batch costs less wall clock than one load per listing suggests, and each listing\'s own `ms` and `via` are in `detail_report`; the fan-out switches itself back to serial the moment a batch comes back with no answers at all, which is named in `detail_fanout.fell_back`; `detail_report` also names which listings answered and what goofish said about the ones that did not. Cards already carry price, want count, city, seller, avatar, photo and tags, so ask for `detail` only on a shortlist. `items` holds just the listings whose titles really carry the query -- as the phrase, or as every term in any order, which is what makes Chinese work (`机械硬盘4t` has 70,000+ listings; the titles read 西数4T机械硬盘). `matched_by` says which rule admitted the set. The recommendation rail is never returned as results; goofish declines some page loads outright, so this retries and may raise `SearchUnavailableError`. A search whose (query, page) set this process has already walked answers from the cache with no page load at all -- `via: \'cache\'`, `attempts: 0` -- and a deeper walk reuses the pages it already has instead of clicking the pager again (5-9.5s a page); `cache` reports every page, whether it was a hit and how old it is, and read a listing before relying on its price. For measured costs, call capabilities. Args: query (str), limit (default 120, capped by XIANYU_SEARCH_MAX_ITEMS), attempts (1-10, default 4; the first 3 type into the search box, the last is a direct-URL fallback), pages (1-10, default 1), detail (0-50, default 0).' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
+  tool({ name: 'search_items', description: 'Search goofish listings by keyword, logged out. Depth is two arguments. `pages` (1-10, default 1) walks the result pager for 30 listings a page; it is a floor, not a ceiling -- if the pages walked leave fewer than `limit` matches, up to two more are walked. Read `count` rather than assuming 30 a page. `detail` (0-50, default 0) reads that many of the top-ranked results in full -- description, every photo, and the seller with their city, tenure, sales count, rating, reply rate and signature -- one page load each, two at a time on pages of the session\'s own (`XIANYU_DETAIL_FANOUT`, 0-4, default 2), so the batch costs less wall clock than one load per listing suggests; each listing\'s own `ms` and `via` are in `detail_report`, and the fan-out switches itself back to serial the moment a batch comes back with no answers at all, which `detail_fanout.fell_back` names; `detail_report` also names which listings answered and what goofish said about the ones that did not. Cards already carry price, want count, city, seller, avatar, photo and tags, so ask for `detail` only on a shortlist. `items` holds just the listings whose titles really carry the query -- as the phrase, or as every term in any order, which is what makes Chinese work (`机械硬盘4t` has 70,000+ listings; the titles read 西数4T机械硬盘). `matched_by` says which rule admitted the set. The recommendation rail is never returned as results; goofish declines some page loads outright, so this retries and may raise `SearchUnavailableError`. A search whose (query, page) set this process has already walked answers from the cache with no page load at all -- `via: \'cache\'`, `attempts: 0` -- and a deeper walk reuses the pages it already has instead of clicking the pager again (5-9.5s a page); `cache` reports every page, whether it was a hit and how old it is, and read a listing before relying on its price. For measured costs, call capabilities. Args: query (str), limit (default 120, capped by XIANYU_SEARCH_MAX_ITEMS), attempts (1-10, default 4; the first 3 type into the search box, the last is a direct-URL fallback), pages (1-10, default 1), detail (0-50, default 0).' + NO_ACCOUNT, schema: SEARCH_ARGS, run: locked(searchItems) }),
   tool({ name: 'related_items', description: 'Listings goofish recommends for a given item ("more like this"), or its generic recommendation set when item_id is omitted. Returns real listings with titles, prices and cities. Args: item_id (optional digits or item URL), limit (default 30), page (1-10000, default 1).' + NO_ACCOUNT, schema: RELATED_ARGS, run: relatedItems }),
   tool({ name: 'seller_profile', description: 'One seller\'s public profile, logged out: display name, avatar, signature, credit tier (卖家信用极好), shop level and score, praise ratio, review count, follower and listing counts, and whether they have passed real-name, real-person and 芝麻 checks. Pass `user_id` (the id item_view and this tool report, or the one in a goofish /personal?userId= URL) for a direct mtop call, or `item_id` to mean "whoever is selling this listing" -- which first loads the listing\'s page -- one page load, and on the loads goofish declines item_view\'s own retry loop absorbs the cost -- and additionally returns their city, tenure, sales count and positive rate, the four facts the profile endpoint does not carry. Exactly one of the two; passing both is refused rather than guessed. Fields the call could not fill come back null and are named in `fields_missing` rather than blank. Args: user_id (optional digits), item_id (optional digits or item URL).' + NO_ACCOUNT, schema: SELLER_ARGS, run: sellerProfile }),
   tool({ name: 'seller_items', description: 'The listings one seller currently has up, logged out -- the 宝贝 tab of their goofish profile, with title, price, category, photo, want count and the label strip. On a site with no ratings and no feedback threads this is the whole of due diligence, and nothing else here can answer it. Pass `user_id` for a direct mtop call, or `item_id` to mean that listing\'s seller (which costs one item page load). `has_more` comes from goofish\'s own `nextPage`; walk `page` rather than assuming 20 a page. Args: user_id (optional digits), item_id (optional digits or item URL), limit (default 20), page (1-50, default 1 -- goofish serves at most 50 pages of 20 here, so walk `has_more` rather than asking for a page number up front).' + NO_ACCOUNT, schema: SELLER_ITEMS_ARGS, run: sellerItems }),

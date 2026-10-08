@@ -11,10 +11,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { BOOT_URL, exclusive, HOME, reloadFresh, Session, setSession } from '../src/browser.ts';
+import { BOOT_URL, DETAIL_POOL_MAX, exclusive, HOME, reloadFresh, Session, setSession } from '../src/browser.ts';
 import { BrowserError, DetailUnavailableError, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from '../src/errors.ts';
 import { FEED_NORMALIZE_JS, ITEM_SCRAPE_JS, MTOP_READY_JS, PAGER_CLICK_JS, SCRAPE_CARDS_JS, SEARCH_INPUT_JS, SEARCH_STATE_JS } from '../src/extract.ts';
-import { budget, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
+import { budget, fanoutSize, ITEM_FIELDS, resetCardCache, TOOLS } from '../src/tools.ts';
 import { reset as resetCaches } from '../src/cache.ts';
 import { z } from 'zod';
 
@@ -48,7 +48,7 @@ const refused = (ret: string) => ({ ret, ok: false, data: null });
  *  resolves -- after `open`'s own allowlist check, before the caller's first read, the window the
  *  reviewer read a lookalike host off-site in. At `'read'`, on the first wait *after* a read, which is
  *  item_view's 6s readiness poll and the second read site. */
-const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]> } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
+const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; search?: any; swallow?: number; mtop?: Record<string, any[]>; poolMs?: number; poolSilent?: boolean } = {}, raw: any = {}, sleepMs = 0, hijack = '', hijackAfter: 'open' | 'read' = 'open') => {
   const queues: Record<any, any[]> = { [FEED_NORMALIZE_JS as any]: [...(payloads.cards ?? [])], [ITEM_SCRAPE_JS as any]: [...(payloads.item ?? [])], [SCRAPE_CARDS_JS as any]: [...(payloads.scrape ?? [])] };
   // The searchbox, as a real page holds it: mounted or not, with the keys that have landed so far.
   const search = { mounted: 'search' in payloads ? payloads.search !== null : true, value: '' };
@@ -93,10 +93,48 @@ const makeSession = (payloads: { cards?: any[]; item?: any[]; scrape?: any[]; se
     // The real `Session.open`, and the `ensureGoofishUrl` it runs before and after every goto, is
     // exercised for real in the two navigation tests below, against a fake Page.
     open: async (u: string) => { s.opened.push(u); at = u; search.value = ''; if (hijack && hijackAfter === 'open') queueMicrotask(() => { at = hijack; }); return page; },
+    // The bounded detail pool, as the session hands it out: one page and one tap per slot, created on
+    // demand. The tap answers about whatever listing its OWN page was last asked to load, which is what
+    // a real page's own detail call does -- and is what makes two concurrent reads provably
+    // independent rather than two consumers of one FIFO queue. `poolMs` costs the load real time, so a
+    // test can tell a fan-out from a serial walk by whether the load windows overlap. `poolSilent`
+    // refuses every pool page, which is the throttled-site arm.
+    pool: [] as any[], poolLoads: [] as { slot: number; url: string; from: number; to: number }[],
+    fanoutSurface: async (slot: number, u: string) => {
+      if (!Number.isInteger(slot) || slot < 0 || slot >= DETAIL_POOL_MAX) throw new BrowserError(`detail fan-out slot ${slot} does not exist`);
+      const held = s.pool[slot] ?? (s.pool[slot] = { page: poolPage(payloads.poolMs ?? 0), tap: null as any });
+      if (!held.tap) held.tap = { record: () => {}, clear: () => {}, take: async (api: string) => (api !== 'mtop.taobao.idle.pc.detail' || payloads.poolSilent ? null : detailReply(String(held.page.url().match(/[?&]id=(\d+)/)?.[1] ?? ''))) };
+      const load = { slot, url: u, from: Date.now(), to: 0 };
+      s.poolLoads.push(load);
+      await held.page.goto(u);
+      if (payloads.poolMs) await new Promise((r) => setTimeout(r, payloads.poolMs));
+      load.to = Date.now();
+      return { page: held.page, tap: held.tap, load: { url: held.page.url(), declined: '', ms: load.to - load.from } };
+    },
     call: async (spec: any) => { s.specs.push(spec); return s.raw; },
   };
   return s;
 };
+
+/** A page for one detail-fan-out slot: its own document, nothing else. A slot is never asked to
+ *  render a search or to walk a pager, so the whole of a real page's surface is not needed -- but it is
+ *  a separate object per slot, so a test can tell which page a load landed on and two concurrent
+ *  reads cannot move each other. `ms` is what makes the fake cost real time, which is how a fan-out is
+ *  told apart from a serial walk. */
+const poolPage = (ms: number) => {
+  let at = HOME;
+  const page: any = {
+    url: () => at,
+    waitForTimeout: async () => { if (ms) await new Promise((r) => setTimeout(r, ms)); },
+    goto: async (u: string) => { at = u; },
+    evaluate: async (fn: any) => (fn === MTOP_READY_JS ? 'ready' : null),
+  };
+  return page;
+};
+
+/** A `mtop.taobao.idle.pc.detail` reply for one listing, in the shape the page's own call returns --
+ *  which is the shape the pool's tap answers about whatever that page was asked to load. */
+const detailReply = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', wantCnt: 4, browseCnt: 900, desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京', hasSoldNumInteger: 12, userRegDay: 730, newGoodRatioRate: '99%' } });
 
 /**
  * A Page fake for the *real* Session, which does touch everything on this object: url, goto,
@@ -108,6 +146,9 @@ const drivenPage = (opts: { land?: (u: string) => string; start?: string; queues
   const page: any = {
     url: () => at,
     isClosed: () => false,
+    // The mtop tap a real Session bolts onto every page it opens. It records replies by subscribing
+    // to responses; this fake has no responses, so the subscription is the whole of its job here.
+    on: () => {},
     reload: async () => {},
     waitForTimeout: async () => {},
     goto: async (u: string) => { page.calls.push(u); at = opts.land ? opts.land(u) : u; },
@@ -181,7 +222,7 @@ const realSession = (opts: Parameters<typeof drivenPage>[0] = {}) => {
 // cleared between tests the same way the env budget is: a test that seeded one would otherwise have
 // the next item_view or search_items answered from it -- and, worse, would stop exercising the
 // refusal paths, since a cached listing never reaches them.
-test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; });
+test.afterEach(() => { setSession(null); resetCardCache(); resetCaches(); for (const g of ['document', 'location', 'window']) delete (globalThis as any)[g]; for (const k of ['SEARCH', 'ITEM_VIEW', 'RECOMMENDATIONS']) delete process.env[`XIANYU_${k}_BUDGET_S`]; delete process.env.XIANYU_SEARCH_MAX_ITEMS; delete process.env.XIANYU_DETAIL_FANOUT; });
 
 const cards = (ids: string[]) => ({ ok: true, ret: 'SUCCESS::调用成功', data: { cardList: ids.map((id) => ({ cardData: { itemId: id, title: `t${id}`, soldPrice: '5' } })) } });
 const listed = (ids: string[]) => ids.map((id) => ({ item_id: id, title: `t${id}`, price: '5', city: '杭州', seller: 'a', want_count: '1', image_urls: [], url: `https://www.goofish.com/item?id=${id}` }));
@@ -827,6 +868,10 @@ test('the deeper walk stops at XIANYU_SEARCH_MAX_ITEMS, and the rail is still ne
 });
 
 test('the `detail` argument reads the top N in full, and reports which ones it could not', async () => {
+  // Run serially: this is about the walk and the honesty of the report, and the fan-out drives its own
+  // pages rather than this scripted tap -- which is exactly the route the fan-out's own guard falls
+  // back to, so testing it here covers the fallback as much as the original behaviour.
+  process.env.XIANYU_DETAIL_FANOUT = '0';
   const rows = Array.from({ length: 8 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), String(100 + i * 10), '北京', '2']);
   const c = searchCase('x220', rows);
   // the detail reply comes back for three of the four requested, and the fourth is refused
@@ -865,7 +910,132 @@ test('the `detail` argument reads the top N in full, and reports which ones it c
   assert.equal(out.items.length, 8, 'and the other four are untouched');
 });
 
+/** A search that answers, plus a `detail` that deepens it -- the fixture every fan-out test below is
+ *  built on, because the fan-out only ever runs against a real ranked result set. */
+const deepenable = (rows: string[][], mtop: Record<string, any[]>, poolMs?: number, poolSilent?: boolean) => {
+  const c = searchCase('x220', rows);
+  return use(makeSession({ cards: [c.rows], poolMs, poolSilent, mtop: { 'mtop.taobao.idlemtopsearch.pc.search': c.mtop['mtop.taobao.idlemtopsearch.pc.search'], ...mtop } }));
+};
+
+test('`detail` reads two listings at a time on pages of its own, and never touches the shared page', async () => {
+  // Measured on this server: four pages loading four listings at once took the batch's wall clock from
+  // 66.3s to 27.1s, at the price of each listing's own latency going 11.4s -> 20.5s. So the fan-out is
+  // built rather than merely described, at two, and everything it does is published.
+  const rows = Array.from({ length: 8 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), '199', '北京', '2']);
+  const s = deepenable(rows, {}, 25);
+  const out = await run('search_items')({ query: 'x220', detail: 4, limit: 8, attempts: 1 });
+  assert.equal(out.detail_requested, 4);
+  // Two slots, two batches, every listing read from goofish on a pool page of its own.
+  assert.equal(out.detail_fanout.width, 2);
+  assert.equal(out.detail_fanout.batches, 2);
+  assert.equal(out.detail_fanout.listings_fanned, 4);
+  assert.equal(out.detail_fanout.fell_back, null, 'a healthy site never trips the guard');
+  assert.equal(out.detail_report.length, 4);
+  for (const r of out.detail_report) {
+    assert.equal(r.via, 'fanout', `${r.item_id} must say where it ran`);
+    assert.equal(r.source, 'item_detail_api', `${r.item_id} came off the page's own detail reply`);
+    assert.equal(typeof r.ms, 'number');
+    assert.ok(r.slot === 0 || r.slot === 1, `${r.item_id} names its pool slot`);
+  }
+  // The two loads in each batch overlap. That is the claim being tested -- a serial walk would leave
+  // `from` of the second load at or after the `to` of the first -- and it is why the fake's load costs
+  // real time rather than resolving instantly.
+  assert.equal(s.poolLoads.length, 4);
+  for (let batch = 0; batch < 2; batch++) {
+    const [a, b] = s.poolLoads.slice(batch * 2, batch * 2 + 2);
+    assert.equal(a.slot, 0); assert.equal(b.slot, 1);
+    assert.ok(a.to > b.from, `batch ${batch + 1} ran its two loads one after the other, which is a serial walk`);
+  }
+  // ...and the shared dom page never navigated for a detail read. It is holding the search results this
+  // call is deepening, which is the reason the pool exists at all.
+  assert.deepEqual(s.opened, [HOME], 'the shared page must be used for the search and nothing else');
+  // each listing still carries the fields only a detail read has, on its own card
+  const first = out.items.find((i: any) => i.item_id === '300');
+  assert.equal(first.description, '成色好，功能正常');
+  assert.equal(first.seller, '卖家');
+  assert.equal(first.detailed, true);
+  assert.equal(first.detail_source, 'item_detail_api');
+});
+
+test('a fan-out batch that goofish answers nothing for falls back to serial, and says so', async () => {
+  // The half of the measurement that decided the shape: on a throttled site four-at-once answered 0/4
+  // where the serial walk still answered 2/4. Batching must never be the reason a listing is missed, so
+  // the first batch with no answer at all turns the fan-out off for the rest of the call -- and says
+  // that it did, in the envelope, rather than quietly costing the caller a slower detail.
+  const rows = Array.from({ length: 8 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), '199', '北京', '2']);
+  // The pool pages refuse everything. The shared page's tap answers for the two listings the serial
+  // route goes on to read, which is the serial route still working -- exactly run 2 of the measurement.
+  const live = (id: string) => ok({ itemDO: { itemId: id, title: `详情 ${id}`, soldPrice: '123', desc: '成色好，功能正常' }, sellerDO: { nick: '卖家', city: '北京' } });
+  const s = deepenable(rows, { 'mtop.taobao.idle.pc.detail': [live('302'), live('303')] }, 0, true);
+  const out = await run('search_items')({ query: 'x220', detail: 4, limit: 8, attempts: 1 });
+  assert.equal(out.detail_fanout.batches, 1, 'only the first batch ran: the guard stopped the rest');
+  assert.equal(out.detail_fanout.listings_fanned, 2);
+  assert.match(out.detail_fanout.fell_back, /answered none of the 2 listing\(s\) in fan-out batch 1/);
+  assert.match(out.detail_fanout.fell_back, /read serially/, 'and it names the route it fell back to');
+  // the pool did not load the second batch, and the shared page read the rest itself
+  assert.equal(s.poolLoads.length, 2);
+  assert.deepEqual(s.opened, [HOME, `${HOME}item?id=302`, `${HOME}item?id=303`]);
+  // A listing that was not read is reported as such and left as a card -- the fan-out did not drop it,
+  // and it did not pretend the card was a detail block.
+  for (const card of out.items.filter((i: any) => ['300', '301'].includes(i.item_id))) {
+    assert.equal(card.detailed, true, 'it came back, from the search card');
+    assert.equal(card.detail_source, 'search_card_cache');
+    assert.equal(card.description, '');
+  }
+  for (const card of out.items.filter((i: any) => ['302', '303'].includes(i.item_id))) assert.equal(card.detail_source, 'item_detail_api', 'the serial route still answered');
+  // every listing is still accounted for, in request order, whichever route answered it
+  assert.deepEqual(out.detail_report.map((r: any) => r.item_id), ['300', '301', '302', '303']);
+  assert.deepEqual(out.detail_report.map((r: any) => r.via), ['fanout', 'fanout', 'serial', 'serial']);
+});
+
+test('XIANYU_DETAIL_FANOUT turns the fan-out off, and is clamped to what was measured', async () => {
+  // Two is the default, and the operator's off-switch is 0 -- which must be the same serial walk that
+  // shipped before the fan-out existed, not a fan-out of width one dressed up as one.
+  assert.equal(fanoutSize(), 2);
+  for (const [raw, want] of [['0', 0], ['1', 1], ['4', 4], ['9', DETAIL_POOL_MAX], ['-3', 0], ['', 2], ['wide', 2], ['2.5', 2]] as const) {
+    process.env.XIANYU_DETAIL_FANOUT = raw;
+    assert.equal(fanoutSize(), want, `XIANYU_DETAIL_FANOUT=${JSON.stringify(raw)}`);
+  }
+  delete process.env.XIANYU_DETAIL_FANOUT;
+
+  process.env.XIANYU_DETAIL_FANOUT = '0';
+  const rows = Array.from({ length: 8 }, (_, i) => [`联想 X220 ${i}`, String(300 + i), '199', '北京', '2']);
+  const s = deepenable(rows, {});
+  const out = await run('search_items')({ query: 'x220', detail: 4, limit: 8, attempts: 1 });
+  assert.equal(out.detail_fanout.width, 0);
+  assert.equal(out.detail_fanout.batches, 0);
+  assert.equal(out.detail_fanout.fell_back, null, 'it never ran, so it has nothing to report falling back from');
+  assert.match(out.detail_fanout.note, /one at a time/);
+  assert.deepEqual(s.poolLoads, [], 'and no page was leased');
+  assert.deepEqual(s.opened, [HOME, `${HOME}item?id=300`, `${HOME}item?id=301`, `${HOME}item?id=302`, `${HOME}item?id=303`]);
+  for (const r of out.detail_report) assert.equal(r.via, 'serial');
+});
+
+test('a fan-out slot past the measured width is refused, and its page is navigated like any other', async () => {
+  // The real Session, with a fake page: the bound is a refusal rather than a silent clamp, and a
+  // fan-out page goes through the same checked navigation site every other load goes through --
+  // including the check that goofish did not redirect us somewhere else.
+  const { s, page } = realSession();
+  (s as any).context = { newPage: async () => page };
+  const item = `${HOME}item?id=42`;
+  const surface = await s.fanoutSurface(0, item);
+  assert.equal(surface.page, page);
+  assert.equal(surface.load.declined, '');
+  assert.ok(surface.tap, 'each slot carries its own tap, so a reply cannot cross to the page that did not make the call');
+  assert.equal(page.calls[page.calls.length - 1], item, 'and it loaded the listing it was leased for');
+  for (const slot of [DETAIL_POOL_MAX, DETAIL_POOL_MAX + 1, -1, 1.5]) {
+    await assert.rejects(() => s.fanoutSurface(slot, item), (e: any) => e instanceof BrowserError, `slot ${slot} must not open a page`);
+  }
+  const off = realSession({ land: () => 'https://evil.com/item?id=42' });
+  (off.s as any).context = { newPage: async () => off.page };
+  await assert.rejects(() => off.s.fanoutSurface(0, item), (e: any) => e instanceof NavigationError);
+  const wrong = realSession({ land: () => 'http://www.goofish.com/item?id=42' });
+  (wrong.s as any).context = { newPage: async () => wrong.page };
+  await assert.rejects(() => wrong.s.fanoutSurface(0, item), (e: any) => e instanceof NavigationError);
+});
+
 test('a search card carries the seller, tags, avatar and publish time, not just a title and a price', async () => {
+  // All of it is in the reply we already had. The seller was the visible gap: a search card's name is
   // All of it is in the reply we already had. The seller was the visible gap: a search card's name is
   // `exContent.userNickName`, and reading `userNick` -- which does not exist on a search card -- left
   // every search result with an empty seller while the feed cards had one.
@@ -1280,6 +1450,62 @@ test('seller_items given an item_id resolves the seller first, off the listing\'
   resetCaches();
   use(makeSession({ item: [UNRENDERED, UNRENDERED], mtop: { 'mtop.taobao.idle.pc.detail': [ok({ itemDO: { itemId: '42', title: 't' }, sellerDO: { nick: '无名氏' } })] } }));
   await assert.rejects(run('seller_items')({ item_id: '42' }), (e: any) => e instanceof DetailUnavailableError && /no readable seller/.test(e.message) && /user_id directly/.test(e.message));
+});
+
+test('the freshness answer does not wait for a browser, and never fakes a probe it did not run', async () => {
+  // The defect (xi-cln): `build` -- which commit is answering, and is it behind main -- was returned
+  // only AFTER the browser/mtop probes, so a caller asking "is this deploy current?" paid a measured
+  // 60-90s cold Chromium launch for an answer that is a pure function of the build stamp, the base
+  // ref and the checkout. Nobody can make a stale dist fresh by launching a browser, and a cold or
+  // wedged Chromium is the slowest thing on the box.
+  //
+  // Proof is behavioural, not structural: a session that throws from every method cannot answer a
+  // call that touched it, so a fast-path answer that came back at all is a fast path that launched
+  // nothing. And the honesty half runs against the same fake -- a payload claiming a probe succeeded
+  // when the fake would have thrown is the failure this split could have introduced.
+  const s = use(makeSession({}, {}, 0));
+  s.ensureReady = async () => { throw new BrowserError('chromium would have taken 90s to launch here'); };
+  s.call = async () => { throw new BrowserError('mtop is not up'); };
+  const fast = await run('capabilities')({ probe: false });
+  // The question the gate actually asked, answered, with no browser in the process at all.
+  assert.ok(fast.build, 'the build block is on the fast path -- that is the whole point');
+  assert.equal(typeof fast.build.stale === 'boolean' || fast.build.stale === null, true);
+  assert.equal(typeof fast.build.commit, 'string');
+  assert.equal(typeof fast.build.behind === 'number' || fast.build.behind === null, true);
+  // ...and the rest of the payload is still whole. Splitting the response is not dropping half of it.
+  assert.ok(Array.isArray(fast.works_without_account) && fast.works_without_account.length > 0);
+  assert.ok(Array.isArray(fast.notes) && fast.notes.length > 0 && fast.note);
+  assert.equal(fast.requires_xianyu_account, false);
+  assert.ok(fast.cache, 'the cache block is on the fast path too');
+  assert.equal(fast.probes.ran, false);
+  // The honesty half. `feed_reachable: false` here would assert the feed did not answer, when the
+  // truth is nobody asked -- and a freshness gate that trusted it would report a live server as
+  // unreachable. Null, and named.
+  assert.deepEqual([fast.session_state, fast.login_probe_ret, fast.feed_reachable, fast.browser_launches], [null, null, null, null]);
+  assert.deepEqual(fast.probes.not_measured, ['session_state', 'login_probe_ret', 'feed_reachable', 'browser_launches']);
+  assert.deepEqual(fast.probes.measured, [], 'nothing was measured, so nothing is claimed');
+  assert.match(fast.probes.note, /nobody looked, NOT because a probe failed/);
+  // no per-probe error keys either: a probe that did not run has not errored
+  assert.deepEqual([fast.browser_error, fast.login_error, fast.feed_error], [undefined, undefined, undefined]);
+  // Same build answer either way -- the split is about WHEN, and two paths that could disagree about
+  // staleness would be a worse bug than the latency this fixes.
+  const deep = use(makeSession({}, { me: { ok: false, ret: 'FAIL_SYS_SESSION_EXPIRED::x' }, f: { ok: true } }));
+  const probed = await run('capabilities')({});
+  assert.deepEqual(fast.build, probed.build, 'the freshness answer does not depend on the probes at all');
+  assert.deepEqual(fast.cache, probed.cache);
+  // and the default still probes: existing callers lose nothing
+  assert.equal(probed.probes.ran, true);
+  assert.deepEqual(probed.probes.measured, ['session_state', 'login_probe_ret', 'feed_reachable', 'browser_launches']);
+  assert.deepEqual(probed.probes.not_measured, []);
+  assert.equal(probed.session_state, 'logged_out');
+  assert.equal(probed.feed_reachable, true);
+  assert.equal(typeof probed.browser_launches, 'number');
+  // even against a dead browser, which is the case the bead says once looked like a hang
+  deep.ensureReady = async () => { throw new BrowserError('chromium is gone'); };
+  const deadFast = await run('capabilities')({ probe: false });
+  assert.equal(deadFast.probes.ran, false, 'a dead browser cannot deny the freshness answer');
+  assert.equal(typeof deadFast.build.commit, 'string');
+  assert.equal(deadFast.session_state, null);
 });
 
 test('capabilities never throws, not even when the browser is gone, and a failed probe does not hide the others', async () => {

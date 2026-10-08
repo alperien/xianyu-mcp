@@ -1,4 +1,22 @@
-/* Every error this server raises on purpose, and the class name is the published `error_type`, so renaming one is a contract change. BrowserError: could not launch or drive the throwaway Chromium. GatedError: goofish refused the call for this anonymous visitor. ParseError: it loaded, but did not have the shape we expected. NavigationError: refused to navigate off goofish.com. SearchUnavailableError and DetailUnavailableError are GatedErrors, and the split is the point: the first means goofish declined this *search* on every attempt, the second that the item page would not render. Anonymous search does work logged out -- that is verified -- but goofish decides per page load whether to serve results, and when it declines it never calls the search API at all: the page renders "nothing found" plus the 猜你喜欢 rail. Raised rather than quietly returning recommendations, which would look like search results but are not. */
+/**
+ * Every error this server raises on purpose. The class name is the published `error_type`, so
+ * renaming one is a contract change rather than a refactor.
+ *
+ *   BrowserError             could not launch or drive the throwaway Chromium
+ *   GatedError               goofish refused the call for this anonymous visitor
+ *   ParseError               it loaded, but not in the shape we expected
+ *   NavigationError          refused to navigate off goofish.com
+ *   SearchUnavailableError   a GatedError: goofish declined this search on every attempt
+ *   DetailUnavailableError   a GatedError: the item page would not render
+ *
+ * The last two are both GatedErrors and the split is the point: a search goofish declined and an
+ * item page that will not paint are different facts, and a caller retries them differently.
+ *
+ * Anonymous search does work logged out, which is verified, but goofish decides per page load
+ * whether to serve results. When it declines it never calls the search API at all -- the page
+ * renders "nothing found" plus the 猜你喜欢 rail. So a declined search raises instead of returning
+ * that rail, which would read as results and is not one.
+ */
 export class XianyuError extends Error {}
 export class GatedError extends XianyuError {} export class SearchUnavailableError extends GatedError {} export class DetailUnavailableError extends GatedError {}
 export class BrowserError extends XianyuError {} export class ParseError extends XianyuError {} export class NavigationError extends XianyuError {}
