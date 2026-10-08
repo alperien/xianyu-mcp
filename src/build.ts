@@ -30,7 +30,8 @@ export const buildBlock = (root?: string) => {
     stale: info.stale,
     deployable: ok,
     // Empty when there is nothing to say. Every entry is a fact a caller would otherwise have to go
-    // and measure themselves, which is how the original nine-commit drift stayed invisible.
+    // and measure itself, which is how the original nine-commit drift stayed invisible for nine
+    // commits with nothing in any answer saying so.
     reasons,
   };
 };

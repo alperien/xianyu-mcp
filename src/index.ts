@@ -1,5 +1,10 @@
 #!/usr/bin/env node
-/** MCP stdio entry point. Register it with an MCP client exactly as README.md shows it -- `node /path/to/xianyu-mcp/dist/index.js` as `command` + `args`; this file used to carry an inline config snippet of its own and it was not valid MCP config. No Xianyu account, no cookies, no stored credentials, no write tools: the server launches its own Chromium and reads goofish the way an anonymous visitor's browser does. */
+/**
+ * MCP stdio entry point. An MCP client runs `node` as `command` and this file's installed path as
+ * `args`; README.md spells the block out. This file used to carry a config snippet of its own and it
+ * was not valid MCP config, so it went. The account-free pitch lives in the `instructions` string
+ * below and in the README, where it belongs.
+ */
 import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -37,12 +42,13 @@ for (const t of TOOLS) {
 }
 
 // The one thing this server does before it has been asked for anything: pay the session's first load.
-// Measured, that first load is 12.4s for an item page and 15-41s for the first search, against a warm
-// price of ~1.6s for everything after it -- and it lands on whoever happens to ask first, which for an
-// MCP client is the user's first question. So it is started here, in the background, on a page of its
-// own that no tool will ever see (see `Session.warmUp`). Fire-and-forget and never awaited: this must
-// not be able to delay the handshake, and a warm-up that throws is recorded under `capabilities`
-// rather than taken out on the server's start. `XIANYU_NO_WARMUP=1` skips it.
+// Measured, that first load is 12.4s for an item page and the mayor measured 15-41s for the first
+// search, against a warm price of ~1.6s for everything after it -- and it lands on whoever happens
+// to ask first, which for an MCP client is the user's first question. So it is started here, in the
+// background, on a page of its own that no tool will ever see (see `Session.warmUp`). Fire-and-forget
+// and never awaited: this must not be able to delay the handshake, and a warm-up that throws is
+// recorded under `capabilities` rather than taken out on the server's start. `XIANYU_NO_WARMUP=1`
+// skips it.
 void getSession().warmUp().catch(() => {});
 
 if (process.stdin.isTTY) {
