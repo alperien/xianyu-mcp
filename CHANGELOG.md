@@ -15,6 +15,28 @@ From here on, each release gets a commit behind it and this file grows normally.
 The Python implementation this is a port of is not in this history at all: it lives on the
 `python-original` branch as a single commit (`cfe401d`, 2026-09-27).
 
+## [0.2.1] — 2026-10-08
+
+### Fixed
+
+- **A cache-served batch is no longer mistaken for a throttled site.** The fan-out's fallback turns
+  the rest of a `detail` walk serial when a batch comes back with no answers at all, which is the
+  signature of a site that has stopped replying. That test counted any answer, including one served
+  from this process's own `search_card_cache`. So a batch answered entirely from cache read as "the
+  site refused us", and the remaining listings were walked serially for no reason.
+  `readFromGoofish` now requires an answer that came from goofish.
+
+### About these two releases
+
+`0.2.1` exists because `v0.2.0` was published and then its tag was moved, 18 minutes later, to a
+later commit. That moved tag shipped the `detail` fan-out as if it were in `0.2.0`; the commit the
+tag actually named did not contain it. Rather than move a published tag again — the second move of
+one is already one too many — the difference ships here, forward.
+
+The `0.2.0` section below describes work that reached users in `0.2.1`, not in `0.2.0`. It is left in
+place rather than rewritten, because rewriting it would make the changelog disagree with the tag that
+was actually published.
+
 ## [0.2.0] — 2026-10-08
 
 Released. The seller tools went in here rather than opening a 0.3.0 section, because 0.2.0 had never
