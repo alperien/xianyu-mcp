@@ -232,15 +232,22 @@ test('both navigation sites re-check the URL, before and after the redirect', ()
   const src = read(join(ROOT, 'src', 'browser.ts'));
   const [load] = src.match(/async function load\([\s\S]*?\n}/) ?? [];
   assert.ok(load && load.includes('page.goto('), 'the one place a chosen URL is loaded from');
-  // open() validates the target before goto, then the URL goofish itself landed on after it
-  const open = src.match(/async open\([\s\S]*?\n  }/)?.[0] ?? '';
+  // open() and fanoutSurface() both delegate to loadInto(), which is now the single place a URL is
+  // loaded from -- so the allowlist checks belong there, and asserting them inside open() would only
+  // be asserting the shape of an earlier refactor.
+  const into = src.match(/private async loadInto\([\s\S]*?\n  }/)?.[0] ?? '';
+  assert.ok(into, 'loadInto is where a chosen URL is loaded from');
+  for (const site of ['open', 'fanoutSurface']) {
+    const body = src.match(new RegExp(`async ${site}\\([\\s\\S]*?\\n  }`))?.[0] ?? '';
+    assert.ok(body.includes('this.loadInto('), `${site} must go through loadInto, not page.goto directly`);
+  }
   // before the goto, after it, and once more on the way out: the settle and the mtop wait after the
   // second check can take tens of seconds, so the check that is still current when the caller scrapes
   // is the last.
-  assert.ok((open.match(/ensureGoofishUrl\(/g) ?? []).length >= 2, open);
-  assert.ok(open.indexOf('ensureGoofishUrl(url)') < open.indexOf('load(page, target)'));
-  assert.ok(open.indexOf('load(page, target)') < open.indexOf('ensureGoofishUrl(page.url())'));
-  assert.ok(open.lastIndexOf('ensureGoofishUrl(page.url())') > open.indexOf('waitForMtop(page)'), open);
+  assert.ok((into.match(/ensureGoofishUrl\(/g) ?? []).length >= 3, into);
+  assert.ok(into.indexOf('ensureGoofishUrl(url)') < into.indexOf('load(page, target)'));
+  assert.ok(into.indexOf('load(page, target)') < into.indexOf('ensureGoofishUrl(page.url())'));
+  assert.ok(into.lastIndexOf('ensureGoofishUrl(page.url())') > into.indexOf('waitForMtop(page)'), into);
   // reloadFresh re-validates wherever the page ended up, which is not something we chose, and it
   // does not swallow that refusal: its three callers scrape whatever is on the page next.
   const fresh = src.match(/async function reloadFresh\([\s\S]*?\n}/)?.[0] ?? '';
@@ -327,7 +334,9 @@ test('item_view reads the page the way an anonymous visitor does, and item ids a
   assert.match(extract.match(/export const detailListing[\s\S]*?\n};/)?.[0] ?? '', /wanted && id !== String\(wanted\)/);
   assert.ok(reader.includes('page_item_id'), 'a page serving a different listing is refused');
   // the rail markers reach both scrapers as an argument, so the pattern is built from the list
-  assert.match(ITEM_SCRAPE_JS.toString(), /new RegExp\(spec\.rails\.join\('\|'\)\)/, 'the item scraper must cut the page at the rail markers it is handed');
+  // The built form re-quotes string literals, so match either quote style -- what is being asserted
+  // is that the pattern is built from the list it is handed, not which quote survived the build.
+  assert.match(ITEM_SCRAPE_JS.toString(), /new RegExp\(spec\.rails\.join\((?:'|")\|(?:'|")\)\)/, 'the item scraper must cut the page at the rail markers it is handed');
   assert.deepEqual(RAIL_MARKERS, ['为你推荐', '猜你喜欢', '猜你想看']);
 });
 
