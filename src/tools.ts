@@ -1,26 +1,19 @@
-/** The ten tools. Six run on the api page and need nothing but goofish's mtop client:
- *  browse_feed, search_count, search_suggest, related_items, seller_profile, seller_items. Two drive
- *  the dom page and read the replies its own bundle fetches: item_view and search_items.
- *  capabilities never raises, even when the browser is gone. Every page read goes through
- *  browser.ts, so a Playwright failure arrives as a typed XianyuError instead of escaping a call.
+/** The ten tools. Six use only goofish's mtop client: browse_feed, search_count, search_suggest,
+ *  related_items, seller_profile, seller_items. Two read the dom page's own mtop replies: item_view,
+ *  search_items. capabilities never raises. Page reads go through browser.ts, so a Playwright failure
+ *  arrives as a typed XianyuError.
  *
- *  The mtop-only tools do not queue behind the ones that drive a browser. They used to share one
- *  page, and a 70s search held up a feed call that does 1.5s of work. The lock therefore sits here,
- *  on the three tools that read the one navigating page (`search_items`, `item_view`,
- *  `recommendations`), and nowhere else. Wrapping every tool at the entry point re-serialised the
- *  fast ones behind the slow ones, and the test that claimed to rule that out called `t.run`
- *  directly, so it never ran the shipped path.
+ *  The lock covers the three tools that read the one navigating page (`search_items`, `item_view`,
+ *  `recommendations`) and nothing else. They used to share a page with everything, and a 70s search
+ *  held up a feed call that does 1.5s of work. Wrapping all ten instead re-serialised the fast ones
+ *  behind the slow ones, and the test that claimed to rule that out called `t.run` directly.
  *
- *  `seller_profile` and `seller_items` are why the rule is stated as "where a navigating page is
- *  read" and not as a tool list. With a `user_id` they are two plain mtop calls that take nothing.
- *  With an `item_id` they have to find the seller behind that listing first, and the only route to
- *  one is the detail call the item page makes for itself: they hold the lock for that hop and drop
- *  it before the mtop calls. See `resolveSeller`.
+ *  `seller_profile` and `seller_items` are why the rule reads "where a navigating page is read" and
+ *  not a tool list: with an `item_id` they must find the seller via the item page's own detail call
+ *  first, holding the lock for that hop and dropping it before the mtop calls (`resolveSeller`).
  *
- *  One thing does hold more than one page, and only inside a lock it already holds: `detail`'s bounded
- *  fan-out loads two listing pages at a time out of the session's own pool, because a search is the
- *  one caller allowed to be slow on purpose and the pool pages are invisible to every other tool.
- *  See `enrichDetails` for the measurement that set the width and the guard that shuts it off. */
+ *  `detail`'s fan-out holds two pool pages at once, inside a lock it already holds. `enrichDetails`
+ *  has the measurement that set the width and the guard that disables it. */
 import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
@@ -31,22 +24,17 @@ import { DETAIL_POOL_MAX, type DomSurface } from './browser.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
-// The mtop endpoints this server is allowed to name. Found by pulling all 51 `mtop.*` names out of
-// goofish's own JS bundles (idle-pc/xy-site) and reading the minified call sites for the parameter
-// shapes, which is why these nine worked first time. All of them answer anonymously, and a test fails
-// the build if any other mtop name shows up anywhere in the tree.
+// The mtop endpoints this server may name, found by pulling all 51 `mtop.*` names out of goofish's
+// bundles (idle-pc/xy-site) and reading the minified call sites for the payload shapes. All answer
+// anonymously, and a test fails the build if another mtop name appears anywhere in the tree.
 //
-// DETAIL_API and SEARCH_API are never called by us. The page calls them and we read the replies off
-// the wire, in `item_view` and `search_items`. Re-issuing either through the page's own mtop client,
-// with the payload the page itself sent, answers TIMEOUT::接口超时: goofish stamps the requests its
-// own bundle originates with a per-call anti-bot blob, and a synthesised request carries none. Letting
-// the page make the call works, and returns strictly more than the DOM did.
+// DETAIL_API and SEARCH_API are never called directly. goofish stamps only requests its own bundle
+// originates, with a per-call anti-bot blob, so re-issuing either through the page's client answers
+// TIMEOUT::接口超时. Reading the page's reply returns strictly more than the DOM did.
 //
-// The two seller endpoints turn that rule round. goofish stamps only what its own bundle originates,
-// so an endpoint the *current* page never happens to use can go through the very same client and
-// answers normally: `page.head` was verified SUCCESS from an item page, which never calls it, on
-// nothing but `{userId}`. Response interception cannot make that call at all, which is why these two
-// endpoints exist.
+// The seller endpoints are the exception: an endpoint the *current* page never uses carries no stamp,
+// so the same client gets through. `page.head` verified SUCCESS from an item page, which never calls
+// it, on `{userId}` alone. Response interception cannot make that call at all.
 const FEED_API = 'mtop.taobao.idlehome.home.webpc.feed';
 // The match counter. The search page calls it with the same payload shape as search and reads
 // `data.hitnum`, so it answers "how many items match this keyword" for a logged-out visitor even on
