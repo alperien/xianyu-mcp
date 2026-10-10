@@ -2,22 +2,22 @@
 
 [![ci](https://github.com/alperien/xianyu-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/alperien/xianyu-mcp/actions/workflows/ci.yml)
 
-xianyu-mcp is a read-only MCP server for Xianyu (闲鱼, Goofish). It needs no Xianyu account: no
-cookies, no login, no stored credentials, and no tool that writes anything.
+xianyu-mcp is a read-only MCP server for Xianyu (闲鱼, Goofish). It works without an account,
+cookies or stored credentials, and has no tools that write to Goofish.
 
-TypeScript, run straight by Node. Unflagged type stripping landed in 23.6 and was backported to
-**22.18**, so that is the floor: on 22.6–22.17 `node src/index.ts` and `node --test` both fail with
-`ERR_UNKNOWN_FILE_EXTENSION` unless you add `--experimental-strip-types`. A checkout runs from
-`src/`; `npm run build` emits `dist/` for the published tarball, prebuilt because Node will not strip
-types from files under `node_modules/`.
+The source is TypeScript and runs directly under Node. Unflagged type stripping is available in Node
+23.6 and 22.18+, so 22.18 is the minimum. On Node 22.6–22.17, `node src/index.ts` and `node --test`
+fail with `ERR_UNKNOWN_FILE_EXTENSION` unless run with `--experimental-strip-types`. In a checkout,
+the server runs from `src/`; `npm run build` emits the prebuilt `dist/` shipped in the published
+tarball. Node does not strip types from files under `node_modules/`.
 
-It drives its own throwaway Chromium with Playwright and reads goofish the way an anonymous visitor's
-browser does -- including calling goofish's own JS client (`window.lib.mtop.request`) rather than
-re-implementing token minting and request signing, which is the whole reason a browser is involved.
+Playwright launches a throwaway Chromium. The server calls Goofish's own JavaScript client
+(`window.lib.mtop.request`) instead of implementing token minting and request signing.
 
-It launches **windowed**, and needs a display (`DISPLAY=:0`, or Xvfb). That is a measurement, not a
-preference: [headless gets served goofish's risk-control page](#headless-vs-headed) instead of the app.
-It never clicks anything in the page, and [the login dialog is left alone on purpose](#the-login-dialog-is-left-alone-on-purpose).
+Chromium runs windowed and needs a display (`DISPLAY=:0` or Xvfb). Goofish serves its risk-control
+page to headless Chromium instead of the app; see [Headless vs headed](#headless-vs-headed). The
+server does not click page controls. It leaves the login dialog open; see
+[The login dialog is left alone](#the-login-dialog-is-left-alone-on-purpose).
 
 ## Install
 
@@ -64,12 +64,12 @@ the checkout it sits in. `scripts/serve.mjs` does, at every spawn:
 }
 ```
 
-It compares the build's stamp against the checkout's HEAD. If they disagree -- a `git pull` that
-fast-forwarded without rebuilding, which is the case that ran unnoticed for nine commits and then again
-for thirteen minutes after being fixed -- it runs `npm ci && npm run build` and starts the rebuilt
-server. If that cannot produce a `dist/` matching the tree, it **refuses to start** rather than
-serving one it cannot vouch for: a loud failure costs one session, while a silently stale dist costs
-every session in the drift window and none of them can tell which ones those were. There is no flag to
+It compares the build stamp with the checkout's HEAD. If they differ -- for example, after a
+fast-forwarding `git pull` without a rebuild -- it runs `npm ci && npm run build` and starts the rebuilt
+server. A stale build went unnoticed for nine commits; another remained stale for thirteen minutes.
+If the rebuild cannot produce a `dist/` matching the tree, the launcher **refuses to start**. The
+failure costs one session; serving a stale build can affect every session in the drift window without
+any of them knowing. There is no flag to
 skip the check and no env var to bypass it, on purpose. A spawn where the build is already current
 costs about 40ms and no network; everything it prints goes to stderr, because stdout is the
 JSON-RPC channel.
@@ -104,9 +104,9 @@ The budget bounds the *loop*, not the call. It is checked between attempts, so a
 flight runs to completion: at the 90s default and a 10–25s load you get several attempts, and a call
 can overshoot its budget by roughly one page load.
 
-The server runs windowed and needs a display. goofish serves headless Chromium its risk-control
-page instead of the app, which leaves the three DOM tools with nothing to read, so headed is the
-default and a headless machine needs `xvfb-run` or an X server. The mtop-only tools work either way.
+The server runs windowed and needs a display. Goofish serves its risk-control page to headless
+Chromium, leaving the three DOM tools with nothing to read. Headed mode is the default; a headless
+machine needs `xvfb-run` or an X server. The mtop-only tools work in either mode.
 
 ## Tools
 
@@ -144,10 +144,9 @@ the envelope which one was ignored. Passing neither gets the same treatment. The
 bottom row are named in `fields_missing` when you passed a `user_id`, because the profile endpoint has
 no answer for them at all and a blank there would read as "this seller has no history".
 
-The profile endpoint is reached in a way worth knowing. `mtop.idle.web.user.page.head` is the
-endpoint goofish's own `/personal?userId=` page calls, and this server reads it by *issuing* it through
-that page's own mtop client -- from a page that never makes the call. That works, and it is the opposite
-of what happens with `mtop.taobao.idle.pc.detail`:
+`mtop.idle.web.user.page.head` is the endpoint Goofish calls from `/personal?userId=`. This server
+can issue it through the page's mtop client even though the page does not call it during this request.
+`mtop.taobao.idle.pc.detail` behaves differently:
 
 | endpoint | the page calls it? | issued by this server |
 |---|---|---|
@@ -218,8 +217,8 @@ search call the page makes for itself, read off the wire. That call cannot be re
 it is the richer one: 30 structured results per query, each with a price, a want count, a city and a
 photo, where the DOM card this used to scrape could see a title and little else.
 
-This is measured, not preferred. A 2x2x2 matrix -- headed/headless x fresh/persistent profile x
-direct-URL/search-input, one fresh browser per cell -- returned results from exactly one cell:
+A test across headed/headless, fresh/persistent profiles and direct-URL/search-input navigation
+returned results from exactly one combination. Each cell used a fresh browser:
 
 | cell | cards | cards whose titles contain the query | outcome |
 |---|---|---|---|

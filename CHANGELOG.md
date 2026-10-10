@@ -1,19 +1,17 @@
 # Changelog
 
-All notable changes to this project are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project adheres to
+Changes are recorded here using
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## About this file
 
-This repository was published from a working history that had already been squashed, so the entries
-below are release notes rather than a commit log. There is no per-commit trail on `main` to generate
-them from and no attempt is made to invent one -- `main` begins at a single squashed import of the
-TypeScript port (`7ab7d6b`, 2026-09-30) and everything after it is a handful of deliberate commits.
-From here on, each release gets a commit behind it and this file grows normally.
+The working history had already been squashed when this repository was published. These are release
+notes, not a reconstructed commit log: `main` begins with the TypeScript port's squashed import
+(`7ab7d6b`, 2026-09-30), followed by the commits made here. Each release will have its own entry.
 
-The Python implementation this is a port of is not in this history at all: it lives on the
-`python-original` branch as a single commit (`cfe401d`, 2026-09-27).
+The original Python implementation is on the `python-original` branch in a single commit
+(`cfe401d`, 2026-09-27).
 
 ## [0.2.1] — 2026-10-08
 
@@ -57,10 +55,9 @@ The Python implementation this is a port of is not in this history at all: it li
 
 ### About these two releases
 
-`0.2.1` exists because `v0.2.0` was published and then its tag was moved, 18 minutes later, to a
-later commit. The move was comment-only and its own release notes say so, so nothing `0.2.0`
-advertised was wrong — but it means the commit the tag names is not the one first published. Rather
-than move a published tag a second time, the difference ships here.
+`v0.2.0` was published, then moved 18 minutes later to a later commit. The change was comment-only,
+as its release notes say; nothing advertised in `0.2.0` was wrong. The tag no longer points to the
+first published commit. It will not be moved again, so the difference ships in `0.2.1`.
 
 The fan-out entries below were originally written into the `0.2.0` section. They are not there now:
 at the `v0.2.0` tag that section did not mention the fan-out at all, and it was neither in the
@@ -69,8 +66,8 @@ exactly, and this is where the fan-out is described, under the version that actu
 
 ## [0.2.0] — 2026-10-08
 
-Released. The seller tools went in here rather than opening a 0.3.0 section, because 0.2.0 had never
-been released and a dated section for it would have been claiming a release that did not happen.
+Released. The seller tools are in this section because `0.2.0` had not been released; a `0.3.0`
+section would have implied otherwise.
 
 ### Added
 

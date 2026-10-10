@@ -2,11 +2,10 @@
 
 ## What this server does and does not hold
 
-This server stores nothing and asks for nothing. That is a design property rather than a promise, and
-there is a test that enforces it: `test/invariants.test.ts` scans the whole source tree for
-`addCookies`, `storageState`, `launchPersistentContext`, `userDataDir`, `localStorage`,
-`sessionStorage` and every goofish cookie name (`cookie2`, `sgcookie`, `x5sec`, `_m_h5_tk`), and
-fails the build if any appears.
+The server stores no credentials or browser state. `test/invariants.test.ts` enforces this by
+scanning the source tree for `addCookies`, `storageState`, `launchPersistentContext`, `userDataDir`,
+`localStorage`, `sessionStorage` and Goofish cookie names (`cookie2`, `sgcookie`, `x5sec`,
+`_m_h5_tk`). Any match fails the build.
 
 - No credentials, ever. It launches its own throwaway Chromium with a brand-new context on every
   launch: no profile directory, no persistent state, nothing carried between sessions.
@@ -24,18 +23,16 @@ fails the build if any appears.
 
 ## Reporting a vulnerability
 
-Report it privately through GitHub's security advisory form on this repository
-(**Security → Report a vulnerability**), not as a public issue.
+Use this repository's GitHub security advisory form (**Security → Report a vulnerability**). Do not
+report vulnerabilities in a public issue.
 
 Include what you found, the file and line, and a reproduction if you have one.
 
-Because this server drives a real browser against a live third-party site, the most likely real
-reports are **redirect/SSRF escapes** (getting the scraper to read a host other than goofish.com) or
-**scope escapes** (getting a tool to write or change state). Both are treated as high severity: they
-would break the two guarantees above.
+The main risks are **redirect/SSRF escapes** that make the scraper read a host other than
+goofish.com, and **scope escapes** that let a tool write or change state. Either breaks the guarantees
+above and is treated as high severity.
 
 ## A note on what this project is not responsible for
 
-This is an unofficial client. It is not affiliated with, endorsed by, or supported by Alibaba or
-Goofish. It reads goofish the way an anonymous visitor's browser does; if you have a problem with
-how the site responds to that, the site operator is the right place.
+This unofficial client is not affiliated with, endorsed by, or supported by Alibaba or Goofish. It
+reads the site as an anonymous visitor. For problems with Goofish itself, contact the site operator.
