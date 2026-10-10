@@ -99,6 +99,11 @@ them into something less precise, which is the failure mode the request names.
 - **6462d01** `docs: add a CHANGELOG, and say plainly that the history was squashed` -- documents the
   absence of history rather than inventing one. Reconstructing a history that was never recorded
   here would be the lie, and the commit says so in the file.
+
+Two em dashes remain in this file, at line 102 and line 188, and both are inside a verbatim quote of
+commit `265a1cc`'s subject line. That subject really does contain an em dash, so rewriting the quote
+would make the document misreport the commit it is about. The exemption is recorded here rather than
+left to be discovered by a grep.
 - **265a1cc** `feat: v0.2 search — env-tunable max-items cap and deeper results (xi-xqq)` -- names the
   env var, its range, the default and what moved (60 to 120, bounded to 300 rather than 500). This
   one uses bullets and an em dash; chy's style note says no bullets and no em dashes, and applying

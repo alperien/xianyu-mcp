@@ -12,11 +12,10 @@ import { getSession } from './browser.ts';
 import { describe } from './errors.ts';
 import { TOOLS } from './tools.ts';
 
-// The version the MCP handshake advertises is package.json's, read rather than written down a second
-// time. It used to be a literal here, and the two drifted without anything noticing: `npm version`
-// moved package.json and the server went on claiming the old number to every client that asked.
-// `../package.json` is one level up from src/ (run straight from a checkout) and from dist/ (the
-// prebuilt tarball) alike, and npm always ships package.json even though `files` does not list it.
+    // The version the MCP handshake advertises is package.json's, read rather than written a second
+    // time. It used to be a literal here and the two drifted unnoticed: `npm version` moved package.json
+    // and the server went on claiming the old number. `../package.json` resolves from src/ and from
+    // dist/ alike, and npm ships package.json even though `files` does not list it.
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
 
 const mcp = new McpServer({ name: 'xianyu', version }, {
@@ -26,11 +25,9 @@ const mcp = new McpServer({ name: 'xianyu', version }, {
 for (const t of TOOLS) {
   mcp.registerTool(t.name, { description: t.description, inputSchema: t.schema }, async (args: any) => {
     // Nothing is serialised here. The three DOM tools (`search_items`, `item_view`, `recommendations`)
-    // take the shared-page lock themselves, in tools.ts, because only they read the one navigating
-    // page; the mtop-only tools must stay free so a 70s search does not hold up a 1.5s feed call.
-    // Wrapping every tool here -- which this used to do -- re-imposed exactly that queue.
-    // Anything unexpected is still reported under its own error type rather than being allowed to kill
-    // the MCP call.
+    // take the shared-page lock themselves in tools.ts, because only they read the one navigating page;
+    // the mtop-only tools must stay free so a 70s search does not hold up a 1.5s feed call. Wrapping
+    // every tool here -- which this used to do -- re-imposed exactly that queue.
     let envelope: any;
     try {
       envelope = { ok: true, data: await t.run(args) };
@@ -41,14 +38,10 @@ for (const t of TOOLS) {
   });
 }
 
-// The one thing this server does before it has been asked for anything: pay the session's first load.
-// Measured, that first load is 12.4s for an item page and the mayor measured 15-41s for the first
-// search, against a warm price of ~1.6s for everything after it -- and it lands on whoever happens
-// to ask first, which for an MCP client is the user's first question. So it is started here, in the
-// background, on a page of its own that no tool will ever see (see `Session.warmUp`). Fire-and-forget
-// and never awaited: this must not be able to delay the handshake, and a warm-up that throws is
-// recorded under `capabilities` rather than taken out on the server's start. `XIANYU_NO_WARMUP=1`
-// skips it.
+    // The one thing this server does before it has been asked for anything: pay the session's first
+    // load. That load is 12.4s for an item page and 15-41s for the first search against ~1.6s warm,
+    // and it lands on whoever asks first -- for an MCP client, the user's first question. So it starts
+    // here, in the background, on a page no tool will ever see (`Session.warmUp`), never awaited.
 void getSession().warmUp().catch(() => {});
 
 if (process.stdin.isTTY) {
@@ -56,17 +49,10 @@ if (process.stdin.isTTY) {
   process.exit(2);
 }
 const transport = new StdioServerTransport();
-// One shutdown path for every way out, because this process holds a real windowed Chromium and the
-// browser has to be torn down deliberately rather than left for the OS. Four things reach it: the
-// client closing stdin (the normal case -- a client that just goes away never sends a signal), a
-// supervisor, and a crash.
-//
-// Re-entrancy here was a leak, not a safety net. Closing stdin emits BOTH `end` and `close`, so the
-// second call reached the guard and called `process.exit` while the first call's teardown was still
-// in flight -- the node process died mid-`browser.close()` and left the windowed Chromium running,
-// reparented to init. Measured: 15 orphaned processes after one audit run. So the guard returns and
-// lets the in-flight teardown finish; `Session.close` is bounded at 5s and escalates to SIGKILL, so
-// it cannot be the thing that hangs.
+    // One shutdown path for every way out: stdin closing (a client that just goes away never sends a
+    // signal), a supervisor, and a crash. Re-entrancy here was a leak, not a safety net -- closing
+    // stdin emits BOTH `end` and `close`, so the second call called `process.exit` mid-`browser.close()`
+    // and orphaned the windowed Chromium (15 after one audit). The guard returns and lets it finish.
 let closing = false;
 const shutdown = (code: number): void => {
   if (closing) return;                 // a teardown is already running and will exit when it is done

@@ -49,8 +49,7 @@ export const SEARCH_MARK = 'data-xianyu-search';
  * goofish's own counter -- returned nothing at all, because the titles say
  * `西数4T机械硬盘`. Cutting at the CJK/Latin boundary as well as at whitespace
  * turns that one query into `机械硬盘` + `4t`. The recommendation rail still
- * fails it, and that is the point: a rail full of bicycles is not going to
- * contain both.
+ * fails it, which is correct: a rail full of bicycles cannot contain both.
  *
  * Deliberately not a sub-sequence match. `机械硬盘4t` is not a sub-sequence of
  * `西数4T机械硬盘` (the `4t` comes first), and a rule that loose would let the
@@ -176,8 +175,8 @@ export const MTOP_CALL_JS = async (spec: { calls: [string, string, any][] }): Pr
 };
 
 // Payload normalisers. Not in-page scripts: these run here, in Node, over a response the page already
-// produced. They are why this server stopped scraping the DOM for the two things the DOM could not
-// answer properly. Plain functions because nothing here touches a global.
+// produced. They exist because the DOM could not answer two questions properly. Plain functions,
+// because nothing here touches a global.
 
 const asText = (v: any): string => String(v ?? '').replace(/\s+/g, ' ').trim();
 const firstText = (...vals: any[]): string => { for (const v of vals) { const s = asText(v); if (s) return s; } return ''; };
@@ -187,26 +186,10 @@ const firstText = (...vals: any[]): string => { for (const v of vals) { const s 
  */
 const countOf = (v: any): string => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? String(Math.trunc(n)) : ''; };
 
-// Typed views of a listing. Everything above this line hands back the site's own strings, and those
-// strings are what the flat fields publish and what every existing consumer reads. They are not
-// retyped here: a field that changes type under a caller is a breaking change wearing a version
-// number. These read the same values as types and publish them beside the strings, under one key
-// whose shape never varies -- `366` next to `"366"`, `2026-01-02T03:04:05.000Z` next to
-// `"1784640276000"`, `{province, city}` next to `"杭州"`.
-//
-// The rule this server has always kept holds here too: a value the site did not render is `null` and
-// is named in `missing`, never inferred from a sibling and never defaulted. A `0` the site sent is a
-// number. A key it never sent is a null in the block and an entry in the list.
-//
-// Node-side, like the normalisers above and unlike the in-page scripts: they read a response already
-// in hand and never the page, so they can close over each other and be shared by every listing tool.
-// Nothing in this section may be called from inside an in-page script.
-
-/**
- * The typed block every listing publishes. Every key is always present; a value the site did not
- * render is a null in it and an entry in `missing`. Written out rather than an index signature, so
- * adding a field is a compile error at the one place that fills it in.
- */
+    // Typed views of a listing. Everything above hands back the site's own strings, and those are what
+    // the flat fields publish and every existing consumer reads; they are not retyped, because a field
+    // that changes type under a caller is a breaking change wearing a version number. These publish
+    // the same values beside them: `366` next to `"366"`. Never called from inside an in-page script.
 export type ListingTyped = {
   price_amount: number | null;
   want_count: number | null;
@@ -392,13 +375,10 @@ export const detailListing = (data: any, wanted: string): any | null => {
     seller_avatar: asText(seller.portraitUrl).replace(/^http:\/\//, 'https://'),
     seller_last_active: asText(seller.lastVisitTime),
     seller_zhima_verified: seller.zhimaAuth === true,
-    // Not in `ITEM_FIELDS`, so `fields_present` / `fields_missing` are unchanged and item_view's
-    // envelope does not grow a field. This is the one hop from a listing to the seller behind it, and
-    // `seller_profile` / `seller_items` need it. `sellerId` is goofish's plain numeric user id --
-    // `kcUserId` in the profile payload, and the `userId` that /personal?userId= takes. Measured,
-    // live: a detail reply's sellerDO carries `sellerId` and no `userId`/`userIdStr` at all, so a
-    // normaliser that guessed at those two names would come back empty and the second hop would
-    // never run.
+    // Not in `ITEM_FIELDS`, so `fields_present` / `fields_missing` are unchanged. This is the one hop
+    // from a listing to the seller behind it. `sellerId` is goofish's plain numeric user id (`kcUserId`
+    // in the profile payload, the `userId` /personal?userId= takes); measured live, a detail reply's
+    // sellerDO carries `sellerId` and no `userId`/`userIdStr` at all.
     seller_id: asText(seller.sellerId),
     brand: asText(attributes['品牌']),
     condition: asText(attributes['成色']),
@@ -542,17 +522,14 @@ export const searchListings = (data: any): any[] => {
     const dp = ex.detailParams || {};
     const args = main.clickParam?.args || {};
     // The id is in three places and they do not all survive a shape change: `detailParams.itemId` is
-    // the one that is normally there, `exContent.itemId` and `clickParam.args.item_id` are the
-    // fallbacks. Without them a card whose `detailParams` is empty or renamed leaves the normaliser
-    // with no id at all and is dropped silently -- which is how a result set gets shorter than it
-    // should with nothing in the envelope saying so.
+    // normally there, `exContent.itemId` and `clickParam.args.item_id` are the fallbacks. Without them a
+    // card whose `detailParams` is empty or renamed leaves the normaliser with no id and is dropped
+    // silently, which is how a result set gets shorter than it should with nothing saying so.
     const itemId = asText(dp.itemId) || asText(ex.itemId) || asText(args.item_id);
     // Rebuilt into the *feed's* card shape -- `{ detailParams, attributeMap, city }` -- so the one
-    // normaliser reads a search result and a feed listing alike, rather than two near-identical
-    // shapes drifting apart. The price is the trap in doing this by hand: a search card's
-    // `detailParams` carries no `soldPrice` at all, it lives in `clickParam.args.price`, so a search
-    // that copies `detailParams` across verbatim returns items with an empty price and they look
-    // like listings that are free.
+    // normaliser reads a search result and a feed listing alike. The price is the trap: a search card's
+    // `detailParams` carries no `soldPrice`, it lives in `clickParam.args.price`, so a search that copies
+    // `detailParams` across returns items with an empty price that look free.
     const soldPrice = asText(dp.soldPrice) || asText(args.price);
     const image = asText(dp.picUrl) || asText(ex.picUrl);
     // The seller is here and was being thrown away: the search card's `userNick` does not exist, the
@@ -732,19 +709,15 @@ export const ITEM_SCRAPE_JS = (spec: { item_id: string; rails: string[] }): any 
   };
   const money = (re: RegExp) => { const m = headCompact.match(re); if (!m) return ''; const n = parseFloat(m[1].replace(/,/g, '')); return Number.isNaN(n) ? '' : String(m[2] ? Math.round(n * 10000) : Math.round(n)); };
   const priceMatch = headCompact.match(/¥\s*([\d,]+(?:\.\d+)?)/);
-  // The title is not in the page's text. Measured over 6 live listings: the detail block prints the
-  // price, the counts, the description, the seller and the attribute block, and the title is nowhere
-  // in `innerText` -- so a class-name search for it finds recommendation cards further down the page
-  // and nothing else, and the one that had a class match came back empty every time. It is in the
-  // document title, with a `_闲鱼` suffix, used only when the class search finds nothing in the detail
-  // head so a page that does render a title element still wins.
+    // The title is not in the page's text. Measured over 6 live listings: the detail block prints price,
+    // counts, description, seller and attributes, and the title is nowhere in `innerText` -- so a
+    // class-name search finds recommendation cards further down the page. It is in the document title
+    // with a `_闲鱼` suffix, used only when the class search finds nothing in the detail head.
   const docTitle = asTitleText(document?.title);
-  // Photos. The old rule -- "big, on a known CDN, not inside a card" -- returned goofish's own promo
-  // banners (measured: four `gw.alicdn.com/imgextra/...-tps-242-150.png` strips on a page whose
-  // listing was a nail gun), because a banner is also big and also on a known CDN. Every photo a
-  // seller uploaded is under `/bao/uploaded/` and a banner or an avatar is not, so that path is the
-  // discriminator. The thumbnail strip and the full-size preview are one photo at two sizes, so the
-  // size suffix is stripped and the two collapse to one URL.
+    // Photos. The old rule -- "big, on a known CDN, not inside a card" -- returned goofish's own promo
+    // banners (four `gw.alicdn.com/imgextra/...-tps-242-150.png` strips on a page whose listing was a
+    // nail gun), because a banner is also big and also on a known CDN. Every seller upload is under
+    // `/bao/uploaded/` and a banner or an avatar is not. Thumb and full size collapse to one URL.
   const railImages = new Set<string>();
   const anchors = document.querySelectorAll("a[href*='/item?id=']");
   for (const a of anchors) for (const img of a.querySelectorAll('img')) if (img.src) railImages.add(img.src);

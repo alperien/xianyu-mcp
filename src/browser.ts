@@ -323,21 +323,17 @@ export class Session {
   }
 
   private async launch(): Promise<void> {
-    // Windowed by default, and that is a measurement rather than a preference: headed gets goofish's
-    // real app (search page, item pages, 20 cards), headless gets the same URL served as the
-    // risk-control page -- "非法访问 ... 请使用正常浏览器访问闲鱼" -- for as long as you watch, with zero
-    // cards and 35 bytes of text. So the three DOM tools need a display. The mtop-only tools do not:
-    // the page's own client boots on the risk-control page too, and that is what they read.
-    // XIANYU_HEADLESS=1 opts back in, and costs the DOM tools.
+    // Windowed by default, and that is a measurement: headed gets goofish's real app, headless gets the
+    // same URL served as the risk-control page ("非法访问 ... 请使用正常浏览器访问闲鱼") with zero cards and 35 bytes
+    // of text for as long as you watch. So the three DOM tools need a display; the mtop-only tools do
+    // not, because the page's own client boots on the risk-control page too. XIANYU_HEADLESS=1 opts in.
     const opts = { headless: process.env.XIANYU_HEADLESS !== '1',
       ...(process.env.XIANYU_BROWSER_PATH ? { executablePath: process.env.XIANYU_BROWSER_PATH } : {}),
       args: ['--no-sandbox', '--disable-blink-features=AutomationControlled', '--no-first-run', '--no-default-browser-check', '--disable-gpu'] };
-    // Playwright is imported here rather than at module scope. It is the heaviest thing this server
-    // depends on (measured: 19M of a 73M tree, most of it playwright-core), and a top-level import
-    // pays that on every start whether or not a browser is ever launched -- including for the four
-    // mtop-only tools, which need a page but no Chromium beyond the one they share. The dynamic
-    // import also turns "playwright is not installed" into a launch-time message carrying LAUNCH_HINT,
-    // not a MODULE_NOT_FOUND at startup that says nothing about a browser.
+    // Playwright is imported here rather than at module scope: it is the heaviest thing this server
+    // depends on (19M of a 73M tree, mostly playwright-core), and a top-level import pays that on every
+    // start including for the four mtop-only tools. The dynamic import also turns "playwright is not
+    // installed" into a launch-time message carrying LAUNCH_HINT, not a MODULE_NOT_FOUND at startup.
     let chromium;
     try { ({ chromium } = await import('playwright')); }
     catch (e) { throw new BrowserError(`playwright could not be loaded: ${e}\n${LAUNCH_HINT}`); }
@@ -557,10 +553,10 @@ export class Session {
 
   /** Lease fan-out slot `i` and load `url` into it: the bounded detail fan-out's private page.
    *
-   *  Not the shared `domPage`, and that is the point. The caller is inside a `search_items`, and that
-   *  page is holding the search results the fan-out exists to deepen -- navigating it away would throw
-   *  away the answers for everything past the first batch. So each slot is its own page with its own
-   *  tap, invisible to the DOM tools, and the lock the caller already holds is the only thing standing
+   *  Each slot is its own page, never the shared `domPage`. The caller is inside a `search_items`,
+   *  and that page is holding the search results the fan-out exists to deepen -- navigating it away
+   *  would throw away the answers for everything past the first batch. Each slot has its own tap,
+   *  invisible to the DOM tools, and the lock the caller already holds is the only thing standing
    *  between two searches' fan-outs: they cannot overlap, because `exclusive()` wraps the whole tool
    *  rather than this lease.
    *

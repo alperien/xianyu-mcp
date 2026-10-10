@@ -181,12 +181,10 @@ export const buildInfo = (root: string = packageRoot(import.meta.dirname), base 
   const baseCommit = root && base ? git(root, ['rev-parse', base]) : '';
   if (!base && root) notes.push('no base ref was asked for, so how far behind one this build is was not measured');
   else if (!baseCommit) notes.push(`${base} does not resolve here, so how far behind it is could not be measured`);
-  // The comparison is against the BUILD's commit, not the checkout's HEAD, and the difference is the
-  // whole point of the module. They diverge the moment anyone pulls, switches branches, or commits
-  // into the directory a deployed dist sits in, which is ordinary, because that is what a checkout is
-  // for. Comparing HEAD would then report a dist built two commits ago as current, having answered a
-  // different question than the one asked. With no stamp there is nothing else to compare, so it
-  // falls back to HEAD and says so in `notes`.
+    // The comparison is against the BUILD's commit, not the checkout's HEAD: they diverge the moment
+    // anyone pulls, switches branches, or commits into the directory a deployed dist sits in. Comparing
+    // HEAD would report a dist built two commits ago as current, having answered a different question.
+    // With no stamp it falls back to HEAD and says so in `notes`.
   const subject = String(facts.commit ?? '') || 'HEAD';
   if (source === 'stamp' && subject !== 'HEAD' && git(root, ['rev-parse', 'HEAD']) !== subject) {
     notes.push(`this checkout has moved since the build (HEAD is ${(git(root, ['rev-parse', '--short', 'HEAD']) || '?').slice(0, 7)}, the build is ${subject.slice(0, 7)}), so the comparison below is against the build's own commit`);
@@ -268,12 +266,10 @@ export const deployVerdict = (info: BuildInfo): { ok: boolean; reasons: string[]
  */
 export const serveVerdict = (info: BuildInfo, head: string, now = new Date().toISOString()): { ok: boolean; reasons: string[] } => {
   const reasons: string[] = [];
-  // `now` bounds the mtime comparison. A source whose mtime is later than the moment this check ran
-  // is a clock disagreeing with ours, not an edit made after the build, and believing it rebuilds on
-  // every spawn forever: each rebuild lands at "now", which is still older than the file. Skew is
-  // real (a mounted checkout, a machine whose clock is minutes out) and the cost of getting it wrong
-  // is an `npm ci` per session for as long as the skew lasts. Nothing is hidden by ignoring it;
-  // `npm run check:deploy` prints the mtimes verbatim.
+    // `now` bounds the mtime comparison. A source dated after this check ran is a clock disagreeing
+    // with ours, not an edit made after the build, and believing it rebuilds on every spawn forever:
+    // each rebuild lands at "now", still older than the file. Skew is real (a mounted checkout, a clock
+    // minutes out) and the cost is an `npm ci` per session. `npm run check:deploy` prints the mtimes.
   const predates = Boolean(info.newest_source_at) && info.newest_source_at! > info.built_at && info.newest_source_at! <= now;
   if (!info.built_at) reasons.push('there is no dist/index.js here to serve');
   else if (predates) {

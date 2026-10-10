@@ -865,13 +865,10 @@ const capabilities = async ({ probe = true }: Args<typeof CAP_ARGS> = {}): Promi
     requires_xianyu_account: false,
     // Null, not their live defaults, on the unprobed path -- see the header.
     session_state: null, login_probe_ret: null, feed_reachable: null, browser_launches: null,
-    // The deployment's own address, up top: which commit is answering, whether it is
-    // behind main. `stale: null` means it could not be measured, which is not the same as
-    // `false` -- a build nobody can place is unverified, and reporting it as current is exactly
-    // what let a nine-commit-old dist keep serving a town full of agents. `npm run check:deploy`
-
-    // runs the same rules from the command line, and it fetches first, because a cached remote-tracking
-    // ref is itself a thing that goes stale. See src/build-info.ts.
+    // The deployment's own address, up top: which commit is answering, whether it is behind main.
+    // `stale: null` means it could not be measured, which is not the same as `false` -- a build nobody
+    // can place is unverified, and reporting it as current is what let a nine-commit-old dist keep
+    // serving a town full of agents. `npm run check:deploy` applies the same rules. See build-info.ts.
     build: {
       note: 'the commit below is what is answering your calls right now; `npm run check:deploy` is the same comparison run deliberately, and it fetches before counting',
       ...buildBlock(),
