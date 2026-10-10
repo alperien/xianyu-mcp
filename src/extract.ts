@@ -677,15 +677,10 @@ export const FEED_NORMALIZE_JS = (spec: { rows: any[] }): any[] => {
   return out;
 };
 
-/**
- * Scrape the item page's own detail block, as a logged-out visitor sees it. Two things learned the
- * hard way. The detail block sits ABOVE the recommendation rail, so the page text is cut at the rail
- * marker and only the head parsed -- parsing the whole body reports a rail card's price and title as
- * if they were the listing's. And class names are hashed build to build (main-title--sMrtWSJa), so
- * selectors match on substrings and a candidate is accepted only if its text really occurs in the
- * detail head. Rejecting by "lives inside a card list" is not enough: the detail block and the rail
- * can share one container, and that threw away the real description and seller.
- */
+/** Scrape an item's detail block from the rendered page. The recommendation rail follows the detail
+ * block, so parsing the whole page can mistake a recommended item's title or price for the listing's.
+ * Class names are build-specific; selectors use stable substrings and candidates must also appear in
+ * the detail text, since the detail block and rail can share a container. */
 export const ITEM_SCRAPE_JS = (spec: { item_id: string; rails: string[] }): any => {
   const { document, location } = globalThis as any;
   const clean = (v: any) => String(v ?? '').replace(/\s+/g, ' ').trim();
@@ -709,15 +704,9 @@ export const ITEM_SCRAPE_JS = (spec: { item_id: string; rails: string[] }): any 
   };
   const money = (re: RegExp) => { const m = headCompact.match(re); if (!m) return ''; const n = parseFloat(m[1].replace(/,/g, '')); return Number.isNaN(n) ? '' : String(m[2] ? Math.round(n * 10000) : Math.round(n)); };
   const priceMatch = headCompact.match(/¥\s*([\d,]+(?:\.\d+)?)/);
-    // The title is not in the page's text. Measured over 6 live listings: the detail block prints price,
-    // counts, description, seller and attributes, and the title is nowhere in `innerText` -- so a
-    // class-name search finds recommendation cards further down the page. It is in the document title
-    // with a `_闲鱼` suffix, used only when the class search finds nothing in the detail head.
+  // The title is absent from the detail text, so use the document title if no detail selector matches.
   const docTitle = asTitleText(document?.title);
-    // Photos. The old rule -- "big, on a known CDN, not inside a card" -- returned goofish's own promo
-    // banners (four `gw.alicdn.com/imgextra/...-tps-242-150.png` strips on a page whose listing was a
-    // nail gun), because a banner is also big and also on a known CDN. Every seller upload is under
-    // `/bao/uploaded/` and a banner or an avatar is not. Thumb and full size collapse to one URL.
+  // Seller uploads use `/bao/uploaded/`; CDN banners and avatars do not. Normalize thumbnail variants.
   const railImages = new Set<string>();
   const anchors = document.querySelectorAll("a[href*='/item?id=']");
   for (const a of anchors) for (const img of a.querySelectorAll('img')) if (img.src) railImages.add(img.src);
@@ -772,25 +761,11 @@ export const ITEM_SCRAPE_JS = (spec: { item_id: string; rails: string[] }): any 
   };
 };
 
-/**
- * Scrape the `a[href*="/item?id="]` cards off a rendered page, with the evidence a caller needs to
- * decide whether the page served what it asked for. Two consumers, one parser: search_items (keyword,
- * needs `query_hits` / `cards_scanned` and the rail / nothing-found signals) and recommendations (any
- * page, needs the rail label).
- *
- * `query_hits` is the guard that matters. A declined anonymous search renders the 猜你喜欢 rail, full
- * of unrelated cards, so a result set is only believable if a *fraction* of the page's titles really
- * contain the query. Hits are counted over every card on the page while `items` stops at `limit`, and
- * `cards_scanned` is the full denominator that fraction needs. `token_hits` is a second, looser count
- * -- titles containing every word of the query in any order -- published so a multi-word query that
- * matches nothing as one substring is visible instead of looking like a rail; the caller keeps its
- * strict guard on `query_hits`.
- *
- * The selector table lives inside the function body because Playwright serialises the function alone
- * and it cannot close over anything in this module. Reading the cards needs no click anywhere: this
- * and the item scraper work off `querySelectorAll` and `innerText`, which see straight through the
- * login dialog's `ant-modal-mask`, so nothing has to be dismissed for a read to succeed.
- */
+/** Scrape item cards from a rendered page for search and recommendation tools. Search uses
+ * `query_hits` and `cards_scanned` to reject unrelated recommendation rails; `token_hits` also reports
+ * titles containing every query term in any order. Counts cover the whole page even when `items` is
+ * limited. The selector table stays inside this function because Playwright serializes it on its own.
+ * Reading `innerText` and querying the DOM does not require dismissing the login overlay. */
 export const SCRAPE_CARDS_JS = (spec: { query: string; terms: string[]; limit: number; rails: string[] }): any => {
   const { document } = globalThis as any;
   const clean = (v: any) => String(v ?? '').replace(/\s+/g, ' ').trim();

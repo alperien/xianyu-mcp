@@ -1,34 +1,12 @@
-/**
- * Which build is running, and is it the build anybody is looking at.
+/** Reports the running build's stamp and its distance from a base ref.
  *
- * The failure this exists for ran nine commits before anyone saw it. `opencode.json` pointed the
- * xianyu MCP server at `node /home/user/xianyu-mcp-ts/dist/index.js`, and that path was a checkout
- * of this same repository sitting ten commits behind `main` with a `dist/` built from it. Nothing
- * errored. Every tool answered, every answer was plausible, and `capabilities` described a search
- * surface the code no longer had. The only way to find it was to ask a human to compare two
- * directories.
+ * `stampBuild` writes `dist/build-info.json` during `npm run build`. Reading that stamp keeps the
+ * reported commit tied to the deployed files even if the checkout later moves. Without a stamp, the
+ * report falls back to the enclosing git checkout and notes the fallback.
  *
- * So the build states its own commit, and the comparison is made where the answers are already being
- * read. Two halves:
- *
- *   - `stampBuild` (scripts/stamp-build.mjs, run by `npm run build`) writes `dist/build-info.json`
- *     at build time. This half makes the failure nameable: a checkout with no stamp was built by
- *     something that never recorded a commit, and that absence is the finding. Reading the stamp
- *     rather than asking git about the working tree is what keeps the answer true when the checkout
- *     moves underneath it.
- *   - everything here reads that stamp, falls back to the enclosing git checkout, and compares
- *     against a base ref.
- *
- * The trap, because it is what lets a naive version of this check pass a stale deploy:
- * `git rev-list HEAD...origin/main` counts commits against the *local remote-tracking ref*, which is
- * just another cached file. In the deploy that had drifted, that ref pointed at the old commit too,
- * so HEAD and `origin/main` agreed exactly and the count was a confident zero. A check that does not
- * fetch cannot see the drift it is looking for. `buildInfo` reports the base it compared against and
- * says in `notes` when it could not measure; scripts/check-deploy.mjs does the fetching.
- *
- * Nothing here throws. This module is read on the `capabilities` path, which is documented never to
- * raise even when the browser is gone, so a machine with no git, no `dist/`, or a half-installed
- * checkout still has to get an answer rather than an error.
+ * Comparisons use the local remote-tracking ref, which may be stale. Callers that need a current
+ * comparison must fetch first; `scripts/check-deploy.mjs` does this. This module does not throw, since
+ * `capabilities` must still return a result when git, `dist/`, or part of the checkout is unavailable.
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
@@ -109,9 +87,7 @@ const newestSource = (root: string): string => {
   return newest ? new Date(newest).toISOString() : '';
 };
 
-/** Walk up from the running module to the directory holding this package's `package.json`, so the
- *  stamp is found from `dist/` and from `src/` alike, and from an installed tarball where `dist/`
- *  is the whole thing. */
+/** Find this package's root from either `src/`, `dist/`, or an installed tarball. */
 export const packageRoot = (from: string): string => {
   let dir = resolve(from);
   for (;;) {
@@ -152,18 +128,10 @@ const fromGit = (root: string): BuildStamp => ({
   dirty: git(root, ['status', '--porcelain']) ? true : undefined,
 });
 
-/**
- * Everything known about the build rooted at `root`, and how far it is behind `base`.
+/** Describe the build at `root` and, when requested, compare it with `base`.
  *
- * `base` defaults to `origin/main`, and the comparison is against the local remote-tracking ref,
- * which is a cache rather than the remote. A caller that wants a trustworthy `behind` fetches first,
- * which is what scripts/check-deploy.mjs does; a caller that wants a cheap answer gets one labelled
- * as resting on a cached ref.
- *
- * `base` may also be `''`, which asks for no comparison at all. That is scripts/serve.mjs, which
- * sits in front of every server start and needs only the local facts. `behind` is then `null` with a
- * note saying it was not asked for, never a silent `0`.
- */
+ * By default, `base` is the local `origin/main` ref; callers needing a current result should fetch it
+ * first. An empty `base` skips comparison and reports `behind: null`, not zero. */
 export const buildInfo = (root: string = packageRoot(import.meta.dirname), base = 'origin/main'): BuildInfo => {
   const notes: string[] = [];
   const version = readVersion(root);
@@ -240,45 +208,21 @@ export const deployVerdict = (info: BuildInfo): { ok: boolean; reasons: string[]
   return { ok: reasons.length === 0, reasons };
 };
 
-/**
- * Whether the `dist/` in this checkout is the build of the tree sitting beside it.
- *
- * `deployVerdict` asks whether the build is current with a base ref, which needs the network. That is
- * the right question before trusting a deployment and the wrong one in front of every server start,
- * because "how far behind main are we" is fixed by a pull and no rebuild fixes it. This asks the
- * half a rebuild can fix: do the bytes in `dist/` correspond to the sources next to them. It is local
- * (one `git rev-parse`, a stat, a walk of `src/`), so it costs milliseconds rather than a round trip,
- * which is what lets scripts/serve.mjs run it on every spawn.
- *
- * `head` is the checkout's HEAD, passed in rather than read here, so this stays a pure function of
- * stated facts as `deployVerdict` is. `''` means this is not a git checkout at all, an installed
- * tarball; there is nothing to compare, so the commit rules are skipped rather than failed, which
- * would make the launcher refuse the one case where it has no work to do.
- *
- * `info.dirty` is not a rule here. Uncommitted sources do not make a `dist/` stale: once built, the
- * build *is* the tree, dirt and all, and a rebuild of a dirty tree stamps itself dirty again, so
- * keying freshness on dirt rebuilds on every start forever. What dirt costs is the ability to name
- * the build as a clean commit, which is `capabilities`' business. A dirty tree whose sources are
- * newer than its `dist/` is still caught below, by mtime.
- *
- * `now` bounds the mtime comparison and keeps this a function of stated facts rather than of a clock
- * nobody controls.
- */
+/** Check whether `dist/` matches the sources beside it. Unlike `deployVerdict`, this is a local
+ * check suitable for every server start. `head` is passed in to keep the result a function of stated
+ * facts; an empty value means there is no checkout to compare (for example, an installed tarball).
+ * Dirty state alone does not make a build stale, but a source newer than the build does. `now` bounds
+ * the mtime check and makes clock skew explicit. */
 export const serveVerdict = (info: BuildInfo, head: string, now = new Date().toISOString()): { ok: boolean; reasons: string[] } => {
   const reasons: string[] = [];
-    // `now` bounds the mtime comparison. A source dated after this check ran is a clock disagreeing
-    // with ours, not an edit made after the build, and believing it rebuilds on every spawn forever:
-    // each rebuild lands at "now", still older than the file. Skew is real (a mounted checkout, a clock
-    // minutes out) and the cost is an `npm ci` per session. `npm run check:deploy` prints the mtimes.
+  // Ignore source mtimes later than `now`; they indicate clock skew, not a post-build edit.
   const predates = Boolean(info.newest_source_at) && info.newest_source_at! > info.built_at && info.newest_source_at! <= now;
   if (!info.built_at) reasons.push('there is no dist/index.js here to serve');
   else if (predates) {
     reasons.push(`a source file is newer than dist/index.js (${info.newest_source_at} against ${info.built_at}), so the build predates the code beside it`);
   }
   if (head) {
-    // The second sentence cannot be stated without the first: with no stamp there is no commit to
-    // compare to HEAD, and naming that as "unstamped" is the honest version of a confusing
-    // "built from " with an empty sha.
+    // Without a stamp, there is no build commit to compare with HEAD.
     if (info.source !== 'stamp') reasons.push('this dist/ carries no build-info.json, so it cannot be shown to be the build of this checkout');
     else if (info.commit !== head) reasons.push(`this dist/ was built from ${info.commit.slice(0, 7)} and this checkout is at ${head.slice(0, 7)}`);
   }

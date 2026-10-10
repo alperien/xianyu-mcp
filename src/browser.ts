@@ -74,29 +74,16 @@ const apiOf = (url: string): string => { try { return new URL(url).pathname.matc
 /** One tapped mtop response: goofish's own `ret`, and its `data` when there is any. */
 export type MtopReply = { api: string; ret: string; ok: boolean; data: any };
 
-/** The most extra DOM pages a session will ever hold open at once, whatever a caller asks for.
- *
- *  Four is not a round number chosen here: it is the width the fan-out was measured at, and four is
- *  where each listing's own latency stopped improving (11.4s -> 20.5s at four) while the wall clock
- *  kept falling (2.4x). Above that the measurement says nothing, and a fan-out whose width was never
- *  measured is a fan-out that can be turned up by a typo and answer with zero listings. So the bound
- *  lives here rather than in the caller: `fanoutSurface` refuses a slot outside it, and the width the
- *  detail walk asks for is clamped to it before it asks. */
+/** Maximum extra DOM pages held by the detail fan-out. Four is the largest measured width; callers
+ * cannot raise the cap beyond it. */
 export const DETAIL_POOL_MAX = 4;
 
-/** One leased DOM page: the page, the tap on the mtop replies its own bundle produced, and the verdict
- *  on the load that put it there.
- *
- *  All three travel together rather than the last two living on the session, because a fan-out has two
- *  of these in flight at once and a shared `Session.lastLoad` can only name whichever load finished
- *  last -- which is how a decline would get attached to the wrong listing. */
+/** A fan-out page and the response tap and load verdict belonging to it. Keeping them together
+ * prevents concurrent loads from assigning a verdict to the wrong listing. */
 export type DomSurface = { page: Page; tap: MtopTap; load: { url: string; declined: string; ms: number } };
 
-/** A bounded collector for the mtop responses a page makes on our behalf.
- *
- *  `take` names the API it wants and hands back the next reply for it, then forgets that reply, so a
- *  second wait for the same API cannot be answered by one left over from an earlier call. A waiter
- *  parked past its timeout is dropped rather than left to fire later. */
+/** Collects mtop responses from a page. `take` returns and removes the next reply for an API;
+ * timed-out waiters are removed as well. */
 export class MtopTap {
   private readonly replies = new Map<string, MtopReply[]>();
   private readonly waiters = new Map<string, ((r: MtopReply) => void)[]>();
@@ -147,10 +134,8 @@ export function ensureGoofishUrl(url: string): string {
   return url;
 }
 let queue: Promise<unknown> = Promise.resolve();
-/** Serialise the calls that share the one navigating page. Only the DOM tools take this lock: they
- *  read whatever `domPage` is holding, and two at once would navigate it out from under each other
- *  and one would report the other's page as its own data. The mtop-only tools run on `apiPage` and
- *  stay off it, so a 70s search no longer blocks a 1.5s feed call. */
+/** Serialize DOM tools that share the navigating page. Mtop-only tools use `apiPage` and do not
+ * take this lock. */
 export function exclusive<T>(fn: () => Promise<T>): Promise<T> {
   const run = queue.then(fn, fn);
   queue = run.then(() => {}, () => {});

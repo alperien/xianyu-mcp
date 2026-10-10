@@ -1,6 +1,5 @@
-/** Ten tools. Six use only goofish's mtop client: browse_feed, search_count, search_suggest,
- * related_items, seller_profile, seller_items. Two read the dom page's own mtop replies: item_view
- * and search_items. capabilities never raises. The lock below is why only the DOM tools take it. */
+/** Tool implementations and shared helpers. Only DOM-backed tools use the page lock; `capabilities`
+ * does not raise. */
 import { z } from 'zod';
 import type { Page } from 'playwright';
 import { DetailUnavailableError, describe, GatedError, NavigationError, ParseError, SearchUnavailableError, XianyuError } from './errors.ts';
@@ -11,34 +10,21 @@ import { DETAIL_POOL_MAX, type DomSurface } from './browser.ts';
 import { ensureGoofishUrl, evaluate, exclusive, getSession, HOME, reloadFresh, settle } from './browser.ts';
 import { detailListing, enrichListing, FEED_NORMALIZE_JS, hasAllTerms, ITEM_SCRAPE_JS, PAGER_CLICK_JS, PAGER_STATE_JS, queryTerms, RAIL_MARKERS, SCROLL_TO_JS, SCRAPE_CARDS_JS, searchListings, SEARCH_INPUT_JS, SEARCH_MARK, SEARCH_STATE_JS, sellerListings, sellerProfileOf } from './extract.ts';
 type Data = Record<string, any>;
-// The mtop endpoints this server may name, among all 51 `mtop.*` names in goofish's bundles; all
-// answer anonymously, and a test fails the build if another appears. DETAIL_API and SEARCH_API are
-// never called directly: goofish stamps only its own bundle's requests, so a synthesised one answers
-// TIMEOUT::接口超时. Seller endpoints are the exception -- one the page never uses carries no stamp.
+// Endpoints observed in goofish bundles. DETAIL_API and SEARCH_API are tapped from page requests
+// because direct calls lack the request stamp; seller endpoints do not require one.
 const FEED_API = 'mtop.taobao.idlehome.home.webpc.feed';
-// The match counter. The search page calls it with the same payload shape as search and reads
-// `data.hitnum`, so it answers "how many items match this keyword" for a logged-out visitor even on
-// the loads where search is declined. Keyword work does not need the search page because of this:
-// about 28,800 for "x220" (it drifts -- 28,791 / 28,804 / 28,810 observed), 0 for nonsense.
+// Search's count endpoint works for logged-out visitors even when the results page is declined.
 const HITNUM_API = 'mtop.taobao.idle.filter.hitnum.pc.get';
 const SUGGEST_API = 'mtop.taobao.idlemtopsearch.pc.search.suggest';
 const RECOMMEND_API = 'mtop.taobao.idle.item.web.recommend.list';
 const LOGINUSER_API = 'mtop.taobao.idlemessage.pc.loginuser.get';   // never used to act as a user: it exists only to *prove* the session is logged out
 const DETAIL_API = 'mtop.taobao.idle.pc.detail';
 const SEARCH_API = 'mtop.taobao.idlemtopsearch.pc.search';
-// The /personal?userId= page's own endpoint. `{userId}` alone is enough: `encryptedUserId` by itself
-// is refused with FAIL_BIZ_CLIENT_PARAM_INVALID, and `self: false` changes nothing. Returns
-// `data.baseInfo` and `data.module.{base,shop,social,tabs}`. A user that does not exist answers
-// FAIL_BIZ_USER_NOT_FOUND rather than an empty object.
+// Profile endpoint used by `/personal?userId=`. Requires `userId` and returns baseInfo and modules.
 const SELLER_HEAD_API = 'mtop.idle.web.user.page.head';
-// One seller's own listings -- the tab the same /personal page heads with 宝贝.
-// `{userId, pageNumber, pageSize, needGroupInfo}`. `nextPage` can be trusted; `totalCount` is always 0,
-// measured at two page sizes against a seller with six live listings, so nothing reads it.
+// Seller listings endpoint used by the 宝贝 tab. `nextPage` indicates whether another page exists.
 const SELLER_ITEMS_API = 'mtop.idle.web.xyh.item.list';
-// The keys this payload carries whatever else it does, measured on both of its shapes: a page with
-// listings on it, and a page past the end (which omits `cardList` and keeps the rest). They tell "this
-// seller has nothing here" apart from "this is not the payload I asked for". The first is an answer,
-// the second is a `ParseError`, and a check on `cardList` alone cannot tell them apart.
+// Keys shared by seller-listing payloads, including pages where `cardList` is absent.
 const payloadKeys = ['cardList', 'nextPage', 'totalCount', 'itemGroupList', 'itemTopicList', 'serverTime'];
 // pageSize is hardcoded to 30 in goofish's bundle and the endpoint rejects anything else with
 // FAIL_BIZ_COMMON_PARAM_ILLEGAL, so `limit` is applied client-side after the call. A missing itemId is
@@ -73,16 +59,13 @@ const SEARCH_ATTEMPTS = 4, MAX_SEARCH_ATTEMPTS = 10;
 // The pager only ever renders boxes 1..10 (`1 2 ... 10 ... 50`), so 10 pages is as deep as this
 // route goes without clicking the ellipsis: 300 listings, against the 50 a comparison needs.
 const MAX_SEARCH_PAGES = 10, MAX_SEARCH_DETAIL = 50;
-// How many listing pages `detail` loads at once before any override. Two: four pages took 4
-// listings from 66.3s to 27.1s (2.4x) while each listing's own latency went 11.4s -> 20.5s, and on a
-// throttled site the same four answered 0/4 where the serial walk got 2/4.
+// Two concurrent detail loads by default; callers can override within the pool limit.
 const DETAIL_FANOUT_DEFAULT = 2;
 // How many extra pages a walk may take when the ones it was asked for leave fewer than `limit`
 // matches. It is named here rather than inside the walk because the cache fast path has to know the
 // deepest page a call could reach before it can decide whether it can answer without a browser at all.
 const SEARCH_TOPUP_PAGES = 2;
-// The whole pager: ten numbered boxes at 30 listings a page. That is the most a walk can collect,
-// and it is also the bound a huge walk has to respect alongside the wall clock.
+// Maximum search walk: ten pages of 30 listings, also bounded by the wall-clock budget.
 const MAX_SEARCH_ITEMS = MAX_SEARCH_PAGES * 30, DEFAULT_SEARCH_ITEMS = 120;
 // How long item_view waits for the page's own detail call before it calls the listing dead. The reply
 // lands with the render that uses it, so this is the same window the old DOM poll needed (32s) and no
@@ -101,11 +84,9 @@ const SEARCH_INPUT_WAIT_MS = 15_000, SEARCH_RESULT_WAIT_MS = 32_000, SEARCH_TYPE
 // containing the query proves nothing: a 40-card rail with 12 incidental hits and one match both pass a
 // `hits > 0` test. 20% of the cards on the page, and never less than one.
 const MIN_MATCH_FRACTION = 0.2;
-// Ret strings that mean "goofish will not serve this to you", as opposed to a bug.
+// Ret strings indicating that goofish declined the request.
 const GATE_MARKERS = ['mini_login', 'RGV587', 'FAIL_SYS_SESSION_EXPIRED', 'FAIL_SYS_TOKEN', 'ILLEGAL_ACCESS', 'TIMEOUT', '非法访问', '令牌过期'];
-// The narrower list, for the one gate that means something specific: `session_state` is the point of
-// `capabilities`, and a rate limit (RGV587) or a TIMEOUT says nothing about whether a session exists.
-// Reporting either as proof of anonymity is how a throttled probe reads as a verified fact.
+// Markers that specifically indicate an expired or invalid session, not a rate limit or timeout.
 const NO_SESSION_MARKERS = ['SESSION_EXPIRED', 'TOKEN', '令牌过期'];
 
 // ---------------------------------------------------------------- pure helpers
